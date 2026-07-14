@@ -1,1 +1,57 @@
-
+configuration:
+  connector_enabled:
+    name: Enable Leapmotor Connector
+    description: Accept signed Leap Hub requests for account and vehicle data.
+  staging_secret:
+    name: Beta Connector key
+    description: HMAC key generated in the Beta environment.
+  production_secret:
+    name: Production Connector key
+    description: HMAC key generated in Production.
+  connector_max_parallel:
+    name: Parallel Connector requests
+    description: Maximum simultaneous Leapmotor cloud operations.
+  ocpp_beta_enabled:
+    name: Enable OCPP Beta
+    description: Starts the Beta OCPP gateway on port 8092.
+  ocpp_beta_internal_url:
+    name: OCPP Beta internal URL
+    description: Leap Hub Beta HTTPS endpoint.
+  ocpp_beta_secret:
+    name: OCPP Beta key
+    description: Key generated on the Beta OCPP server page.
+  ocpp_beta_max_connections:
+    name: Beta charger limit
+    description: Maximum simultaneous OCPP connections.
+  ocpp_production_enabled:
+    name: Enable OCPP Production
+    description: Starts the Production OCPP gateway on port 8093.
+  ocpp_production_internal_url:
+    name: OCPP Production internal URL
+    description: Leap Hub Production HTTPS endpoint.
+  ocpp_production_secret:
+    name: OCPP Production key
+    description: Key generated on the Production OCPP server page.
+  ocpp_production_max_connections:
+    name: Production charger limit
+    description: Maximum simultaneous OCPP connections.
+  tunnel_enabled:
+    name: Enable Cloudflare Tunnel
+    description: Enable only after routes target local-leaphub-gateway.
+  tunnel_token:
+    name: Cloudflare Tunnel token
+    description: Full token. It is never shown in logs or process arguments.
+  tunnel_log_level:
+    name: Tunnel log level
+    description: cloudflared logging detail.
+  log_level:
+    name: Service log level
+    description: Connector, OCPP and supervisor logging detail.
+  dashboard_log_lines:
+    name: Dashboard log lines
+    description: Maximum recent lines shown per service.
+network:
+  8092/TCP: OCPP Beta for Cloudflare Tunnel
+  8093/TCP: OCPP Production for Cloudflare Tunnel
+  8094/TCP: Leapmotor Connector for Cloudflare Tunnel
+  8099/TCP: Internal Ingress dashboard
