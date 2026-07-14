@@ -10,6 +10,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_NO_CACHE_DIR=1 \
     LEAPHUB_RUNTIME_DIR=/data/runtime \
+    PYTHONPATH=/app \
     PATH=/usr/local/bin:/usr/bin:/bin
 
 WORKDIR /app
@@ -34,7 +35,37 @@ RUN set -eux; \
 COPY requirements.txt /app/requirements.txt
 RUN python3 -m pip install --requirement /app/requirements.txt
 
-COPY connector.py connector_server.py ocpp_gateway.py gateway_manager.py /app/
+# O módulo é copiado para /app e também instalado com um nome interno exclusivo.
+COPY connector.py /app/connector.py
+RUN python3 - <<'PY'
+from pathlib import Path
+import shutil
+import site
+source = Path('/app/connector.py')
+if not source.is_file() or source.stat().st_size < 1000:
+    raise SystemExit('connector.py ausente ou incompleto')
+target = Path(site.getsitepackages()[0]) / 'leaphub_connector.py'
+shutil.copy2(source, target)
+print(f'Connector instalado em {target}')
+PY
+
+COPY connector_server.py ocpp_gateway.py gateway_manager.py /app/
+
+# A imagem só é publicada quando todos os módulos realmente podem ser importados.
+RUN python3 - <<'PY'
+from pathlib import Path
+import importlib.util
+import leaphub_connector
+assert Path('/app/connector.py').is_file()
+assert leaphub_connector.CONNECTOR_VERSION
+assert leaphub_connector.package_version() is not None
+for module in ('connector_server', 'ocpp_gateway', 'gateway_manager'):
+    spec = importlib.util.find_spec(module)
+    if spec is None:
+        raise SystemExit(f'Módulo ausente: {module}')
+print('Autoteste de importação concluído com sucesso.')
+PY
+
 RUN python3 -m compileall -q /app \
     && mkdir -p /data/runtime /data/logs
 

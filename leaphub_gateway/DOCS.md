@@ -1,4 +1,4 @@
-# Leap Hub Gateway 1.11.54.4
+# Leap Hub Gateway 1.11.54.5
 
 ## Visão geral
 

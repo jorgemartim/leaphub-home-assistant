@@ -71,6 +71,22 @@ for filename in (
     if filename != "connector.py" and version not in content:
         fail(f"{filename} não contém a versão {version}.")
 
+
+# Garante que o Connector será incluído e importado com o mesmo nome usado em runtime.
+dockerfile = (APP / "Dockerfile").read_text(encoding="utf-8")
+server_source = (APP / "connector_server.py").read_text(encoding="utf-8")
+for marker in (
+    "COPY connector.py /app/connector.py",
+    "leaphub_connector.py",
+    "Autoteste de importação concluído",
+):
+    if marker not in dockerfile:
+        fail(f"Dockerfile não contém a proteção obrigatória: {marker}")
+if "import leaphub_connector as connector" not in server_source:
+    fail("connector_server.py não usa o módulo interno leaphub_connector.")
+if (APP / "connector.py").stat().st_size < 1000:
+    fail("connector.py parece vazio ou incompleto.")
+
 for required_file in (
     "README.md",
     "DOCS.md",

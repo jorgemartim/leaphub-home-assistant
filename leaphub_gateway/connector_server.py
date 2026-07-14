@@ -14,9 +14,14 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-import connector
+try:
+    import leaphub_connector as connector
+except ModuleNotFoundError as exc:
+    raise RuntimeError(
+        "Módulo interno leaphub_connector ausente na imagem. Atualize o Leap Hub Gateway."
+    ) from exc
 
-VERSION = "1.11.54.4"
+VERSION = "1.11.54.5"
 SERVICE = "Leap Hub Leapmotor Connector"
 MAX_BODY = 1024 * 1024
 WINDOW_SECONDS = 180

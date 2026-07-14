@@ -35,6 +35,16 @@ jobs:
           fi
           echo "version=${version}" >> "${GITHUB_OUTPUT}"
 
+      - name: Verify Connector sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s leaphub_gateway/connector.py
+          test -s leaphub_gateway/connector_server.py
+          grep -q "import leaphub_connector as connector" leaphub_gateway/connector_server.py
+          grep -q "COPY connector.py /app/connector.py" leaphub_gateway/Dockerfile
+          sha256sum leaphub_gateway/connector.py
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4.2.0
 

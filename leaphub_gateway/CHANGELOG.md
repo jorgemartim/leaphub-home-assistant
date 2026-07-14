@@ -1,12 +1,12 @@
 # Changelog
 
-## 1.11.54.4
+## 1.11.54.5
 
-- Corrige a imagem-base que causava `apk: not found` durante a compilação local.
-- Passa a usar Python 3.12 sobre Debian slim para evitar bibliotecas compartilhadas ausentes.
-- Substitui o workflow quebrado por publicação direta no GitHub Container Registry.
-- Publica inicialmente para `amd64`, a arquitetura do servidor atual.
-- Adiciona cache de camadas para acelerar builds futuros no GitHub.
+- Corrige `ModuleNotFoundError: No module named leaphub_connector/connector`.
+- Instala o Connector em `site-packages` com nome interno exclusivo.
+- Adiciona autoteste obrigatório de importação na compilação Docker.
+- Adiciona validação de presença e tamanho do arquivo `connector.py`.
+- Registra no log o caminho do módulo carregado antes de iniciar os serviços.
 
 ## 1.11.54.2
 
