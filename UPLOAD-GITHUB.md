@@ -17,7 +17,7 @@ https://github.com/jorgemartim/leaphub-home-assistant
 7. Em **Commit changes**, use:
 
    ```text
-   Publica Leap Hub Gateway 1.11.54.3
+   Publica Leap Hub Gateway 1.11.54.4
    ```
 
 8. Clique em **Commit changes**.

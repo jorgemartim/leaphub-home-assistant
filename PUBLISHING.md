@@ -6,7 +6,7 @@
 2. Atualize `version` em `leaphub_gateway/config.yaml`.
 3. Registre as mudanças em `leaphub_gateway/CHANGELOG.md`.
 4. Envie as alterações para o branch `main`.
-5. O GitHub Actions valida o pacote, compila `amd64` e `aarch64`, publica as imagens e cria o manifesto multi-arquitetura.
+5. O GitHub Actions valida o pacote, compila a imagem `amd64` e publica no GitHub Container Registry.
 6. O Home Assistant detecta a nova versão pelo `config.yaml`.
 
 ## Nome da imagem
@@ -38,7 +38,7 @@ Uma imagem pública pode ser baixada pelo Home Assistant sem login no GitHub.
 
 - Não reutilize uma versão que já foi publicada.
 - Não altere o código mantendo o mesmo número de versão.
-- Use versões crescentes, por exemplo `1.11.54.3`, `1.11.55` e `1.11.55.1`.
+- Use versões crescentes, por exemplo `1.11.54.4`, `1.11.55` e `1.11.55.1`.
 - O valor de `version` precisa corresponder à tag da imagem.
 
 ## Execução manual
