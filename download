@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+*.log
+.env
+.env.*
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.zip
+*.tar.gz
+runtime/
+data/
