@@ -16,7 +16,7 @@ from typing import Any
 
 import connector
 
-VERSION = "1.11.54.3"
+VERSION = "1.11.54.4"
 SERVICE = "Leap Hub Leapmotor Connector"
 MAX_BODY = 1024 * 1024
 WINDOW_SECONDS = 180

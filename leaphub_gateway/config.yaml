@@ -1,12 +1,11 @@
 name: "Leap Hub Gateway"
-version: "1.11.54.3"
+version: "1.11.54.4"
 slug: "leaphub_gateway"
 description: "Gateway unificado do Leap Hub: Leapmotor, OCPP Beta/Produção, Cloudflare Tunnel e diagnóstico Ingress."
 url: "https://github.com/jorgemartim/leaphub-home-assistant"
 image: "ghcr.io/jorgemartim/leaphub-gateway"
 arch:
   - amd64
-  - aarch64
 startup: services
 boot: auto
 init: false

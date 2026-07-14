@@ -1,13 +1,12 @@
 # Changelog
 
-## 1.11.54.3
+## 1.11.54.4
 
-- Distribuição oficial pelo GitHub Container Registry.
-- Instalação e atualização sem compilação local no Home Assistant.
-- Suporte a `amd64` e `aarch64`.
-- Download do Cloudflared adaptado por arquitetura e validado por SHA-256.
-- Repositório oficial com documentação, botão de instalação e workflows automáticos.
-- URL e metadados atualizados para o repositório oficial.
+- Corrige a imagem-base que causava `apk: not found` durante a compilação local.
+- Passa a usar Python 3.12 sobre Debian slim para evitar bibliotecas compartilhadas ausentes.
+- Substitui o workflow quebrado por publicação direta no GitHub Container Registry.
+- Publica inicialmente para `amd64`, a arquitetura do servidor atual.
+- Adiciona cache de camadas para acelerar builds futuros no GitHub.
 
 ## 1.11.54.2
 
