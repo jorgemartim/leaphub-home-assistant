@@ -48,10 +48,12 @@ class TelemetryEngine:
         self.wake_event = threading.Event()
         self.worker: threading.Thread | None = None
         self.lock = threading.RLock()
-        self.active_seconds = self._bounded("telemetry_active_seconds", 15, 10, 120)
-        self.charging_seconds = self._bounded("telemetry_charging_seconds", 30, 15, 300)
-        self.parked_seconds = self._bounded("telemetry_parked_seconds", 300, 60, 1800)
-        self.sleep_seconds = self._bounded("telemetry_sleep_seconds", 900, 300, 7200)
+        self.active_seconds = self._bounded("telemetry_active_seconds", 5, 5, 120)
+        self.charging_seconds = self._bounded("telemetry_charging_seconds", 5, 5, 300)
+        self.parked_seconds = self._bounded("telemetry_parked_seconds", 30, 15, 1800)
+        self.sleep_seconds = self._bounded("telemetry_sleep_seconds", 120, 60, 7200)
+        self.rate_limit_cooldown_seconds = self._bounded("telemetry_rate_limit_cooldown_seconds", 1800, 300, 21600)
+        self.charge_watch_seconds = max(5, min(15, self.charging_seconds * 2))
         self.batch_size = self._bounded("telemetry_batch_size", 25, 1, 50)
         self.retention_days = self._bounded("telemetry_retention_days", 7, 1, 60)
         self.queue_max = self._bounded("telemetry_queue_max_events", 10000, 100, 100000)
@@ -114,6 +116,7 @@ class TelemetryEngine:
                     last_state TEXT NULL,
                     parked_streak INTEGER NOT NULL DEFAULT 0,
                     consecutive_failures INTEGER NOT NULL DEFAULT 0,
+                    cooldown_until REAL NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
@@ -139,6 +142,9 @@ class TelemetryEngine:
                 CREATE INDEX IF NOT EXISTS idx_events_subscription ON events(subscription_id, created_at);
                 """
             )
+            columns = {str(row[1]) for row in db.execute("PRAGMA table_info(subscriptions)").fetchall()}
+            if "cooldown_until" not in columns:
+                db.execute("ALTER TABLE subscriptions ADD COLUMN cooldown_until REAL NOT NULL DEFAULT 0")
 
     def start(self) -> None:
         if self.worker and self.worker.is_alive():
@@ -171,19 +177,19 @@ class TelemetryEngine:
                 raise ValueError("Credenciais de telemetria incompletas.")
         encrypted = self.fernet.encrypt(canonical_json(credentials))
         now = utc_iso()
-        next_run = time.time() + random.uniform(1.0, 4.0)
+        next_run = time.time() + random.uniform(0.5, 1.5)
         with self.lock, self._db() as db:
             db.execute(
                 """
                 INSERT INTO subscriptions
                 (subscription_id, environment, account_id, credentials_encrypted, vehicle_ids_json, enabled, status, next_run_at,
-                 last_run_at, last_success_at, last_delivery_at, last_error, last_state, parked_streak, consecutive_failures, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, 'waiting', ?, NULL, NULL, NULL, NULL, NULL, 0, 0, ?, ?)
+                 last_run_at, last_success_at, last_delivery_at, last_error, last_state, parked_streak, consecutive_failures, cooldown_until, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, 'waiting', ?, NULL, NULL, NULL, NULL, NULL, 0, 0, 0, ?, ?)
                 ON CONFLICT(subscription_id) DO UPDATE SET
                     environment=excluded.environment, account_id=excluded.account_id,
                     credentials_encrypted=excluded.credentials_encrypted, vehicle_ids_json=excluded.vehicle_ids_json,
                     enabled=excluded.enabled, status='waiting', next_run_at=excluded.next_run_at,
-                    last_error=NULL, consecutive_failures=0, updated_at=excluded.updated_at
+                    last_error=NULL, consecutive_failures=0, cooldown_until=0, updated_at=excluded.updated_at
                 """,
                 (subscription_id, environment, account_id, encrypted, json.dumps(vehicle_ids), 1 if enabled else 0, next_run, now, now),
             )
@@ -234,8 +240,10 @@ class TelemetryEngine:
             "profiles": {
                 "driving_seconds": self.active_seconds,
                 "charging_seconds": self.charging_seconds,
+                "charge_watch_seconds": self.charge_watch_seconds,
                 "parked_seconds": self.parked_seconds,
                 "sleep_seconds": self.sleep_seconds,
+                "rate_limit_cooldown_seconds": self.rate_limit_cooldown_seconds,
             },
             "recent": recent,
         }
@@ -280,6 +288,10 @@ class TelemetryEngine:
             self._reschedule(sid, 60, "queue_full", "Fila persistente atingiu o limite; aguardando entrega ao site.", failed=False)
             LOG.error("Fila de telemetria cheia (%s eventos). Coleta pausada até a entrega liberar espaço.", queued)
             return
+        cooldown_until = float(subscription["cooldown_until"] or 0)
+        if cooldown_until > time.time():
+            self._reschedule(sid, max(5, int(cooldown_until - time.time())), "cooldown", "Proteção de limite ativa; aguardando antes da próxima consulta.", failed=False)
+            return
         environment = str(subscription["environment"])
         if not self.environment_enabled.get(environment, False) or not self.delivery_urls.get(environment):
             self._reschedule(sid, self.sleep_seconds, "disabled", "URL de entrega ou ambiente desativado.", failed=True)
@@ -302,9 +314,20 @@ class TelemetryEngine:
         try:
             result = connector.handle_account({"credentials": credentials, "read_only": True}, sync=True)
         except Exception as exc:  # noqa: BLE001
+            message = connector.clean_message(str(exc))
             failures = int(subscription["consecutive_failures"] or 0) + 1
-            delay = min(self.sleep_seconds, max(30, 15 * (2 ** min(failures, 6))))
-            self._reschedule(sid, delay, "error", connector.clean_message(str(exc)), failed=True)
+            if self._looks_rate_limited(message):
+                delay = self.rate_limit_cooldown_seconds
+                now = utc_iso()
+                with self.lock, self._db() as db:
+                    db.execute(
+                        "UPDATE subscriptions SET status='cooldown', cooldown_until=?, next_run_at=?, last_run_at=?, last_error=?, consecutive_failures=consecutive_failures+1, updated_at=? WHERE subscription_id=?",
+                        (time.time() + delay, time.time() + delay, now, message[:500], now, sid),
+                    )
+                LOG.warning("Proteção contra limite ativada para %s por %ss: %s", sid, delay, message)
+            else:
+                delay = min(self.sleep_seconds, max(15, 10 * (2 ** min(failures, 6))))
+                self._reschedule(sid, delay, "error", message, failed=True)
             return
         finally:
             self.operation_semaphore.release()
@@ -325,15 +348,19 @@ class TelemetryEngine:
             states.append(state)
             self._queue_event(subscription, vehicle, source_at)
 
+        previous_state = str(subscription["last_state"] or "")
         interval, aggregate_state, parked_streak = self._adaptive_interval(states, int(subscription["parked_streak"] or 0))
-        jitter = random.uniform(0, max(1.0, interval * 0.08))
+        jitter = random.uniform(0, min(2.0, max(0.25, interval * 0.04)))
         now = utc_iso()
         with self.lock, self._db() as db:
             db.execute(
-                "UPDATE subscriptions SET status='active', next_run_at=?, last_run_at=?, last_success_at=?, last_error=NULL, last_state=?, parked_streak=?, consecutive_failures=0, updated_at=? WHERE subscription_id=?",
+                "UPDATE subscriptions SET status='active', next_run_at=?, last_run_at=?, last_success_at=?, last_error=NULL, last_state=?, parked_streak=?, consecutive_failures=0, cooldown_until=0, updated_at=? WHERE subscription_id=?",
                 (time.time() + interval + jitter, now, now, aggregate_state, parked_streak, now, sid),
             )
-        LOG.info("Telemetria %s: %s veículo(s), estado %s, próxima consulta em %ss.", sid, len(vehicles), aggregate_state, int(interval + jitter))
+        if previous_state != aggregate_state:
+            LOG.info("Telemetria %s mudou de %s para %s; próxima consulta em %ss.", sid, previous_state or "inicial", aggregate_state, int(interval + jitter))
+        else:
+            LOG.debug("Telemetria %s: %s veículo(s), estado %s, próxima consulta em %ss.", sid, len(vehicles), aggregate_state, int(interval + jitter))
         self.wake_event.set()
 
     def _state_of(self, telemetry: dict[str, Any]) -> str:
@@ -343,10 +370,12 @@ class TelemetryEngine:
             speed = float(telemetry.get("speed_kmh") or 0)
         except (TypeError, ValueError):
             speed = 0
+        if charging in {"charging", "active", "fast_charging", "slow_charging", "dc_charging", "ac_charging"} or state == "charging":
+            return "charging"
         if speed > 1 or state in {"driving", "ready"} or telemetry.get("ready_state") is True or telemetry.get("ignition_on") is True:
             return "driving"
-        if charging == "charging" or state == "charging":
-            return "charging"
+        if telemetry.get("plugged") is True or charging == "plugged":
+            return "charge_watch"
         if telemetry.get("is_parked") is True or state == "parked":
             return "parked"
         return "sleep"
@@ -356,12 +385,22 @@ class TelemetryEngine:
             return self.active_seconds, "driving", 0
         if "charging" in states:
             return self.charging_seconds, "charging", 0
+        if "charge_watch" in states:
+            return self.charge_watch_seconds, "charge_watch", 0
         if "parked" in states:
             streak = previous_parked_streak + 1
-            if streak >= 4:
+            if streak >= 20:
                 return self.sleep_seconds, "sleep", streak
             return self.parked_seconds, "parked", streak
         return self.sleep_seconds, "sleep", previous_parked_streak + 1
+
+    @staticmethod
+    def _looks_rate_limited(message: str) -> bool:
+        normalized = str(message or "").lower()
+        return any(token in normalized for token in (
+            "429", "too many", "rate limit", "rate-limit", "throttle", "temporarily blocked",
+            "muitas solicitações", "limite de requisições", "conta bloqueada",
+        ))
 
     def _queue_event(self, subscription: sqlite3.Row, vehicle: dict[str, Any], source_at: str) -> None:
         environment = str(subscription["environment"])
@@ -419,7 +458,7 @@ class TelemetryEngine:
             valid_rows.append(row)
         if not events:
             return
-        body = canonical_json({"events": events, "gateway_version": "1.11.55", "sent_at": utc_iso()})
+        body = canonical_json({"events": events, "gateway_version": "1.11.56", "sent_at": utc_iso()})
         parsed = urllib.parse.urlparse(url)
         path = parsed.path or "/"
         timestamp = str(int(time.time()))
@@ -433,7 +472,7 @@ class TelemetryEngine:
             headers={
                 "Content-Type": "application/json",
                 "Accept": "application/json",
-                "User-Agent": "LeapHubGateway/1.11.55",
+                "User-Agent": "LeapHubGateway/1.11.56",
                 "X-LeapHub-Timestamp": timestamp,
                 "X-LeapHub-Nonce": nonce,
                 "X-LeapHub-Environment": environment,

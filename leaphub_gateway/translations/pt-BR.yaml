@@ -28,16 +28,19 @@ configuration:
     description: URL HTTPS que recebe a fila no Leap Hub de Produção.
   telemetry_active_seconds:
     name: Intervalo durante viagem
-    description: Frequência de consulta quando o veículo está em movimento ou READY.
+    description: Consulta automática rápida durante viagem. O padrão é 5 segundos e usa proteção com recuo em caso de limite ou falha.
   telemetry_charging_seconds:
     name: Intervalo durante recarga
-    description: Frequência de consulta durante carregamento.
+    description: Consulta automática durante carregamento. O padrão é 5 segundos para detectar o início e acompanhar a curva.
   telemetry_parked_seconds:
     name: Intervalo estacionado
-    description: Frequência inicial quando o veículo está estacionado.
+    description: Frequência automática quando estacionado. O padrão é 30 segundos para detectar cabo, recarga ou início de viagem.
   telemetry_sleep_seconds:
     name: Intervalo em repouso prolongado
-    description: Frequência econômica após várias leituras estacionadas.
+    description: Frequência econômica após repouso prolongado. O padrão é 120 segundos.
+  telemetry_rate_limit_cooldown_seconds:
+    name: Pausa de proteção da nuvem Leapmotor
+    description: Tempo de espera automático quando o Gateway detectar limitação de requisições. O padrão é 30 minutos.
   telemetry_batch_size:
     name: Eventos por envio
     description: Quantidade máxima de leituras enviadas ao site em cada lote.

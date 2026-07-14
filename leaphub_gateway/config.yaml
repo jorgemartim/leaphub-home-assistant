@@ -1,7 +1,7 @@
 name: "Leap Hub Gateway"
-version: "1.11.55"
+version: "1.11.56"
 slug: "leaphub_gateway"
-description: "Gateway unificado com telemetria contínua, fila persistente, Leapmotor, OCPP e Cloudflare Tunnel."
+description: "Gateway unificado com sincronização automática adaptativa, fila persistente, Leapmotor, OCPP e Cloudflare Tunnel."
 url: "https://github.com/jorgemartim/leaphub-home-assistant"
 image: "ghcr.io/jorgemartim/leaphub-gateway"
 arch:
@@ -36,10 +36,11 @@ options:
   telemetry_beta_internal_url: "https://leaphub.com.br/beta/leap/api/internal/telemetry/events"
   telemetry_production_enabled: false
   telemetry_production_internal_url: "https://leaphub.com.br/leap/api/internal/telemetry/events"
-  telemetry_active_seconds: 15
-  telemetry_charging_seconds: 30
-  telemetry_parked_seconds: 300
-  telemetry_sleep_seconds: 900
+  telemetry_active_seconds: 5
+  telemetry_charging_seconds: 5
+  telemetry_parked_seconds: 30
+  telemetry_sleep_seconds: 120
+  telemetry_rate_limit_cooldown_seconds: 1800
   telemetry_batch_size: 25
   telemetry_retention_days: 7
   telemetry_queue_max_events: 10000
@@ -66,10 +67,11 @@ schema:
   telemetry_beta_internal_url: url
   telemetry_production_enabled: bool
   telemetry_production_internal_url: url
-  telemetry_active_seconds: "int(10,120)"
-  telemetry_charging_seconds: "int(15,300)"
-  telemetry_parked_seconds: "int(60,1800)"
-  telemetry_sleep_seconds: "int(300,7200)"
+  telemetry_active_seconds: "int(5,120)"
+  telemetry_charging_seconds: "int(5,300)"
+  telemetry_parked_seconds: "int(15,1800)"
+  telemetry_sleep_seconds: "int(60,7200)"
+  telemetry_rate_limit_cooldown_seconds: "int(300,21600)"
   telemetry_batch_size: "int(1,50)"
   telemetry_retention_days: "int(1,60)"
   telemetry_queue_max_events: "int(100,100000)"

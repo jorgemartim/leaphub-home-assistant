@@ -17,7 +17,7 @@ https://github.com/jorgemartim/leaphub-home-assistant
 7. Em **Commit changes**, use:
 
    ```text
-   Corrige Connector e publica Leap Hub Gateway 1.11.55
+   Corrige Connector e publica Leap Hub Gateway 1.11.56
    ```
 
 8. Clique em **Commit changes**.

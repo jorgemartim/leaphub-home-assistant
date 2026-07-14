@@ -38,7 +38,7 @@ Uma imagem pública pode ser baixada pelo Home Assistant sem login no GitHub.
 
 - Não reutilize uma versão que já foi publicada.
 - Não altere o código mantendo o mesmo número de versão.
-- Use versões crescentes, por exemplo `1.11.55`, `1.11.56` e `1.11.56.1`.
+- Use versões crescentes, por exemplo `1.11.56`, `1.11.56` e `1.11.56.1`.
 - O valor de `version` precisa corresponder à tag da imagem.
 
 ## Execução manual

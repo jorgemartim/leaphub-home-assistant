@@ -51,6 +51,6 @@ Apps antigos:
 Remova-os somente depois de alguns dias de funcionamento estável e após confirmar que as chaves foram preservadas em local seguro.
 
 
-## Telemetria contínua 1.11.55
+## Telemetria contínua 1.11.56
 
 O Gateway guarda credenciais e eventos criptografados em `/data/telemetry`, usa intervalos adaptativos e reenvia a fila quando o site volta. Eventos usam identificadores determinísticos para impedir duplicidade. Uma queda do Home Assistant inteiro cria uma lacuna real; o sistema não inventa rota, consumo ou posições.

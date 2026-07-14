@@ -38,6 +38,9 @@ configuration:
   telemetry_sleep_seconds:
     name: Extended rest interval
     description: Economy frequency after repeated parked readings.
+  telemetry_rate_limit_cooldown_seconds:
+    name: Leapmotor cloud protection cooldown
+    description: Automatic pause when request limiting is detected. Default is 30 minutes.
   telemetry_batch_size:
     name: Events per delivery
     description: Maximum readings sent to the site in one batch.
