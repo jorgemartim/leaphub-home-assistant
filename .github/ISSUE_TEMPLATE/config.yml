@@ -1,5 +1,0 @@
-blank_issues_enabled: false
-contact_links:
-  - name: Documentação do Leap Hub Gateway
-    url: https://github.com/jorgemartim/leaphub-home-assistant/blob/main/leaphub_gateway/DOCS.md
-    about: Consulte a documentação antes de abrir um problema.
