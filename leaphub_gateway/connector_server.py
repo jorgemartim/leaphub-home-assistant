@@ -10,7 +10,15 @@ import re
 import sys
 import threading
 import time
-from telemetry_engine import TelemetryEngine
+try:
+    from leaphub_telemetry_engine import TelemetryEngine
+except ModuleNotFoundError:
+    try:
+        from telemetry_engine import TelemetryEngine
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "Módulo interno de telemetria ausente na imagem. Atualize o Leap Hub Gateway."
+        ) from exc
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -22,7 +30,7 @@ except ModuleNotFoundError as exc:
         "Módulo interno leaphub_connector ausente na imagem. Atualize o Leap Hub Gateway."
     ) from exc
 
-VERSION = "1.11.56"
+VERSION = "1.11.56.1"
 SERVICE = "Leap Hub Leapmotor Connector"
 MAX_BODY = 1024 * 1024
 WINDOW_SECONDS = 180

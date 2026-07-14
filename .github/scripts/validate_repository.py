@@ -62,6 +62,7 @@ for key in (
 for filename in (
     "connector.py",
     "connector_server.py",
+    "telemetry_engine.py",
     "ocpp_gateway.py",
     "gateway_manager.py",
 ):
@@ -76,16 +77,20 @@ for filename in (
 dockerfile = (APP / "Dockerfile").read_text(encoding="utf-8")
 server_source = (APP / "connector_server.py").read_text(encoding="utf-8")
 for marker in (
-    "COPY connector.py /app/connector.py",
+    "COPY connector.py telemetry_engine.py /app/",
     "leaphub_connector.py",
-    "Autoteste de importação concluído",
+    "leaphub_telemetry_engine.py",
+    "Autoteste de importação de Connector e telemetria concluído",
 ):
     if marker not in dockerfile:
         fail(f"Dockerfile não contém a proteção obrigatória: {marker}")
 if "import leaphub_connector as connector" not in server_source:
     fail("connector_server.py não usa o módulo interno leaphub_connector.")
-if (APP / "connector.py").stat().st_size < 1000:
-    fail("connector.py parece vazio ou incompleto.")
+if "leaphub_telemetry_engine" not in server_source:
+    fail("connector_server.py não usa o módulo interno leaphub_telemetry_engine.")
+for critical in ("connector.py", "telemetry_engine.py"):
+    if (APP / critical).stat().st_size < 1000:
+        fail(f"{critical} parece vazio ou incompleto.")
 
 for required_file in (
     "README.md",

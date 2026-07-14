@@ -1,23 +1,13 @@
 # Changelog
 
-## 1.11.56
+## 1.11.56.1
 
-- Sincronização automática adaptativa: 5 s em viagem e recarga, 10 s com cabo conectado, 30 s estacionado e 120 s em repouso.
-- Proteção com jitter, fila por conta, recuo exponencial e pausa automática ao detectar limitação.
-- Logs de ciclos bem-sucedidos passam para DEBUG; mudanças de estado continuam visíveis.
-- Painel mostra o novo perfil automático e o tempo de proteção.
+- Corrige a inclusão e a importação do motor de telemetria na imagem publicada.
+- Instala o módulo também em site-packages com nome interno exclusivo.
+- Adiciona teste de runtime da imagem exata antes da publicação no GHCR.
+- Mantém configurações, fila persistente, OCPP e Tunnel sem alteração.
 
-# 1.11.56
-
-- Telemetria adaptativa durante viagem, recarga, estacionamento e repouso.
-- Fila SQLite persistente com credenciais e eventos criptografados.
-- Entrega idempotente ao site e recuperação após indisponibilidade.
-- Painel com assinaturas, fila e falhas; healthchecks sem poluir logs.
-- Origens do Tunnel corrigidas para 127.0.0.1 dentro do App unificado.
-
-# Changelog
-
-## 1.11.56
+## 1.11.56.1
 
 - Corrige `ModuleNotFoundError: No module named leaphub_connector/connector`.
 - Instala o Connector em `site-packages` com nome interno exclusivo.
