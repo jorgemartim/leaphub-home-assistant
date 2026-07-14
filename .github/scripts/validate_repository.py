@@ -45,7 +45,7 @@ if config["image"] != "ghcr.io/jorgemartim/leaphub-gateway":
     fail("A imagem do config.yaml não aponta para o GHCR oficial.")
 
 architectures = set(config["arch"])
-if architectures != {"amd64", "aarch64"}:
+if architectures != {"amd64"}:
     fail(f"Arquiteturas inesperadas: {sorted(architectures)}")
 
 options = config.get("options", {})
