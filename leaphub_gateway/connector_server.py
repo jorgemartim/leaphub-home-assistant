@@ -10,6 +10,7 @@ import re
 import sys
 import threading
 import time
+from telemetry_engine import TelemetryEngine
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -21,7 +22,7 @@ except ModuleNotFoundError as exc:
         "Módulo interno leaphub_connector ausente na imagem. Atualize o Leap Hub Gateway."
     ) from exc
 
-VERSION = "1.11.54.5"
+VERSION = "1.11.55"
 SERVICE = "Leap Hub Leapmotor Connector"
 MAX_BODY = 1024 * 1024
 WINDOW_SECONDS = 180
@@ -44,11 +45,13 @@ SECRETS = {
     "staging": str(OPTIONS.get("staging_secret") or "").strip(),
     "production": str(OPTIONS.get("production_secret") or "").strip(),
 }
-MAX_PARALLEL = max(1, min(4, int(OPTIONS.get("max_parallel_requests") or 2)))
+MAX_PARALLEL = max(1, min(8, int(OPTIONS.get("max_parallel_requests") or 2)))
 SEMAPHORE = threading.BoundedSemaphore(MAX_PARALLEL)
+MANUAL_WAIT_SECONDS = max(2, min(60, int(OPTIONS.get("manual_wait_seconds") or 20)))
 LOG_LEVEL = str(OPTIONS.get("log_level") or "INFO").upper()
 logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO), format="%(asctime)s %(levelname)s %(message)s")
 LOG = logging.getLogger("leaphub.connector")
+TELEMETRY = TelemetryEngine(OPTIONS, SECRETS, SEMAPHORE)
 
 
 def json_bytes(payload: dict[str, Any]) -> bytes:
@@ -121,7 +124,11 @@ class Handler(BaseHTTPRequestHandler):
     sys_version = ""
 
     def log_message(self, fmt: str, *args: Any) -> None:
-        LOG.info("%s - %s", self.address_string(), fmt % args)
+        line = fmt % args
+        if self.client_address[0] in {"127.0.0.1", "::1"} and 'GET /health ' in line and line.endswith(' 200 -'):
+            LOG.debug("local healthcheck")
+            return
+        LOG.info("%s - %s", self.address_string(), line)
 
     def send_json(self, status: int, payload: dict[str, Any]) -> None:
         body = json_bytes(payload)
@@ -141,19 +148,24 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/health":
             self.send_json(200, public_health_payload())
             return
-        if path == "/health/details":
+        if path in {"/health/details", "/v1/telemetry/status"}:
             try:
                 environment = verify_signature("GET", path, b"", self.headers)
             except PermissionError as exc:
                 LOG.warning("Private diagnostics rejected: %s", exc)
                 self.send_json(403, {"ok": False})
                 return
-            self.send_json(200, detailed_health_payload(environment))
+            if path == "/health/details":
+                details = detailed_health_payload(environment)
+                details["telemetry"] = TELEMETRY.status()
+                self.send_json(200, details)
+            else:
+                self.send_json(200, TELEMETRY.status())
             return
         self.send_json(404, {"ok": False, "message": "Página não encontrada."})
 
     def do_POST(self) -> None:
-        if self.path not in {"/v1/accounts/test", "/v1/vehicles/sync", "/v1/vehicles/command"}:
+        if self.path not in {"/v1/accounts/test", "/v1/vehicles/sync", "/v1/vehicles/command", "/v1/telemetry/subscriptions/upsert", "/v1/telemetry/subscriptions/remove", "/v1/telemetry/subscriptions/boost"}:
             self.send_json(404, {"ok": False, "message": "Página não encontrada."})
             return
         try:
@@ -177,26 +189,36 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(400, {"ok": False, "message": "Payload inválido."})
             return
 
-        acquired = SEMAPHORE.acquire(timeout=2)
-        if not acquired:
-            self.send_json(503, {"ok": False, "message": "Conector ocupado. Tente novamente em instantes."})
-            return
         try:
             LOG.info("Action %s accepted for %s", self.path, environment)
-            if self.path == "/v1/accounts/test":
-                result = connector.handle_account(payload, sync=False)
-            elif self.path == "/v1/vehicles/sync":
-                result = connector.handle_account(payload, sync=True)
-            else:
-                result = connector.handle_command(payload)
-            self.send_json(200, result)
+            if self.path == "/v1/telemetry/subscriptions/upsert":
+                self.send_json(200, TELEMETRY.upsert(environment, payload))
+                return
+            if self.path == "/v1/telemetry/subscriptions/remove":
+                self.send_json(200, TELEMETRY.remove(str(payload.get("subscription_id") or "")))
+                return
+            if self.path == "/v1/telemetry/subscriptions/boost":
+                self.send_json(200, TELEMETRY.boost(str(payload.get("subscription_id") or ""), int(payload.get("seconds") or 900)))
+                return
+            acquired = SEMAPHORE.acquire(timeout=MANUAL_WAIT_SECONDS)
+            if not acquired:
+                self.send_json(503, {"ok": False, "message": "Conector ocupado. A solicitação não perdeu dados; tente novamente em instantes."})
+                return
+            try:
+                if self.path == "/v1/accounts/test":
+                    result = connector.handle_account(payload, sync=False)
+                elif self.path == "/v1/vehicles/sync":
+                    result = connector.handle_account(payload, sync=True)
+                else:
+                    result = connector.handle_command(payload)
+                self.send_json(200, result)
+            finally:
+                SEMAPHORE.release()
         except (ValueError, RuntimeError) as exc:
             self.send_json(422, {"ok": False, "message": connector.clean_message(str(exc)), "connector_version": connector.CONNECTOR_VERSION})
         except Exception as exc:  # noqa: BLE001
             LOG.exception("Unhandled connector error")
             self.send_json(500, {"ok": False, "message": "Falha interna no conector.", "connector_version": connector.CONNECTOR_VERSION})
-        finally:
-            SEMAPHORE.release()
 
 
 if __name__ == "__main__":
@@ -204,5 +226,9 @@ if __name__ == "__main__":
         LOG.error("Configure staging_secret ou production_secret antes de iniciar.")
     server = ThreadingHTTPServer(("0.0.0.0", 8094), Handler)
     server.daemon_threads = True
+    TELEMETRY.start()
     LOG.info("%s listening on port 8094", SERVICE)
-    server.serve_forever()
+    try:
+        server.serve_forever()
+    finally:
+        TELEMETRY.stop()

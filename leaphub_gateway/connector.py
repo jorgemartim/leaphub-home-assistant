@@ -20,7 +20,7 @@ from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any
 
-CONNECTOR_VERSION = "0.9.0"
+CONNECTOR_VERSION = "1.11.55"
 MAX_INPUT_BYTES = 1024 * 1024
 
 COMMAND_METHODS: dict[str, str] = {
@@ -259,6 +259,31 @@ def plain_data(value: Any, depth: int = 0) -> Any:
     if hasattr(value, "__dict__"):
         return plain_data(vars(value), depth + 1)
     return text_value(value, 500)
+
+
+def redacted_cloud_raw(value: Any, depth: int = 0) -> Any:
+    """Preserve unknown cloud signals while removing credentials and exact location."""
+    if depth > 7:
+        return "[limite de profundidade]"
+    if isinstance(value, dict):
+        result: dict[str, Any] = {}
+        for key, item in list(value.items())[:300]:
+            name = str(key)[:120]
+            normalized = normalized_key(name)
+            if any(token in normalized for token in (
+                "password", "passwd", "token", "secret", "certificate", "privatekey", "authorization",
+                "latitude", "longitude", "location", "coordinate", "vin", "deviceid", "userid", "email",
+            )):
+                result[name] = "[redigido]"
+            else:
+                result[name] = redacted_cloud_raw(item, depth + 1)
+        return result
+    if isinstance(value, (list, tuple, set)):
+        return [redacted_cloud_raw(item, depth + 1) for item in list(value)[:300]]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        text = value if not isinstance(value, str) else value[:500]
+        return text
+    return redacted_cloud_raw(plain_data(value), depth + 1)
 
 
 def object_scalar_map(data: Any) -> dict[str, Any]:
@@ -764,6 +789,11 @@ def serialize_vehicle(vehicle: Any, include_status: bool, client: Any, messages:
         },
         "tire_data": {key: numeric(value) for key, value in tire_data.items()},
         "captured_at": iso_timestamp(attribute(status, "collect_time") or attribute(status, "create_time")),
+        "cloud_raw_redacted": redacted_cloud_raw({
+            "vehicle": attribute(vehicle, "raw", {}),
+            "status": attribute(status, "raw", {}),
+        }),
+        "mapping_version": "1.11.55",
     }
     result["telemetry"] = telemetry
     return result

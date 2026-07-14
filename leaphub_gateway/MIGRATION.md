@@ -24,8 +24,8 @@ Apps antigos:
 4. Inicie o Gateway.
 5. Abra o painel lateral e confirme Connector e OCPP Beta em execução.
 6. No Cloudflare Tunnel, altere uma rota por vez:
-   - `connector.leaphub.com.br` → `http://local-leaphub-gateway:8094`;
-   - `ocpp-beta.leaphub.com.br` → `http://local-leaphub-gateway:8092`.
+   - `connector.leaphub.com.br` → `http://127.0.0.1:8094`;
+   - `ocpp-beta.leaphub.com.br` → `http://127.0.0.1:8092`.
 7. Teste os endpoints públicos e o botão **Testar gateway** no Leap Hub Beta.
 8. Ative `tunnel_enabled` e reinicie o Gateway.
 9. Pare o Tunnel antigo.
@@ -49,3 +49,8 @@ Apps antigos:
 ## Remoção dos Apps antigos
 
 Remova-os somente depois de alguns dias de funcionamento estável e após confirmar que as chaves foram preservadas em local seguro.
+
+
+## Telemetria contínua 1.11.55
+
+O Gateway guarda credenciais e eventos criptografados em `/data/telemetry`, usa intervalos adaptativos e reenvia a fila quando o site volta. Eventos usam identificadores determinísticos para impedir duplicidade. Uma queda do Home Assistant inteiro cria uma lacuna real; o sistema não inventa rota, consumo ou posições.

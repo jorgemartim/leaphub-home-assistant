@@ -1,6 +1,14 @@
+# 1.11.55
+
+- Telemetria adaptativa durante viagem, recarga, estacionamento e repouso.
+- Fila SQLite persistente com credenciais e eventos criptografados.
+- Entrega idempotente ao site e recuperação após indisponibilidade.
+- Painel com assinaturas, fila e falhas; healthchecks sem poluir logs.
+- Origens do Tunnel corrigidas para 127.0.0.1 dentro do App unificado.
+
 # Changelog
 
-## 1.11.54.5
+## 1.11.55
 
 - Corrige `ModuleNotFoundError: No module named leaphub_connector/connector`.
 - Instala o Connector em `site-packages` com nome interno exclusivo.

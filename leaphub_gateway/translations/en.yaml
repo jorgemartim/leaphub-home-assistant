@@ -11,6 +11,42 @@ configuration:
   connector_max_parallel:
     name: Parallel Connector requests
     description: Maximum simultaneous Leapmotor cloud operations.
+  connector_manual_wait_seconds:
+    name: Manual operation wait
+    description: Seconds a manual request may wait for an available cloud operation slot.
+  telemetry_beta_enabled:
+    name: Enable Beta continuous telemetry
+    description: Poll adaptively and deliver data to the Beta environment.
+  telemetry_beta_internal_url:
+    name: Beta telemetry internal endpoint
+    description: HTTPS URL that receives the persistent queue in Leap Hub Beta.
+  telemetry_production_enabled:
+    name: Enable Production continuous telemetry
+    description: Enable only after configuring Production site and secret.
+  telemetry_production_internal_url:
+    name: Production telemetry internal endpoint
+    description: HTTPS URL that receives the Production queue.
+  telemetry_active_seconds:
+    name: Driving interval
+    description: Polling frequency while driving or READY.
+  telemetry_charging_seconds:
+    name: Charging interval
+    description: Polling frequency while charging.
+  telemetry_parked_seconds:
+    name: Parked interval
+    description: Initial polling frequency while parked.
+  telemetry_sleep_seconds:
+    name: Extended rest interval
+    description: Economy frequency after repeated parked readings.
+  telemetry_batch_size:
+    name: Events per delivery
+    description: Maximum readings sent to the site in one batch.
+  telemetry_retention_days:
+    name: Local retention after delivery
+    description: Days confirmed events remain in Home Assistant.
+  telemetry_queue_max_events:
+    name: Local queue limit
+    description: Storage protection for the persistent queue.
   ocpp_beta_enabled:
     name: Enable OCPP Beta
     description: Starts the Beta OCPP gateway on port 8092.

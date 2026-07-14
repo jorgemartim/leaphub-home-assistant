@@ -18,7 +18,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-VERSION = "1.11.54.5"
+VERSION = "1.11.55"
 OPTIONS_PATH = Path(os.getenv("LEAPHUB_OPTIONS_PATH", "/data/options.json"))
 RUNTIME = Path(os.getenv("LEAPHUB_RUNTIME_DIR", "/data/runtime"))
 LOG_DIR = Path(os.getenv("LEAPHUB_LOG_DIR", "/data/logs"))
@@ -81,6 +81,8 @@ class ManagedService:
     requested_restart: bool = False
     lines: deque[str] = field(default_factory=lambda: deque(maxlen=300))
     log_file: Any = None
+    health_cache: dict[str, Any] = field(default_factory=lambda: {"ok": False, "message": "não verificado"})
+    health_checked_at: float = 0.0
 
     def state(self) -> str:
         if not self.enabled:
@@ -169,17 +171,28 @@ class ManagedService:
         self.next_start = time.time() + delay
         LOG.warning("%s encerrou com código %s; reinício em %.1fs.", self.label, code, delay)
 
-    def health(self) -> dict[str, Any]:
-        if self.state() != "running":
-            return {"ok": False, "message": self.state()}
+    def health(self, force: bool = False) -> dict[str, Any]:
+        state = self.state()
+        if state != "running":
+            self.health_cache = {"ok": False, "message": state}
+            return dict(self.health_cache)
         if not self.health_url:
-            return {"ok": True, "message": "processo ativo"}
+            self.health_cache = {"ok": True, "message": "processo ativo"}
+            return dict(self.health_cache)
+        now = time.time()
+        if not force and now - self.health_checked_at < 30:
+            return dict(self.health_cache)
+        previous = bool(self.health_cache.get("ok"))
         try:
             with urllib.request.urlopen(self.health_url, timeout=2.5) as response:
                 payload = json.loads(response.read(4096).decode("utf-8"))
-            return {"ok": bool(payload.get("ok")), "message": "endpoint respondeu"}
+            self.health_cache = {"ok": bool(payload.get("ok")), "message": "endpoint respondeu"}
         except Exception as exc:
-            return {"ok": False, "message": str(exc)[:160]}
+            self.health_cache = {"ok": False, "message": str(exc)[:160]}
+        self.health_checked_at = now
+        if previous != bool(self.health_cache.get("ok")):
+            LOG.info("Saúde de %s mudou para %s.", self.label, "OK" if self.health_cache.get("ok") else "falha")
+        return dict(self.health_cache)
 
 
 def write_connector_options() -> Path:
@@ -188,6 +201,18 @@ def write_connector_options() -> Path:
         "staging_secret": str(OPTIONS.get("staging_secret") or "").strip(),
         "production_secret": str(OPTIONS.get("production_secret") or "").strip(),
         "max_parallel_requests": int(OPTIONS.get("connector_max_parallel") or 2),
+        "manual_wait_seconds": int(OPTIONS.get("connector_manual_wait_seconds") or 20),
+        "telemetry_beta_enabled": bool(OPTIONS.get("telemetry_beta_enabled", True)),
+        "telemetry_beta_internal_url": str(OPTIONS.get("telemetry_beta_internal_url") or ""),
+        "telemetry_production_enabled": bool(OPTIONS.get("telemetry_production_enabled", False)),
+        "telemetry_production_internal_url": str(OPTIONS.get("telemetry_production_internal_url") or ""),
+        "telemetry_active_seconds": int(OPTIONS.get("telemetry_active_seconds") or 15),
+        "telemetry_charging_seconds": int(OPTIONS.get("telemetry_charging_seconds") or 30),
+        "telemetry_parked_seconds": int(OPTIONS.get("telemetry_parked_seconds") or 300),
+        "telemetry_sleep_seconds": int(OPTIONS.get("telemetry_sleep_seconds") or 900),
+        "telemetry_batch_size": int(OPTIONS.get("telemetry_batch_size") or 25),
+        "telemetry_retention_days": int(OPTIONS.get("telemetry_retention_days") or 7),
+        "telemetry_queue_max_events": int(OPTIONS.get("telemetry_queue_max_events") or 10000),
         "log_level": LOG_LEVEL,
     }
     path.write_text(json.dumps(payload), encoding="utf-8")
@@ -267,6 +292,22 @@ SERVICES: dict[str, ManagedService] = {
 }
 
 
+
+def telemetry_summary() -> dict[str, Any]:
+    db_path = Path("/data/telemetry/telemetry.sqlite")
+    if not db_path.is_file():
+        return {"subscriptions": 0, "pending_events": 0, "status": "waiting"}
+    try:
+        import sqlite3
+        with sqlite3.connect(db_path, timeout=2) as db:
+            subscriptions = int(db.execute("SELECT COUNT(*) FROM subscriptions WHERE enabled=1").fetchone()[0])
+            pending = int(db.execute("SELECT COUNT(*) FROM events WHERE status='pending'").fetchone()[0])
+            failed = int(db.execute("SELECT COUNT(*) FROM events WHERE status='failed'").fetchone()[0])
+            last = db.execute("SELECT MAX(last_success_at) FROM subscriptions").fetchone()[0]
+        return {"subscriptions": subscriptions, "pending_events": pending, "failed_events": failed, "last_success_at": last, "status": "active" if subscriptions else "waiting"}
+    except Exception as exc:
+        return {"subscriptions": 0, "pending_events": 0, "status": "degraded", "message": str(exc)[:160]}
+
 def status_payload(include_logs: bool = True) -> dict[str, Any]:
     result: dict[str, Any] = {
         "ok": True,
@@ -274,6 +315,7 @@ def status_payload(include_logs: bool = True) -> dict[str, Any]:
         "updated_at": utc_now(),
         "hostname_for_tunnel": "local-leaphub-gateway",
         "services": {},
+        "telemetry": telemetry_summary(),
     }
     max_lines = max(20, min(300, int(OPTIONS.get("dashboard_log_lines") or 80)))
     for name, service in SERVICES.items():
@@ -311,15 +353,16 @@ main{max-width:1180px;margin:auto;padding:24px}.hero{display:flex;gap:18px;align
 details{margin-top:12px}summary{cursor:pointer;color:var(--muted)}pre{white-space:pre-wrap;word-break:break-word;background:#050c15;border:1px solid var(--line);border-radius:12px;padding:12px;max-height:260px;overflow:auto;color:#bcd0e8;font-size:12px}.wide{grid-column:1/-1}.routes{display:grid;grid-template-columns:1fr auto;gap:8px}.routes code{background:#050c15;border:1px solid var(--line);border-radius:10px;padding:9px;overflow:auto}.notice{border-left:3px solid var(--blue);padding:10px 12px;background:rgba(85,167,255,.08);border-radius:10px;color:#cfe4ff}.foot{color:var(--muted);text-align:center;padding:20px}
 @media(max-width:760px){main{padding:14px}.grid{grid-template-columns:1fr}.hero{align-items:flex-start}.badge{display:none}.meta{grid-template-columns:1fr 1fr}.routes{grid-template-columns:1fr}}
 </style></head><body><main>
-<div class="hero"><div class="mark">LH</div><div><h1>Leap Hub Gateway</h1><p class="sub">Connector Leapmotor, OCPP e Cloudflare em um único App</p></div><span class="badge">v1.11.54.5</span></div>
+<div class="hero"><div class="mark">LH</div><div><h1>Leap Hub Gateway</h1><p class="sub">Telemetria resiliente, Connector, OCPP e Cloudflare em um único App</p></div><span class="badge">v1.11.55</span></div>
 <div class="grid" id="cards"></div>
-<section class="card wide" style="margin-top:16px"><div class="head"><div><h2>Rotas do Cloudflare Tunnel</h2><p>Use o mesmo hostname interno para todos os serviços do App unificado.</p></div></div><div class="routes"><code>connector.leaphub.com.br → http://local-leaphub-gateway:8094</code><span>Connector</span><code>ocpp-beta.leaphub.com.br → http://local-leaphub-gateway:8092</code><span>OCPP Beta</span><code>ocpp.leaphub.com.br → http://local-leaphub-gateway:8093</code><span>Produção</span></div><p class="notice">Durante a migração, deixe o Tunnel novo desativado. Altere as rotas, teste, ative o Tunnel unificado e só então pare os Apps antigos.</p></section>
+<section class="card wide" style="margin-top:16px"><div class="head"><div><h2>Rotas do Cloudflare Tunnel</h2><p>Como o Tunnel roda dentro do mesmo App, use 127.0.0.1 nas origens.</p></div></div><div class="routes"><code>connector.leaphub.com.br → http://127.0.0.1:8094</code><span>Connector</span><code>ocpp-beta.leaphub.com.br → http://127.0.0.1:8092</code><span>OCPP Beta</span><code>ocpp.leaphub.com.br → http://127.0.0.1:8093</code><span>Produção</span></div><p class="notice">A fila de telemetria sobrevive a reinícios do App. Uma queda do Home Assistant inteiro ainda cria uma lacuna real, que nunca será preenchida com dados inventados.</p></section>
 <div class="foot">Tokens e chaves nunca são exibidos neste painel.</div></main><script>
 const token='__TOKEN__';const labels={connector:'Connector Leapmotor',ocpp_beta:'OCPP Beta',ocpp_production:'OCPP Produção',tunnel:'Cloudflare Tunnel'};
 function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 async function action(name,kind){const b=document.querySelector(`[data-action="${name}-${kind}"]`);if(b)b.disabled=true;try{const r=await fetch(`api/services/${name}/${kind}`,{method:'POST',headers:{'X-LeapHub-UI-Token':token}});const j=await r.json();alert(j.message||'Concluído');await load()}catch(e){alert('Falha: '+e)}finally{if(b)b.disabled=false}}
 function card(name,s){const health=s.health||{};const logs=(s.logs||[]).join('\n');return `<article class="card"><div class="head"><div><h2>${esc(labels[name]||s.label)}</h2><p>${s.configured?'Configuração pronta':'Configuração pendente'}</p></div><span class="state ${esc(s.state)}">${esc(s.state.replaceAll('_',' '))}</span></div><div class="meta"><div>Saúde<strong>${health.ok?'OK':'Atenção'}</strong></div><div>PID<strong>${esc(s.pid||'—')}</strong></div><div>Reinícios<strong>${esc(s.restarts)}</strong></div></div><div class="actions"><button class="btn" data-action="${name}-test" onclick="action('${name}','test')">Testar</button><button class="btn secondary" data-action="${name}-restart" onclick="action('${name}','restart')" ${!s.enabled||!s.configured?'disabled':''}>Reiniciar serviço</button></div><details><summary>Logs recentes</summary><pre>${esc(logs||'Sem logs nesta inicialização.')}</pre></details></article>`}
-async function load(){const r=await fetch('api/status',{cache:'no-store'});const j=await r.json();document.getElementById('cards').innerHTML=Object.entries(j.services).map(([n,s])=>card(n,s)).join('')}
+function telemetryCard(t){return `<article class="card"><div class="head"><div><h2>Telemetria contínua</h2><p>Fila persistente e consulta adaptativa</p></div><span class="state ${t.status==='active'?'running':'disabled'}">${esc(t.status||'waiting')}</span></div><div class="meta"><div>Assinaturas<strong>${esc(t.subscriptions||0)}</strong></div><div>Pendentes<strong>${esc(t.pending_events||0)}</strong></div><div>Falhas<strong>${esc(t.failed_events||0)}</strong></div></div><p class="notice">Última coleta: ${esc(t.last_success_at||'aguardando veículo')}</p></article>`}
+async function load(){const r=await fetch('api/status',{cache:'no-store'});const j=await r.json();document.getElementById('cards').innerHTML=Object.entries(j.services).map(([n,s])=>card(n,s)).join('')+telemetryCard(j.telemetry||{})}
 load();setInterval(load,5000);
 </script></body></html>'''
 
@@ -381,7 +424,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(202, {"ok": True, "message": f"Reinício solicitado para {service.label}."})
             return
         if action == "test":
-            result = service.health()
+            result = service.health(force=True)
             self.send_json(200 if result["ok"] else 503, {"ok": result["ok"], "message": f"{service.label}: {result['message']}"})
             return
         self.send_json(404, {"ok": False, "message": "Ação não encontrada."})

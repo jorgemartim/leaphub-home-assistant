@@ -49,7 +49,7 @@ shutil.copy2(source, target)
 print(f'Connector instalado em {target}')
 PY
 
-COPY connector_server.py ocpp_gateway.py gateway_manager.py /app/
+COPY connector_server.py telemetry_engine.py ocpp_gateway.py gateway_manager.py /app/
 
 # A imagem só é publicada quando todos os módulos realmente podem ser importados.
 RUN python3 - <<'PY'
@@ -59,7 +59,7 @@ import leaphub_connector
 assert Path('/app/connector.py').is_file()
 assert leaphub_connector.CONNECTOR_VERSION
 assert leaphub_connector.package_version() is not None
-for module in ('connector_server', 'ocpp_gateway', 'gateway_manager'):
+for module in ('connector_server', 'telemetry_engine', 'ocpp_gateway', 'gateway_manager'):
     spec = importlib.util.find_spec(module)
     if spec is None:
         raise SystemExit(f'Módulo ausente: {module}')

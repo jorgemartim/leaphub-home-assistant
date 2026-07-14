@@ -11,6 +11,42 @@ configuration:
   connector_max_parallel:
     name: Consultas simultâneas do Connector
     description: Limite de operações simultâneas contra a nuvem Leapmotor.
+  connector_manual_wait_seconds:
+    name: Espera de operações manuais
+    description: Segundos que uma ação manual pode aguardar vaga antes de retornar ocupado.
+  telemetry_beta_enabled:
+    name: Ativar telemetria contínua Beta
+    description: Coleta dados adaptativamente e entrega ao ambiente Beta.
+  telemetry_beta_internal_url:
+    name: Endpoint interno de telemetria Beta
+    description: URL HTTPS que recebe a fila persistente no Leap Hub Beta.
+  telemetry_production_enabled:
+    name: Ativar telemetria contínua Produção
+    description: Ative somente após configurar a chave e o site de Produção.
+  telemetry_production_internal_url:
+    name: Endpoint interno de telemetria Produção
+    description: URL HTTPS que recebe a fila no Leap Hub de Produção.
+  telemetry_active_seconds:
+    name: Intervalo durante viagem
+    description: Frequência de consulta quando o veículo está em movimento ou READY.
+  telemetry_charging_seconds:
+    name: Intervalo durante recarga
+    description: Frequência de consulta durante carregamento.
+  telemetry_parked_seconds:
+    name: Intervalo estacionado
+    description: Frequência inicial quando o veículo está estacionado.
+  telemetry_sleep_seconds:
+    name: Intervalo em repouso prolongado
+    description: Frequência econômica após várias leituras estacionadas.
+  telemetry_batch_size:
+    name: Eventos por envio
+    description: Quantidade máxima de leituras enviadas ao site em cada lote.
+  telemetry_retention_days:
+    name: Retenção local após confirmação
+    description: Dias que eventos já entregues permanecem no Home Assistant.
+  telemetry_queue_max_events:
+    name: Limite da fila local
+    description: Proteção de armazenamento para a fila persistente.
   ocpp_beta_enabled:
     name: Ativar OCPP Beta
     description: Inicia o gateway OCPP Beta na porta 8092.

@@ -41,6 +41,7 @@ jobs:
           set -euo pipefail
           test -s leaphub_gateway/connector.py
           test -s leaphub_gateway/connector_server.py
+          test -s leaphub_gateway/telemetry_engine.py
           grep -q "import leaphub_connector as connector" leaphub_gateway/connector_server.py
           grep -q "COPY connector.py /app/connector.py" leaphub_gateway/Dockerfile
           sha256sum leaphub_gateway/connector.py

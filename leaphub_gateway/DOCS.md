@@ -1,4 +1,4 @@
-# Leap Hub Gateway 1.11.54.5
+# Leap Hub Gateway 1.11.55
 
 ## Visão geral
 
@@ -15,9 +15,9 @@ O painel de diagnóstico é aberto pelo Ingress autenticado do Home Assistant.
 
 | Serviço | Porta | Origem no Cloudflare Tunnel |
 |---|---:|---|
-| Connector Leapmotor | 8094 | `http://local-leaphub-gateway:8094` |
-| OCPP Beta | 8092 | `http://local-leaphub-gateway:8092` |
-| OCPP Produção | 8093 | `http://local-leaphub-gateway:8093` |
+| Connector Leapmotor | 8094 | `http://127.0.0.1:8094` |
+| OCPP Beta | 8092 | `http://127.0.0.1:8092` |
+| OCPP Produção | 8093 | `http://127.0.0.1:8093` |
 | Painel Ingress | 8099 | Não publicar |
 
 ## Configuração
@@ -65,10 +65,10 @@ No painel do Cloudflare Tunnel, altere apenas as origens internas:
 
 ```text
 connector.leaphub.com.br
-→ http://local-leaphub-gateway:8094
+→ http://127.0.0.1:8094
 
 ocpp-beta.leaphub.com.br
-→ http://local-leaphub-gateway:8092
+→ http://127.0.0.1:8092
 ```
 
 Depois abra:
@@ -126,3 +126,8 @@ Confirme se o pacote `ghcr.io/jorgemartim/leaphub-gateway` está público no Git
 ### O App não aparece na loja
 
 Remova e adicione novamente o repositório, depois use **Verificar atualizações**.
+
+
+## Telemetria contínua 1.11.55
+
+O Gateway guarda credenciais e eventos criptografados em `/data/telemetry`, usa intervalos adaptativos e reenvia a fila quando o site volta. Eventos usam identificadores determinísticos para impedir duplicidade. Uma queda do Home Assistant inteiro cria uma lacuna real; o sistema não inventa rota, consumo ou posições.
