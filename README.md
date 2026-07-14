@@ -33,7 +33,7 @@ As imagens são compiladas no GitHub Actions e publicadas no GitHub Container Re
 Arquiteturas disponíveis:
 
 - `amd64` — notebooks, mini PCs e servidores x86-64;
-- `aarch64` — Raspberry Pi 4/5 e servidores ARM64 compatíveis.
+- `aarch64` será adicionado depois da validação da versão `amd64`.
 
 ## Documentação
 

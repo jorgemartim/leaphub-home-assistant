@@ -4,7 +4,7 @@
 
 - Home Assistant OS ou Home Assistant Supervised com suporte a Apps;
 - acesso à Loja de Apps;
-- arquitetura `amd64` ou `aarch64`;
+- arquitetura `amd64`;
 - chaves HMAC geradas no Leap Hub;
 - token do Cloudflare Tunnel, quando o Tunnel integrado for utilizado.
 
