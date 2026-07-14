@@ -1,0 +1,37 @@
+name: Relatar problema
+about: Informe um erro sem incluir credenciais ou dados pessoais
+title: "[Bug] "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Não publique tokens, chaves HMAC, credenciais Leapmotor, localização ou dados pessoais.
+  - type: input
+    id: version
+    attributes:
+      label: Versão do Leap Hub Gateway
+      placeholder: 1.11.54.4
+    validations:
+      required: true
+  - type: dropdown
+    id: arch
+    attributes:
+      label: Arquitetura
+      options:
+        - amd64
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: O que aconteceu?
+      description: Descreva o comportamento esperado e o comportamento observado.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs sem dados sensíveis
+      description: Remova tokens, chaves, e-mails, VIN, localização e identificadores pessoais.
+      render: shell

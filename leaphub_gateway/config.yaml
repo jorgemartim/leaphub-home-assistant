@@ -1,0 +1,64 @@
+name: "Leap Hub Gateway"
+version: "1.11.54.4"
+slug: "leaphub_gateway"
+description: "Gateway unificado do Leap Hub: Leapmotor, OCPP Beta/Produção, Cloudflare Tunnel e diagnóstico Ingress."
+url: "https://github.com/jorgemartim/leaphub-home-assistant"
+image: "ghcr.io/jorgemartim/leaphub-gateway"
+arch:
+  - amd64
+startup: services
+boot: auto
+init: false
+stage: experimental
+ingress: true
+ingress_port: 8099
+ingress_stream: true
+panel_icon: "mdi:car-connected"
+panel_title: "Leap Hub Gateway"
+ports:
+  8092/tcp: null
+  8093/tcp: null
+  8094/tcp: null
+  8099/tcp: null
+ports_description:
+  8092/tcp: "OCPP Beta (origem do Cloudflare Tunnel)"
+  8093/tcp: "OCPP Produção (origem do Cloudflare Tunnel)"
+  8094/tcp: "Connector Leapmotor (origem do Cloudflare Tunnel)"
+  8099/tcp: "Painel interno Ingress"
+watchdog: "http://[HOST]:[PORT:8099]/health"
+options:
+  connector_enabled: true
+  staging_secret: ""
+  production_secret: ""
+  connector_max_parallel: 2
+  ocpp_beta_enabled: true
+  ocpp_beta_internal_url: "https://leaphub.com.br/beta/leap/api/internal/ocpp"
+  ocpp_beta_secret: ""
+  ocpp_beta_max_connections: 100
+  ocpp_production_enabled: false
+  ocpp_production_internal_url: "https://leaphub.com.br/leap/api/internal/ocpp"
+  ocpp_production_secret: ""
+  ocpp_production_max_connections: 100
+  tunnel_enabled: false
+  tunnel_token: ""
+  tunnel_log_level: "info"
+  log_level: "INFO"
+  dashboard_log_lines: 80
+schema:
+  connector_enabled: bool
+  staging_secret: "password?"
+  production_secret: "password?"
+  connector_max_parallel: "int(1,4)"
+  ocpp_beta_enabled: bool
+  ocpp_beta_internal_url: url
+  ocpp_beta_secret: "password?"
+  ocpp_beta_max_connections: "int(1,1000)"
+  ocpp_production_enabled: bool
+  ocpp_production_internal_url: url
+  ocpp_production_secret: "password?"
+  ocpp_production_max_connections: "int(1,1000)"
+  tunnel_enabled: bool
+  tunnel_token: "password?"
+  tunnel_log_level: "list(debug|info|warn|error|fatal)"
+  log_level: "list(DEBUG|INFO|WARNING|ERROR)"
+  dashboard_log_lines: "int(20,300)"
