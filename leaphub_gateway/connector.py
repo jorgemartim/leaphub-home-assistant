@@ -20,7 +20,7 @@ from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any
 
-CONNECTOR_VERSION = "1.11.56.1"
+CONNECTOR_VERSION = "1.11.57"
 MAX_INPUT_BYTES = 1024 * 1024
 
 COMMAND_METHODS: dict[str, str] = {
@@ -554,6 +554,34 @@ def window_open(value: Any) -> bool | None:
     return bool_or_none(value)
 
 
+def first_bool(*values: Any) -> bool | None:
+    """Return the first boolean signal that can be interpreted safely."""
+    for value in values:
+        parsed = bool_or_none(value)
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def enum_or_value(value: Any) -> Any:
+    """Serialize enums without losing unknown numeric signals."""
+    if value is None:
+        return None
+    return value_of(value)
+
+
+def compact_mapping(values: dict[str, Any]) -> dict[str, Any]:
+    """Remove only unknown values; keep False and zero because they are real states."""
+    return {key: value for key, value in values.items() if value is not None}
+
+
+def safe_https_url(value: Any) -> str | None:
+    text = text_value(value, 1000)
+    if not text or not text.lower().startswith("https://"):
+        return None
+    return text
+
+
 def charging_label(status: Any) -> str:
     charging = bool_or_none(attribute(status, "is_charging"))
     plugged = bool_or_none(attribute(status, "is_plugged"))
@@ -591,8 +619,20 @@ def serialize_vehicle(vehicle: Any, include_status: bool, client: Any, messages:
 
     raw_abilities = attribute(vehicle, "abilities", []) or []
     raw_rights = attribute(vehicle, "rights", []) or []
+    raw_module_rights = attribute(vehicle, "module_rights", []) or []
     abilities = [str(value_of(item)) for item in raw_abilities]
     rights = [str(value_of(item)) for item in raw_rights]
+    module_rights = [str(value_of(item)) for item in raw_module_rights]
+    vehicle_scalars = object_scalar_map(vehicle)
+    exterior_color = first_text(
+        attribute(vehicle, "out_color"),
+        map_text(vehicle_scalars, "outColor", "outsideColor", "exteriorColor", "bodyColor", "paintColor", "vehicleColor", "colorName"),
+        max_length=80,
+    )
+    vehicle_image_url = safe_https_url(mapping_pick(vehicle_scalars, (
+        "carPicture", "carPictureUrl", "carImage", "carImageUrl", "vehicleImage", "vehicleImageUrl",
+        "outwardImage", "appearanceImage", "modelImage", "imageUrl",
+    )))
     supported_commands = [
         key for key, method in COMMAND_METHODS.items()
         if callable(getattr(client, method, None))
@@ -604,11 +644,14 @@ def serialize_vehicle(vehicle: Any, include_status: bool, client: Any, messages:
         "display_name": display_name[:120],
         "model": model[:80],
         "year": attribute(vehicle, "year"),
+        "exterior_color": exterior_color,
+        "vehicle_image_url": vehicle_image_url,
         "powertrain": None,
         "shared": bool(attribute(vehicle, "is_shared", False)),
         "capabilities": {
             "abilities": abilities,
             "rights": rights,
+            "module_rights": module_rights,
             "supported_commands": supported_commands,
         },
     }
@@ -624,6 +667,10 @@ def serialize_vehicle(vehicle: Any, include_status: bool, client: Any, messages:
     doors = attribute(status, "doors")
     windows = attribute(status, "windows")
     tires = attribute(status, "tires")
+    connectivity = attribute(status, "connectivity")
+    seat_comfort = attribute(status, "seat_comfort")
+    security = attribute(status, "security")
+    ignition = attribute(status, "ignition")
 
     tire_data = attribute(tires, "all_bar", {})
     if not isinstance(tire_data, dict):
@@ -674,6 +721,103 @@ def serialize_vehicle(vehicle: Any, include_status: bool, client: Any, messages:
     for source_map in (driving_scalars, battery_scalars):
         for key, value in source_map.items():
             cloud_scalars.setdefault(key, value)
+
+    door_state = {
+        "front_left": door_open(attribute(doors, "lbcm_driver_door_status")),
+        "front_right": door_open(attribute(doors, "rbcm_driver_door_status")),
+        "rear_left": door_open(attribute(doors, "lbcm_left_rear_door_status")),
+        "rear_right": door_open(attribute(doors, "rbcm_right_rear_door_status")),
+        "trunk": door_open(attribute(doors, "bbcm_back_door_status")),
+    }
+    window_positions = {
+        "front_left": first_numeric(attribute(windows, "left_front_window_percent")),
+        "front_right": first_numeric(attribute(windows, "right_front_window_percent")),
+        "rear_left": first_numeric(attribute(windows, "left_rear_window_percent")),
+        "rear_right": first_numeric(attribute(windows, "right_rear_window_percent")),
+    }
+    window_state = {
+        "front_left": window_open(window_positions["front_left"]) if window_positions["front_left"] is not None else first_bool(attribute(windows, "driver_window_status")),
+        "front_right": window_open(window_positions["front_right"]) if window_positions["front_right"] is not None else first_bool(attribute(windows, "right_front_window_status")),
+        "rear_left": window_open(window_positions["rear_left"]) if window_positions["rear_left"] is not None else first_bool(attribute(windows, "left_rear_window_status")),
+        "rear_right": window_open(window_positions["rear_right"]) if window_positions["rear_right"] is not None else first_bool(attribute(windows, "right_rear_window_status")),
+    }
+
+    roof_opening = first_numeric(attribute(security, "roof_opening"), map_numeric(cloud_scalars, "roofOpening", "sunroofOpening", "roofOpenPercent"))
+    sunshade_position = first_numeric(attribute(windows, "sun_shade"), map_numeric(cloud_scalars, "sunShade", "sunshadeOpening", "sunshadePercent"))
+    roof_state = window_open(roof_opening) if roof_opening is not None else first_bool(map_text(cloud_scalars, "sunroofOpen", "roofOpen"))
+    sunshade_state = window_open(sunshade_position) if sunshade_position is not None else first_bool(map_text(cloud_scalars, "sunshadeOpen"))
+
+    lights_state = compact_mapping({
+        "position": first_bool(mapping_pick(cloud_scalars, ("positionLamp", "positionLight", "parkingLight"))),
+        "low_beam": first_bool(mapping_pick(cloud_scalars, ("lowBeam", "lowBeamLamp", "dippedBeam"))),
+        "high_beam": first_bool(mapping_pick(cloud_scalars, ("highBeam", "highBeamLamp"))),
+        "hazard": first_bool(mapping_pick(cloud_scalars, ("hazardLamp", "hazardLights", "doubleFlash"))),
+        "daytime": first_bool(mapping_pick(cloud_scalars, ("daytimeRunningLamp", "daytimeLight", "drl"))),
+    })
+    mirrors_state = compact_mapping({
+        "left_heating": first_bool(attribute(security, "left_mirror_heating"), mapping_pick(cloud_scalars, ("leftMirrorHeating",))),
+        "right_heating": first_bool(attribute(security, "right_mirror_heating"), mapping_pick(cloud_scalars, ("rightMirrorHeating",))),
+        "folded": first_bool(mapping_pick(cloud_scalars, ("rearviewMirrorFolded", "mirrorFolded", "mirrorsFolded"))),
+    })
+    security_state = compact_mapping({
+        "active": first_bool(attribute(security, "is_security_active"), attribute(security, "vehicle_security_active")),
+        "raw_state": enum_or_value(attribute(security, "vehicle_security_active")),
+        "sentry_mode": first_bool(attribute(security, "sentry_mode")),
+        "roof_open": roof_state,
+        "roof_opening_percent": roof_opening,
+        "sunshade_open": sunshade_state,
+        "sunshade_percent": sunshade_position,
+    })
+    seat_state = compact_mapping({
+        "driver_heating": first_numeric(attribute(seat_comfort, "driver_seat_heating")),
+        "driver_ventilation": first_numeric(attribute(seat_comfort, "driver_seat_ventilation")),
+        "passenger_heating": first_numeric(attribute(seat_comfort, "passenger_seat_heating")),
+        "passenger_ventilation": first_numeric(attribute(seat_comfort, "passenger_seat_ventilation")),
+        "steering_wheel_heating": first_numeric(attribute(seat_comfort, "steering_wheel_heating")),
+        "steering_wheel_minutes": first_numeric(attribute(seat_comfort, "steering_wheel_heater_minutes")),
+    })
+    connectivity_state = compact_mapping({
+        "bluetooth": first_bool(attribute(connectivity, "bluetooth_state")),
+        "hotspot": first_bool(attribute(connectivity, "hotspot_state")),
+    })
+    climate_state = compact_mapping({
+        "on": first_bool(attribute(climate, "ac_switch")),
+        "left_temperature_c": first_numeric(attribute(climate, "ac_setting")),
+        "right_temperature_c": first_numeric(attribute(climate, "ac_setting_right")),
+        "fan_level": first_numeric(attribute(climate, "ac_air_volume"), attribute(climate, "ac_air_volume_setting")),
+        "mode": enum_or_value(attribute(climate, "climate_mode")),
+        "operate_mode": enum_or_value(attribute(climate, "ac_operate_mode")),
+        "recirculation": enum_or_value(attribute(climate, "recirculation_mode")),
+        "windshield_defrost": first_bool(attribute(climate, "is_windshield_defrost_active"), attribute(climate, "windshield_defrost")),
+        "rear_window_heating": first_bool(attribute(climate, "rear_window_heating")),
+        "rapid_cooling": first_bool(attribute(climate, "rapid_cooling")),
+        "rapid_heating": first_bool(attribute(climate, "rapid_heating")),
+    })
+    charge_plan = attribute(battery, "charge_plan")
+    charge_state_details = compact_mapping({
+        "remaining_minutes": first_numeric(attribute(battery, "charge_remain_time")),
+        "fast_connector": first_bool(attribute(battery, "is_charge_fast_gun_insert"), attribute(battery, "dc_input_fast_charge")),
+        "slow_connector": first_bool(attribute(battery, "is_charge_slow_gun_insert"), attribute(battery, "ac_input_slow_charge")),
+        "completed": first_bool(attribute(battery, "charge_completed")),
+        "healthy_charge": first_bool(attribute(battery, "healthy_charge_enabled")),
+        "thermal_request": enum_or_value(attribute(battery, "battery_thermal_request")),
+        "schedule_enabled": first_bool(attribute(charge_plan, "enabled")),
+        "schedule_start": text_value(attribute(charge_plan, "start"), 20),
+        "schedule_end": text_value(attribute(charge_plan, "end"), 20),
+        "schedule_cycles": text_value(attribute(charge_plan, "cycles"), 30),
+    })
+    tire_states = compact_mapping({
+        "front_left": enum_or_value(attribute(tires, "front_left_state")),
+        "front_right": enum_or_value(attribute(tires, "front_right_state")),
+        "rear_left": enum_or_value(attribute(tires, "rear_left_state")),
+        "rear_right": enum_or_value(attribute(tires, "rear_right_state")),
+        "all_ok": first_bool(attribute(tires, "all_ok")),
+    })
+    ignition_state = compact_mapping({
+        "on1": first_bool(attribute(ignition, "bcm_key_position_on1")),
+        "on2": first_bool(attribute(ignition, "bcm_key_position_on2")),
+        "on3": first_bool(attribute(ignition, "bcm_key_position_on3")),
+    })
 
     official_total = first_numeric(
         map_numeric(driving_scalars, "officialTripEnergyKwh", "officialTripEnergy", "tripEnergyKwh", "tripEnergy", "currentTripEnergy", "energyConsumption"),
@@ -774,18 +918,34 @@ def serialize_vehicle(vehicle: Any, include_status: bool, client: Any, messages:
         "regenerated_energy_kwh": first_numeric(attribute(driving, "regenerated_energy_kwh"), attribute(driving, "recovery_energy"), map_numeric(cloud_scalars, "regeneratedEnergyKwh", "recoveryEnergyKwh")),
         "latitude": numeric(attribute(location, "latitude")),
         "longitude": numeric(attribute(location, "longitude")),
-        "doors": {
-            "front_left": door_open(attribute(doors, "lbcm_driver_door_status")),
-            "front_right": door_open(attribute(doors, "rbcm_driver_door_status")),
-            "rear_left": door_open(attribute(doors, "lbcm_left_rear_door_status")),
-            "rear_right": door_open(attribute(doors, "rbcm_right_rear_door_status")),
-            "trunk": door_open(attribute(doors, "bbcm_back_door_status")),
-        },
-        "windows": {
-            "front_left": window_open(attribute(windows, "left_front_window_percent")),
-            "front_right": window_open(attribute(windows, "right_front_window_percent")),
-            "rear_left": window_open(attribute(windows, "left_rear_window_percent")),
-            "rear_right": window_open(attribute(windows, "right_rear_window_percent")),
+        "doors": door_state,
+        "windows": window_state,
+        "window_positions": compact_mapping(window_positions),
+        "roof_open": roof_state,
+        "roof_open_percent": roof_opening,
+        "sunshade_open": sunshade_state,
+        "sunshade_percent": sunshade_position,
+        "lights": lights_state,
+        "mirrors": mirrors_state,
+        "security": security_state,
+        "seat_comfort": seat_state,
+        "connectivity": connectivity_state,
+        "climate_details": climate_state,
+        "charging_details": charge_state_details,
+        "tire_status": tire_states,
+        "ignition_details": ignition_state,
+        "vehicle_image_url": vehicle_image_url,
+        "exterior_color": exterior_color,
+        "visual_state": {
+            "doors": door_state,
+            "windows": window_state,
+            "window_positions": compact_mapping(window_positions),
+            "roof": compact_mapping({"open": roof_state, "percent": roof_opening}),
+            "sunshade": compact_mapping({"open": sunshade_state, "percent": sunshade_position}),
+            "lights": lights_state,
+            "mirrors": mirrors_state,
+            "security": security_state,
+            "charging": charge_state_details,
         },
         "tire_data": {key: numeric(value) for key, value in tire_data.items()},
         "captured_at": iso_timestamp(attribute(status, "collect_time") or attribute(status, "create_time")),
@@ -793,7 +953,7 @@ def serialize_vehicle(vehicle: Any, include_status: bool, client: Any, messages:
             "vehicle": attribute(vehicle, "raw", {}),
             "status": attribute(status, "raw", {}),
         }),
-        "mapping_version": "1.11.56.1",
+        "mapping_version": "1.11.57",
     }
     result["telemetry"] = telemetry
     return result

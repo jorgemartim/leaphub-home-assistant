@@ -1,4 +1,4 @@
-# Leap Hub Gateway 1.11.56.1
+# Leap Hub Gateway 1.11.57
 
 ## Visão geral
 
@@ -128,6 +128,6 @@ Confirme se o pacote `ghcr.io/jorgemartim/leaphub-gateway` está público no Git
 Remova e adicione novamente o repositório, depois use **Verificar atualizações**.
 
 
-## Telemetria contínua 1.11.56.1
+## Telemetria contínua 1.11.57
 
 O Gateway guarda credenciais e eventos criptografados em `/data/telemetry`, usa intervalos adaptativos e reenvia a fila quando o site volta. Eventos usam identificadores determinísticos para impedir duplicidade. Uma queda do Home Assistant inteiro cria uma lacuna real; o sistema não inventa rota, consumo ou posições.
