@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.11.61
+
+- Publica o estado visual versão 5 com pistas seguras de resolução do modelo e da cor.
+- Informa a origem dos campos usados e se a imagem HTTPS reportada pela nuvem estava disponível.
+- Adiciona avisos de identidade e lista dos grupos de sensores com cobertura incompleta.
+- Mantém VIN, credenciais, localização e identificadores da conta fora do diagnóstico visual.
+- Preserva fila ordenada, deduplicação semântica e heartbeats da versão anterior.
+- Atualiza a versão do mapeamento para 1.11.61.
+
 ## 1.11.60
 
 - Publica o estado visual versão 4 com diagnóstico de cobertura dos sensores.

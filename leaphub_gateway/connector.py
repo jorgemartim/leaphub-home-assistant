@@ -21,7 +21,7 @@ from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any
 
-CONNECTOR_VERSION = "1.11.60"
+CONNECTOR_VERSION = "1.11.61"
 MAX_INPUT_BYTES = 1024 * 1024
 
 COMMAND_METHODS: dict[str, str] = {
@@ -712,6 +712,18 @@ def visual_sensor_health(capabilities: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def visual_model_family(*values: Any) -> str | None:
+    """Resolve only the public commercial family used by the visual catalog."""
+    for value in values:
+        text = str(value or "").strip().lower()
+        normalized = "".join(char for char in text if char.isalnum())
+        if "c10" in normalized:
+            return "c10"
+        if "b10" in normalized:
+            return "b10"
+    return None
+
+
 def visual_fingerprint(payload: dict[str, Any]) -> str:
     """Create a stable fingerprint without VIN, credentials or account identifiers."""
     canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=json_default)
@@ -988,22 +1000,62 @@ def serialize_vehicle(vehicle: Any, include_status: bool, client: Any, messages:
         charge_state_details,
     )
     captured_at = iso_timestamp(attribute(status, "collect_time") or attribute(status, "create_time"))
+    model_code_candidate = first_text(
+        map_text(vehicle_scalars, "modelCode", "carModel", "vehicleModel", "seriesCode"),
+        model,
+        max_length=80,
+    )
+    model_family_hint = visual_model_family(model, model_code_candidate)
+    color_source = "vehicle.out_color" if attribute(vehicle, "out_color") is not None else ("vehicle.raw" if exterior_color else None)
     visual_identity = compact_mapping({
         "model": model[:80],
-        "model_code": first_text(
-            map_text(vehicle_scalars, "modelCode", "carModel", "vehicleModel", "seriesCode"),
-            model,
-            max_length=80,
-        ),
+        "model_code": model_code_candidate,
+        "model_family_hint": model_family_hint,
         "exterior_color": exterior_color,
         "image_url": vehicle_image_url,
         "model_source": "vehicle.car_type",
-        "color_source": "vehicle.out_color" if attribute(vehicle, "out_color") is not None else "vehicle.raw",
+        "color_source": color_source,
     })
+    visual_resolution_hints = {
+        "schema": 1,
+        "model": compact_mapping({
+            "reported": model[:80],
+            "code": model_code_candidate,
+            "family_hint": model_family_hint,
+            "source": "vehicle.car_type",
+        }),
+        "color": compact_mapping({
+            "reported": exterior_color,
+            "source": color_source,
+        }),
+        "asset": compact_mapping({
+            "cloud_image_available": bool(vehicle_image_url),
+            "cloud_image_https": bool(vehicle_image_url and str(vehicle_image_url).lower().startswith("https://")),
+        }),
+    }
     visual_diagnostics = visual_sensor_health(reported_visual_capabilities)
+    identity_warnings: list[str] = []
+    if model_family_hint is None:
+        identity_warnings.append("model_family_not_recognized")
+    if not exterior_color:
+        identity_warnings.append("exterior_color_not_reported")
+    if int(visual_diagnostics.get("core_known") or 0) <= 0:
+        identity_warnings.append("core_visual_sensors_unavailable")
+    visual_diagnostics["identity"] = {
+        "model_present": bool(model),
+        "model_family_recognized": model_family_hint is not None,
+        "color_present": bool(exterior_color),
+        "cloud_image_present": bool(vehicle_image_url),
+    }
+    visual_diagnostics["warnings"] = identity_warnings
+    visual_diagnostics["missing_groups"] = [
+        name for name, group in (visual_diagnostics.get("groups") or {}).items()
+        if isinstance(group, dict) and str(group.get("status") or "") != "complete"
+    ]
     visual_fingerprint_value = visual_fingerprint({
-        "version": 4,
+        "version": 5,
         "identity": visual_identity,
+        "resolution_hints": visual_resolution_hints,
         "primary": visual_primary_state,
         "signature": visual_signature,
         "components": visual_components,
@@ -1153,21 +1205,23 @@ def serialize_vehicle(vehicle: Any, include_status: bool, client: Any, messages:
         "ignition_details": ignition_state,
         "vehicle_image_url": vehicle_image_url,
         "exterior_color": exterior_color,
-        "visual_state_version": 4,
+        "visual_state_version": 5,
         "visual_primary_state": visual_primary_state,
         "visual_components": visual_components,
         "visual_signature": visual_signature,
         "visual_fingerprint": visual_fingerprint_value,
         "visual_sample_fingerprint": visual_sample_fingerprint,
         "visual_identity": visual_identity,
+        "visual_resolution_hints": visual_resolution_hints,
         "visual_capabilities": reported_visual_capabilities,
         "visual_diagnostics": visual_diagnostics,
         "visual_state": {
-            "version": 4,
+            "version": 5,
             "captured_at": captured_at,
             "fingerprint": visual_fingerprint_value,
             "sample_fingerprint": visual_sample_fingerprint,
             "identity": visual_identity,
+            "resolution_hints": visual_resolution_hints,
             "primary": visual_primary_state,
             "signature": visual_signature,
             "components": visual_components,
@@ -1190,7 +1244,7 @@ def serialize_vehicle(vehicle: Any, include_status: bool, client: Any, messages:
             "vehicle": attribute(vehicle, "raw", {}),
             "status": attribute(status, "raw", {}),
         }),
-        "mapping_version": "1.11.60",
+        "mapping_version": "1.11.61",
     }
     result["telemetry"] = telemetry
     return result
