@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.11.60
+
+- Publica o estado visual versão 4 com diagnóstico de cobertura dos sensores.
+- Separa a fingerprint do estado da fingerprint da amostra, evitando atualizações visuais desnecessárias.
+- Ordena eventos por veículo e impede que uma leitura nova ultrapasse outra pendente.
+- Suprime leituras semanticamente idênticas e mantém heartbeats seguros conforme o estado do carro.
+- Adiciona sequência, tipo do evento e indicador de alteração real ao payload entregue.
+- Mantém a última leitura no site quando o Home Assistant fica temporariamente indisponível, sem inventar dados.
+- Atualiza a versão do mapeamento para 1.11.60.
+
 ## 1.11.59
 
 - Atualiza a representação do veículo em tempo real sem recarregar a página inteira.

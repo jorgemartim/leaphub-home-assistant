@@ -22,7 +22,7 @@ from cryptography.fernet import Fernet, InvalidToken
 import leaphub_connector as connector
 
 LOG = logging.getLogger("leaphub.telemetry")
-ENGINE_VERSION = "1.11.59"
+ENGINE_VERSION = "1.11.60"
 
 
 def utc_iso() -> str:
@@ -31,6 +31,35 @@ def utc_iso() -> str:
 
 def canonical_json(value: Any) -> bytes:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True, default=connector.json_default).encode("utf-8")
+
+
+VOLATILE_SEMANTIC_KEYS = {
+    "captured_at",
+    "collect_time",
+    "create_time",
+    "synced_at",
+    "sent_at",
+    "gateway_collected_at",
+    "visual_sample_fingerprint",
+    "sample_fingerprint",
+}
+
+
+def semantic_snapshot(value: Any, parent_key: str = "") -> Any:
+    """Remove transport timestamps while preserving every actual vehicle state."""
+    if isinstance(value, dict):
+        result: dict[str, Any] = {}
+        for raw_key, item in value.items():
+            key = str(raw_key)
+            if key in VOLATILE_SEMANTIC_KEYS:
+                continue
+            if parent_key == "maintenance" and key == "synced_at":
+                continue
+            result[key] = semantic_snapshot(item, key)
+        return result
+    if isinstance(value, list):
+        return [semantic_snapshot(item, parent_key) for item in value]
+    return value
 
 
 class TelemetryEngine:
@@ -146,6 +175,34 @@ class TelemetryEngine:
             columns = {str(row[1]) for row in db.execute("PRAGMA table_info(subscriptions)").fetchall()}
             if "cooldown_until" not in columns:
                 db.execute("ALTER TABLE subscriptions ADD COLUMN cooldown_until REAL NOT NULL DEFAULT 0")
+            event_columns = {str(row[1]) for row in db.execute("PRAGMA table_info(events)").fetchall()}
+            if "sequence" not in event_columns:
+                db.execute("ALTER TABLE events ADD COLUMN sequence INTEGER NOT NULL DEFAULT 0")
+            if "semantic_hash" not in event_columns:
+                db.execute("ALTER TABLE events ADD COLUMN semantic_hash TEXT NULL")
+            if "state_changed" not in event_columns:
+                db.execute("ALTER TABLE events ADD COLUMN state_changed INTEGER NOT NULL DEFAULT 1")
+            if "event_kind" not in event_columns:
+                db.execute("ALTER TABLE events ADD COLUMN event_kind TEXT NOT NULL DEFAULT 'change'")
+            db.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS vehicle_state_cache (
+                    subscription_id TEXT NOT NULL,
+                    remote_id TEXT NOT NULL,
+                    semantic_hash TEXT NOT NULL,
+                    visual_fingerprint TEXT NULL,
+                    last_source_at TEXT NULL,
+                    last_queued_at REAL NOT NULL DEFAULT 0,
+                    sequence INTEGER NOT NULL DEFAULT 0,
+                    skipped_unchanged INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY(subscription_id, remote_id),
+                    FOREIGN KEY(subscription_id) REFERENCES subscriptions(subscription_id) ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS idx_vehicle_state_updated ON vehicle_state_cache(updated_at);
+                CREATE INDEX IF NOT EXISTS idx_events_vehicle_order ON events(subscription_id, remote_id, status, sequence);
+                """
+            )
 
     def start(self) -> None:
         if self.worker and self.worker.is_alive():
@@ -226,6 +283,12 @@ class TelemetryEngine:
             recent = [dict(row) for row in db.execute(
                 "SELECT subscription_id, environment, account_id, status, last_run_at, last_success_at, last_delivery_at, last_error, last_state, next_run_at FROM subscriptions ORDER BY updated_at DESC LIMIT 20"
             ).fetchall()]
+            dedupe = db.execute(
+                "SELECT COALESCE(SUM(skipped_unchanged),0) skipped, COUNT(*) vehicles, MAX(updated_at) last_state_update FROM vehicle_state_cache"
+            ).fetchone()
+            recent_states = [dict(row) for row in db.execute(
+                "SELECT subscription_id, remote_id, sequence, skipped_unchanged, last_source_at, updated_at FROM vehicle_state_cache ORDER BY updated_at DESC LIMIT 20"
+            ).fetchall()]
         for item in recent:
             item["next_run_in_seconds"] = max(0, int(float(item.pop("next_run_at") or 0) - time.time()))
             if item.get("last_error"):
@@ -238,6 +301,10 @@ class TelemetryEngine:
             "pending_events": int(queue["pending"] or 0),
             "delivered_events": int(queue["delivered"] or 0),
             "oldest_pending": queue["oldest_pending"],
+            "deduplicated_events": int(dedupe["skipped"] or 0),
+            "tracked_vehicles": int(dedupe["vehicles"] or 0),
+            "last_state_update": dedupe["last_state_update"],
+            "recent_vehicle_states": recent_states,
             "profiles": {
                 "driving_seconds": self.active_seconds,
                 "charging_seconds": self.charging_seconds,
@@ -342,12 +409,18 @@ class TelemetryEngine:
             return
 
         states: list[str] = []
+        queued_events = 0
+        skipped_events = 0
         for vehicle in vehicles:
             telemetry = vehicle.get("telemetry") if isinstance(vehicle.get("telemetry"), dict) else {}
             source_at = str(telemetry.get("captured_at") or utc_iso())
             state = self._state_of(telemetry)
             states.append(state)
-            self._queue_event(subscription, vehicle, source_at)
+            queued = self._queue_event(subscription, vehicle, source_at, state)
+            if queued.get("queued"):
+                queued_events += 1
+            else:
+                skipped_events += 1
 
         previous_state = str(subscription["last_state"] or "")
         interval, aggregate_state, parked_streak = self._adaptive_interval(states, int(subscription["parked_streak"] or 0))
@@ -361,7 +434,10 @@ class TelemetryEngine:
         if previous_state != aggregate_state:
             LOG.info("Telemetria %s mudou de %s para %s; próxima consulta em %ss.", sid, previous_state or "inicial", aggregate_state, int(interval + jitter))
         else:
-            LOG.debug("Telemetria %s: %s veículo(s), estado %s, próxima consulta em %ss.", sid, len(vehicles), aggregate_state, int(interval + jitter))
+            LOG.debug(
+                "Telemetria %s: %s veículo(s), estado %s, %s evento(s) enfileirado(s), %s leitura(s) idêntica(s) suprimida(s), próxima consulta em %ss.",
+                sid, len(vehicles), aggregate_state, queued_events, skipped_events, int(interval + jitter),
+            )
         self.wake_event.set()
 
     def _state_of(self, telemetry: dict[str, Any]) -> str:
@@ -403,28 +479,126 @@ class TelemetryEngine:
             "muitas solicitações", "limite de requisições", "conta bloqueada",
         ))
 
-    def _queue_event(self, subscription: sqlite3.Row, vehicle: dict[str, Any], source_at: str) -> None:
+    def _heartbeat_interval(self, state: str) -> int:
+        if state in {"driving", "charging"}:
+            return 60
+        if state == "charge_watch":
+            return 120
+        if state == "parked":
+            return 300
+        return 900
+
+    def _queue_event(self, subscription: sqlite3.Row, vehicle: dict[str, Any], source_at: str, state: str) -> dict[str, Any]:
         environment = str(subscription["environment"])
         account_id = int(subscription["account_id"])
-        remote_id = str(vehicle.get("remote_id") or "")[:190]
-        payload_hash = hashlib.sha256(canonical_json(vehicle)).hexdigest()
-        event_id = hashlib.sha256(f"{environment}|{account_id}|{remote_id}|{source_at}|{payload_hash}".encode()).hexdigest()
-        encrypted = self.fernet.encrypt(canonical_json(vehicle))
-        now = utc_iso()
+        subscription_id = str(subscription["subscription_id"])
+        remote_id = str(vehicle.get("remote_id") or "").strip()[:190]
+        if not remote_id:
+            LOG.warning("Veículo sem remote_id ignorado na assinatura %s.", subscription_id)
+            return {"queued": False, "reason": "missing_remote_id"}
+
+        semantic_hash = hashlib.sha256(canonical_json(semantic_snapshot(vehicle))).hexdigest()
+        telemetry = vehicle.get("telemetry") if isinstance(vehicle.get("telemetry"), dict) else {}
+        visual_fingerprint = str(telemetry.get("visual_fingerprint") or "").strip().lower()
+        if len(visual_fingerprint) != 64 or any(char not in "0123456789abcdef" for char in visual_fingerprint):
+            visual_fingerprint = ""
+        now_epoch = time.time()
+        now_iso = utc_iso()
+        source_at = str(source_at or now_iso).strip()[:80] or now_iso
+
         with self.lock, self._db() as db:
-            db.execute(
-                """
-                INSERT OR IGNORE INTO events
-                (event_id, subscription_id, environment, account_id, remote_id, source_at, payload_encrypted, payload_hash, status, attempts, next_attempt_at, last_error, created_at, delivered_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, NULL, ?, NULL)
-                """,
-                (event_id, str(subscription["subscription_id"]), environment, account_id, remote_id, source_at, encrypted, payload_hash, time.time(), now),
-            )
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                cached = db.execute(
+                    "SELECT * FROM vehicle_state_cache WHERE subscription_id=? AND remote_id=?",
+                    (subscription_id, remote_id),
+                ).fetchone()
+                unchanged = cached is not None and str(cached["semantic_hash"] or "") == semantic_hash
+                last_queued_at = float(cached["last_queued_at"] or 0) if cached is not None else 0.0
+                if unchanged and now_epoch - last_queued_at < self._heartbeat_interval(state):
+                    db.execute(
+                        "UPDATE vehicle_state_cache SET visual_fingerprint=?, last_source_at=?, skipped_unchanged=skipped_unchanged+1, updated_at=? WHERE subscription_id=? AND remote_id=?",
+                        (visual_fingerprint or None, source_at, now_iso, subscription_id, remote_id),
+                    )
+                    db.execute("COMMIT")
+                    return {"queued": False, "reason": "unchanged", "sequence": int(cached["sequence"] or 0)}
+
+                sequence = (int(cached["sequence"] or 0) if cached is not None else 0) + 1
+                state_changed = not unchanged
+                event_kind = "change" if state_changed else "heartbeat"
+                enriched = json.loads(canonical_json(vehicle).decode("utf-8"))
+                enriched_telemetry = enriched.get("telemetry") if isinstance(enriched.get("telemetry"), dict) else {}
+                enriched_telemetry["gateway_delivery"] = {
+                    "version": 1,
+                    "engine_version": ENGINE_VERSION,
+                    "sequence": sequence,
+                    "state_changed": state_changed,
+                    "event_kind": event_kind,
+                    "vehicle_state": state,
+                    "source_at": source_at,
+                    "gateway_collected_at": now_iso,
+                    "semantic_hash": semantic_hash[:16],
+                }
+                enriched["telemetry"] = enriched_telemetry
+                payload_bytes = canonical_json(enriched)
+                payload_hash = hashlib.sha256(payload_bytes).hexdigest()
+                event_id = hashlib.sha256(
+                    f"{environment}|{account_id}|{subscription_id}|{remote_id}|{sequence}|{payload_hash}".encode()
+                ).hexdigest()
+                encrypted = self.fernet.encrypt(payload_bytes)
+                db.execute(
+                    """
+                    INSERT INTO events
+                    (event_id, subscription_id, environment, account_id, remote_id, source_at, payload_encrypted, payload_hash,
+                     status, attempts, next_attempt_at, last_error, created_at, delivered_at, sequence, semantic_hash, state_changed, event_kind)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, NULL, ?, NULL, ?, ?, ?, ?)
+                    """,
+                    (
+                        event_id, subscription_id, environment, account_id, remote_id, source_at, encrypted, payload_hash,
+                        now_epoch, now_iso, sequence, semantic_hash, 1 if state_changed else 0, event_kind,
+                    ),
+                )
+                db.execute(
+                    """
+                    INSERT INTO vehicle_state_cache
+                    (subscription_id, remote_id, semantic_hash, visual_fingerprint, last_source_at, last_queued_at, sequence, skipped_unchanged, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)
+                    ON CONFLICT(subscription_id, remote_id) DO UPDATE SET
+                        semantic_hash=excluded.semantic_hash,
+                        visual_fingerprint=excluded.visual_fingerprint,
+                        last_source_at=excluded.last_source_at,
+                        last_queued_at=excluded.last_queued_at,
+                        sequence=excluded.sequence,
+                        updated_at=excluded.updated_at
+                    """,
+                    (subscription_id, remote_id, semantic_hash, visual_fingerprint or None, source_at, now_epoch, sequence, now_iso),
+                )
+                db.execute("COMMIT")
+                return {"queued": True, "sequence": sequence, "event_kind": event_kind, "state_changed": state_changed}
+            except Exception:
+                db.execute("ROLLBACK")
+                raise
 
     def _deliver_due(self) -> bool:
         with self.lock, self._db() as db:
             rows = db.execute(
-                "SELECT * FROM events WHERE status='pending' AND next_attempt_at<=? ORDER BY created_at ASC LIMIT ?",
+                """
+                SELECT e.*
+                FROM events e
+                WHERE e.status='pending' AND e.next_attempt_at<=?
+                  AND NOT EXISTS (
+                      SELECT 1 FROM events older
+                      WHERE older.status='pending'
+                        AND older.subscription_id=e.subscription_id
+                        AND older.remote_id=e.remote_id
+                        AND (
+                            (older.sequence>0 AND e.sequence>0 AND older.sequence<e.sequence)
+                            OR (older.sequence=0 AND older.created_at<e.created_at)
+                        )
+                  )
+                ORDER BY e.created_at ASC
+                LIMIT ?
+                """,
                 (time.time(), self.batch_size),
             ).fetchall()
         if not rows:
@@ -454,12 +628,15 @@ class TelemetryEngine:
                 "event_id": str(row["event_id"]),
                 "account_id": int(row["account_id"]),
                 "source_at": str(row["source_at"]),
+                "sequence": int(row["sequence"] or 0),
+                "state_changed": bool(row["state_changed"]),
+                "event_kind": str(row["event_kind"] or "change"),
                 "vehicle": vehicle,
             })
             valid_rows.append(row)
         if not events:
             return
-        body = canonical_json({"events": events, "gateway_version": "1.11.56", "sent_at": utc_iso()})
+        body = canonical_json({"events": events, "gateway_version": ENGINE_VERSION, "sent_at": utc_iso()})
         parsed = urllib.parse.urlparse(url)
         path = parsed.path or "/"
         timestamp = str(int(time.time()))
@@ -473,7 +650,7 @@ class TelemetryEngine:
             headers={
                 "Content-Type": "application/json",
                 "Accept": "application/json",
-                "User-Agent": "LeapHubGateway/1.11.56",
+                "User-Agent": f"LeapHubGateway/{ENGINE_VERSION}",
                 "X-LeapHub-Timestamp": timestamp,
                 "X-LeapHub-Nonce": nonce,
                 "X-LeapHub-Environment": environment,

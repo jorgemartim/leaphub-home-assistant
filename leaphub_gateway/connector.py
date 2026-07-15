@@ -21,7 +21,7 @@ from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any
 
-CONNECTOR_VERSION = "1.11.59"
+CONNECTOR_VERSION = "1.11.60"
 MAX_INPUT_BYTES = 1024 * 1024
 
 COMMAND_METHODS: dict[str, str] = {
@@ -659,6 +659,59 @@ def visual_capabilities(
     }
 
 
+def visual_sensor_health(capabilities: dict[str, Any]) -> dict[str, Any]:
+    """Summarize mapped visual signals without treating unsupported values as closed."""
+    expected = {
+        "doors": 5,
+        "windows": 4,
+        "roof": 1,
+        "sunshade": 1,
+        "lights": 5,
+        "security": 3,
+        "climate": 2,
+        "mirrors": 3,
+        "charging": 6,
+    }
+    groups: dict[str, dict[str, Any]] = {}
+    known_total = 0
+    expected_total = 0
+    core_known = 0
+    core_expected = 0
+    for group, expected_count in expected.items():
+        raw = capabilities.get(group)
+        if isinstance(raw, list):
+            known_count = len({str(item) for item in raw if str(item).strip()})
+        elif isinstance(raw, bool):
+            known_count = 1 if raw else 0
+        else:
+            known_count = 0
+        known_count = max(0, min(expected_count, known_count))
+        status = "complete" if known_count >= expected_count else ("partial" if known_count > 0 else "unavailable")
+        groups[group] = {
+            "known": known_count,
+            "expected": expected_count,
+            "status": status,
+        }
+        known_total += known_count
+        expected_total += expected_count
+        if group in {"doors", "windows", "roof", "sunshade"}:
+            core_known += known_count
+            core_expected += expected_count
+    completeness = round((known_total / expected_total) * 100) if expected_total else 0
+    core_completeness = round((core_known / core_expected) * 100) if core_expected else 0
+    overall = "complete" if core_completeness >= 100 else ("partial" if known_total > 0 else "unavailable")
+    return {
+        "status": overall,
+        "known": known_total,
+        "expected": expected_total,
+        "completeness_percent": completeness,
+        "core_known": core_known,
+        "core_expected": core_expected,
+        "core_completeness_percent": core_completeness,
+        "groups": groups,
+    }
+
+
 def visual_fingerprint(payload: dict[str, Any]) -> str:
     """Create a stable fingerprint without VIN, credentials or account identifiers."""
     canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=json_default)
@@ -947,9 +1000,9 @@ def serialize_vehicle(vehicle: Any, include_status: bool, client: Any, messages:
         "model_source": "vehicle.car_type",
         "color_source": "vehicle.out_color" if attribute(vehicle, "out_color") is not None else "vehicle.raw",
     })
+    visual_diagnostics = visual_sensor_health(reported_visual_capabilities)
     visual_fingerprint_value = visual_fingerprint({
-        "version": 3,
-        "captured_at": captured_at,
+        "version": 4,
         "identity": visual_identity,
         "primary": visual_primary_state,
         "signature": visual_signature,
@@ -964,6 +1017,10 @@ def serialize_vehicle(vehicle: Any, include_status: bool, client: Any, messages:
         "security": security_state,
         "climate": climate_state,
         "charging": charge_state_details,
+    })
+    visual_sample_fingerprint = visual_fingerprint({
+        "state": visual_fingerprint_value,
+        "captured_at": captured_at,
     })
 
     tire_states = compact_mapping({
@@ -1096,22 +1153,26 @@ def serialize_vehicle(vehicle: Any, include_status: bool, client: Any, messages:
         "ignition_details": ignition_state,
         "vehicle_image_url": vehicle_image_url,
         "exterior_color": exterior_color,
-        "visual_state_version": 3,
+        "visual_state_version": 4,
         "visual_primary_state": visual_primary_state,
         "visual_components": visual_components,
         "visual_signature": visual_signature,
         "visual_fingerprint": visual_fingerprint_value,
+        "visual_sample_fingerprint": visual_sample_fingerprint,
         "visual_identity": visual_identity,
         "visual_capabilities": reported_visual_capabilities,
+        "visual_diagnostics": visual_diagnostics,
         "visual_state": {
-            "version": 3,
+            "version": 4,
             "captured_at": captured_at,
             "fingerprint": visual_fingerprint_value,
+            "sample_fingerprint": visual_sample_fingerprint,
             "identity": visual_identity,
             "primary": visual_primary_state,
             "signature": visual_signature,
             "components": visual_components,
             "capabilities": reported_visual_capabilities,
+            "diagnostics": visual_diagnostics,
             "doors": door_state,
             "windows": window_state,
             "window_positions": compact_mapping(window_positions),
@@ -1129,7 +1190,7 @@ def serialize_vehicle(vehicle: Any, include_status: bool, client: Any, messages:
             "vehicle": attribute(vehicle, "raw", {}),
             "status": attribute(status, "raw", {}),
         }),
-        "mapping_version": "1.11.59",
+        "mapping_version": "1.11.60",
     }
     result["telemetry"] = telemetry
     return result
