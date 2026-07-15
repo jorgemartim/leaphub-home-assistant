@@ -21,7 +21,7 @@ from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any
 
-CONNECTOR_VERSION = "1.11.61"
+CONNECTOR_VERSION = "1.11.62"
 MAX_INPUT_BYTES = 1024 * 1024
 
 COMMAND_METHODS: dict[str, str] = {
@@ -634,6 +634,63 @@ def build_visual_signature(
     return components, "--".join(signature_parts)
 
 
+
+def visual_component_states(
+    primary_state: str,
+    doors: dict[str, Any],
+    windows: dict[str, Any],
+    roof_open: bool | None,
+    sunshade_open: bool | None,
+    lights: dict[str, Any],
+    security: dict[str, Any],
+    climate: dict[str, Any],
+    mirrors: dict[str, Any],
+    charging: dict[str, Any],
+) -> dict[str, bool | None]:
+    """Publish explicit true/false/unknown states for the visual contract."""
+    light_values = [value for value in lights.values() if isinstance(value, bool)]
+    states: dict[str, bool | None] = {
+        "front-left-open": doors.get("front_left"),
+        "front-right-open": doors.get("front_right"),
+        "rear-left-open": doors.get("rear_left"),
+        "rear-right-open": doors.get("rear_right"),
+        "trunk-open": doors.get("trunk"),
+        "window-front-left-open": windows.get("front_left"),
+        "window-front-right-open": windows.get("front_right"),
+        "window-rear-left-open": windows.get("rear_left"),
+        "window-rear-right-open": windows.get("rear_right"),
+        "roof-open": roof_open,
+        "sunshade-open": sunshade_open,
+        "lights-on": any(light_values) if light_values else None,
+        "hazard-on": lights.get("hazard"),
+        "sentry-on": security.get("sentry_mode"),
+        "climate-on": climate.get("on"),
+        "battery-preheat-on": climate.get("battery_preheat"),
+        "charge-completed": charging.get("completed"),
+        "mirrors-folded": mirrors.get("folded"),
+        "parked": primary_state == "parked",
+        "unlocked": primary_state == "unlocked",
+        "driving": primary_state == "driving",
+        "plugged": primary_state == "plugged",
+        "charging": primary_state == "charging",
+    }
+    return states
+
+
+def visual_contract(component_states: dict[str, bool | None]) -> dict[str, Any]:
+    known = sorted(key for key, value in component_states.items() if isinstance(value, bool))
+    unknown = sorted(key for key, value in component_states.items() if value is None)
+    active = sorted(key for key, value in component_states.items() if value is True)
+    return {
+        "schema": 1,
+        "version": 6,
+        "unknown_is_not_closed": True,
+        "known_components": known,
+        "unknown_components": unknown,
+        "active_components": active,
+    }
+
+
 def visual_capabilities(
     doors: dict[str, Any],
     windows: dict[str, Any],
@@ -999,6 +1056,19 @@ def serialize_vehicle(vehicle: Any, include_status: bool, client: Any, messages:
         mirrors_state,
         charge_state_details,
     )
+    reported_visual_component_states = visual_component_states(
+        visual_primary_state,
+        door_state,
+        window_state,
+        roof_state,
+        sunshade_state,
+        lights_state,
+        security_state,
+        climate_state,
+        mirrors_state,
+        charge_state_details,
+    )
+    reported_visual_contract = visual_contract(reported_visual_component_states)
     captured_at = iso_timestamp(attribute(status, "collect_time") or attribute(status, "create_time"))
     model_code_candidate = first_text(
         map_text(vehicle_scalars, "modelCode", "carModel", "vehicleModel", "seriesCode"),
@@ -1053,12 +1123,14 @@ def serialize_vehicle(vehicle: Any, include_status: bool, client: Any, messages:
         if isinstance(group, dict) and str(group.get("status") or "") != "complete"
     ]
     visual_fingerprint_value = visual_fingerprint({
-        "version": 5,
+        "version": 6,
         "identity": visual_identity,
         "resolution_hints": visual_resolution_hints,
         "primary": visual_primary_state,
         "signature": visual_signature,
         "components": visual_components,
+        "component_states": reported_visual_component_states,
+        "contract": reported_visual_contract,
         "doors": compact_mapping(door_state),
         "windows": compact_mapping(window_state),
         "window_positions": compact_mapping(window_positions),
@@ -1205,9 +1277,11 @@ def serialize_vehicle(vehicle: Any, include_status: bool, client: Any, messages:
         "ignition_details": ignition_state,
         "vehicle_image_url": vehicle_image_url,
         "exterior_color": exterior_color,
-        "visual_state_version": 5,
+        "visual_state_version": 6,
         "visual_primary_state": visual_primary_state,
         "visual_components": visual_components,
+        "visual_component_states": reported_visual_component_states,
+        "visual_contract": reported_visual_contract,
         "visual_signature": visual_signature,
         "visual_fingerprint": visual_fingerprint_value,
         "visual_sample_fingerprint": visual_sample_fingerprint,
@@ -1216,7 +1290,7 @@ def serialize_vehicle(vehicle: Any, include_status: bool, client: Any, messages:
         "visual_capabilities": reported_visual_capabilities,
         "visual_diagnostics": visual_diagnostics,
         "visual_state": {
-            "version": 5,
+            "version": 6,
             "captured_at": captured_at,
             "fingerprint": visual_fingerprint_value,
             "sample_fingerprint": visual_sample_fingerprint,
@@ -1225,6 +1299,8 @@ def serialize_vehicle(vehicle: Any, include_status: bool, client: Any, messages:
             "primary": visual_primary_state,
             "signature": visual_signature,
             "components": visual_components,
+            "component_states": reported_visual_component_states,
+            "contract": reported_visual_contract,
             "capabilities": reported_visual_capabilities,
             "diagnostics": visual_diagnostics,
             "doors": door_state,
@@ -1244,7 +1320,7 @@ def serialize_vehicle(vehicle: Any, include_status: bool, client: Any, messages:
             "vehicle": attribute(vehicle, "raw", {}),
             "status": attribute(status, "raw", {}),
         }),
-        "mapping_version": "1.11.61",
+        "mapping_version": "1.11.62",
     }
     result["telemetry"] = telemetry
     return result

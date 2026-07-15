@@ -1,4 +1,4 @@
-# Leap Hub Gateway 1.11.61
+# Leap Hub Gateway 1.11.62
 
 ## Visão geral
 
@@ -128,6 +128,6 @@ Confirme se o pacote `ghcr.io/jorgemartim/leaphub-gateway` está público no Git
 Remova e adicione novamente o repositório, depois use **Verificar atualizações**.
 
 
-## Telemetria contínua 1.11.61
+## Telemetria contínua 1.11.62
 
-O Gateway mantém a fila criptografada, a sequência por veículo e a deduplicação da 1.11.60. A versão 1.11.61 publica o estado visual versão 5 com pistas seguras de resolução do modelo e da cor, informa se a imagem oficial da nuvem estava disponível e identifica grupos de sensores incompletos sem tratar ausência como estado fechado. Esses dados não incluem VIN, credenciais, localização ou identificadores da conta.
+O Gateway mantém a fila criptografada, a sequência por veículo e a deduplicação da 1.11.60. A versão 1.11.62 publica o estado visual versão 5 com pistas seguras de resolução do modelo e da cor, informa se a imagem oficial da nuvem estava disponível e identifica grupos de sensores incompletos sem tratar ausência como estado fechado. Esses dados não incluem VIN, credenciais, localização ou identificadores da conta.

@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.11.62
+
+- Publica o contrato visual versão 6 com estado explícito `true`, `false` ou desconhecido por componente.
+- Lista componentes conhecidos, desconhecidos e ativos sem interpretar ausência como fechado.
+- Permite ao Leap Hub usar o contrato como fallback quando a estrutura detalhada do sensor vier incompleta.
+- Inclui o contrato na fingerprint sem adicionar VIN, localização, credenciais ou identificadores da conta.
+- Preserva fila ordenada, deduplicação semântica e heartbeats.
+- Atualiza a versão do mapeamento para 1.11.62.
+
 ## 1.11.61
 
 - Publica o estado visual versão 5 com pistas seguras de resolução do modelo e da cor.
