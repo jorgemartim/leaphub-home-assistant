@@ -1,4 +1,9 @@
-# Leap Hub Gateway 1.11.63
+# Leap Hub Gateway 1.11.64
+
+## Consistência visual 1.11.64
+
+Cada composição oficial agora informa o estado principal, a assinatura, os componentes usados e um hash de consistência. O Leap Hub rejeita automaticamente uma imagem antiga quando ela não corresponde à telemetria atual e usa a biblioteca local como fallback. Os bytes continuam sendo reenviados somente quando a imagem realmente muda.
+
 
 
 ## Imagem oficial e validação de carregamento 1.11.63

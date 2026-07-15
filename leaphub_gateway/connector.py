@@ -26,7 +26,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-CONNECTOR_VERSION = "1.11.63"
+CONNECTOR_VERSION = "1.11.64"
 MAX_INPUT_BYTES = 1024 * 1024
 
 COMMAND_METHODS: dict[str, str] = {
@@ -688,7 +688,7 @@ def visual_contract(component_states: dict[str, bool | None]) -> dict[str, Any]:
     active = sorted(key for key, value in component_states.items() if value is True)
     return {
         "schema": 1,
-        "version": 7,
+        "version": 8,
         "unknown_is_not_closed": True,
         "known_components": known,
         "unknown_components": unknown,
@@ -802,6 +802,190 @@ def safe_https_url(value: Any) -> str | None:
 
 _IMAGE_LAST_HASH: dict[str, str] = {}
 _IMAGE_PACKAGE_CACHE: dict[str, tuple[float, Any, str]] = {}
+
+_OFFICIAL_RENDER_COMPONENTS = {
+    "front-left-open",
+    "front-right-open",
+    "rear-left-open",
+    "rear-right-open",
+    "trunk-open",
+    "window-front-left-open",
+    "window-rear-left-open",
+    "plugged",
+    "charging",
+}
+
+
+def _official_render_contract(
+    visual_components: list[str],
+    evidence: dict[str, Any],
+) -> tuple[str, list[str], str]:
+    """Return only the state that the official layer package can actually draw."""
+    active = {
+        str(component).strip().lower()
+        for component in visual_components
+        if str(component).strip().lower() in _OFFICIAL_RENDER_COMPONENTS
+    }
+    if evidence.get("active_charging") is True:
+        render_state = "charging"
+        active.discard("plugged")
+        active.add("charging")
+    elif evidence.get("plugged") is True:
+        render_state = "plugged"
+        active.discard("charging")
+        active.add("plugged")
+    else:
+        render_state = "parked"
+        active.discard("charging")
+        active.discard("plugged")
+    components = sorted(active)
+    signature = "--".join([render_state] + [item for item in components if item != render_state])
+    return render_state, components, signature
+
+
+def _official_visual_status(render_components: list[str], render_state: str) -> Any:
+    """Build the compositor input from the normalized visual contract.
+
+    The cloud object can temporarily omit a door group. Passing that raw object to
+    the upstream compositor turns an unknown sensor into a closed door. Building a
+    status from the normalized active components prevents the image from reverting
+    to closed while the visual contract still reports the opening.
+    """
+    active = set(render_components)
+    doors = SimpleNamespace(
+        lbcm_driver_door_status="front-left-open" in active,
+        rbcm_driver_door_status="front-right-open" in active,
+        lbcm_left_rear_door_status="rear-left-open" in active,
+        rbcm_right_rear_door_status="rear-right-open" in active,
+        bbcm_back_door_status="trunk-open" in active,
+    )
+    windows = SimpleNamespace(
+        left_front_window_percent=100 if "window-front-left-open" in active else 0,
+        right_front_window_percent=100 if "window-front-right-open" in active else 0,
+        left_rear_window_percent=100 if "window-rear-left-open" in active else 0,
+        right_rear_window_percent=100 if "window-rear-right-open" in active else 0,
+    )
+    charging = render_state == "charging"
+    plugged = render_state in {"charging", "plugged"}
+    return SimpleNamespace(
+        doors=doors,
+        windows=windows,
+        is_plugged=plugged,
+        is_charging=charging,
+        battery=SimpleNamespace(is_charging=charging),
+    )
+
+
+def _edge_alpha_ratio(image: Any) -> float:
+    width, height = image.size
+    if width < 2 or height < 2:
+        return 1.0
+    alpha = image.getchannel("A")
+    pixels = alpha.load()
+    samples: list[int] = []
+    for x in range(width):
+        samples.append(int(pixels[x, 0]))
+        samples.append(int(pixels[x, height - 1]))
+    for y in range(1, height - 1):
+        samples.append(int(pixels[0, y]))
+        samples.append(int(pixels[width - 1, y]))
+    if not samples:
+        return 0.0
+    return sum(1 for value in samples if value > 12) / len(samples)
+
+
+def _clean_official_composite(raw_png: bytes) -> tuple[bytes, dict[str, Any]]:
+    """Preserve alpha and remove edge-connected package backgrounds.
+
+    Some regional picture packages contain semi-opaque canvas pixels in individual
+    layers. Stacking those layers creates the grey blocks/triangles seen around an
+    opened door. The cleanup only removes regions connected to the outer border; it
+    does not erase isolated bodywork or an opened door in the center of the canvas.
+    """
+    from PIL import Image, ImageDraw
+
+    image = Image.open(io.BytesIO(raw_png)).convert("RGBA")
+    width, height = image.size
+    if width < 64 or height < 64 or width > 4096 or height > 4096:
+        raise ValueError("Dimensões da composição oficial fora do limite.")
+
+    before = _edge_alpha_ratio(image)
+    original_alpha = image.getchannel("A")
+    work = image.convert("RGB")
+    marker = (255, 0, 255)
+    step_x = max(1, width // 12)
+    step_y = max(1, height // 12)
+    seeds = {(0, 0), (width - 1, 0), (0, height - 1), (width - 1, height - 1)}
+    for x in range(0, width, step_x):
+        seeds.add((x, 0))
+        seeds.add((x, height - 1))
+    for y in range(0, height, step_y):
+        seeds.add((0, y))
+        seeds.add((width - 1, y))
+
+    alpha_pixels = original_alpha.load()
+    for seed in seeds:
+        if int(alpha_pixels[seed[0], seed[1]]) <= 8:
+            continue
+        if work.getpixel(seed) == marker:
+            continue
+        ImageDraw.floodfill(work, seed, marker, thresh=34)
+
+    marked = list(work.getdata())
+    alpha_values = list(original_alpha.getdata())
+    removed = 0
+    for index, pixel in enumerate(marked):
+        if pixel == marker:
+            if alpha_values[index] > 0:
+                removed += 1
+            alpha_values[index] = 0
+        elif alpha_values[index] <= 6:
+            alpha_values[index] = 0
+    cleaned_alpha = Image.new("L", image.size)
+    cleaned_alpha.putdata(alpha_values)
+    image.putalpha(cleaned_alpha)
+
+    bbox = cleaned_alpha.getbbox()
+    if bbox is None:
+        raise ValueError("A composição oficial ficou vazia após a limpeza.")
+    left, top, right, bottom = bbox
+    visible_width = right - left
+    visible_height = bottom - top
+    if visible_width < width * 0.18 or visible_height < height * 0.18:
+        raise ValueError("A composição oficial não contém área útil suficiente.")
+
+    after = _edge_alpha_ratio(image)
+    if before >= 0.30 and after >= 0.22:
+        # Melhor exibir o asset local correto do que publicar uma composição com
+        # um fundo quebrado ocupando o card inteiro.
+        raise ValueError("O pacote oficial manteve um fundo opaco incompatível.")
+
+    padding_x = max(4, int(visible_width * 0.035))
+    padding_y = max(4, int(visible_height * 0.055))
+    crop = (
+        max(0, left - padding_x),
+        max(0, top - padding_y),
+        min(width, right + padding_x),
+        min(height, bottom + padding_y),
+    )
+    image = image.crop(crop)
+
+    buffer = io.BytesIO()
+    image.save(buffer, format="WEBP", lossless=True, quality=100, method=6)
+    output = buffer.getvalue()
+    if len(output) < 512 or len(output) > 2_500_000:
+        raise ValueError("A composição oficial processada ficou fora do limite.")
+    total = max(1, width * height)
+    return output, {
+        "edge_alpha_before": round(before, 4),
+        "edge_alpha_after": round(after, 4),
+        "removed_pixels": removed,
+        "removed_percent": round((removed / total) * 100, 2),
+        "cropped": crop != (0, 0, width, height),
+        "output_width": image.size[0],
+        "output_height": image.size[1],
+        "format": "webp-lossless",
+    }
 
 
 def charging_evidence(status: Any) -> dict[str, Any]:
@@ -971,6 +1155,8 @@ def official_visual_image_payload(
     remote_id: str,
     visual_fingerprint_value: str,
     visual_signature: str,
+    visual_primary_state: str,
+    visual_components: list[str],
     evidence: dict[str, Any],
     captured_at: str,
 ) -> dict[str, Any] | None:
@@ -979,19 +1165,36 @@ def official_visual_image_payload(
         return None
     package, picture_key_hash = resolved
     try:
-        visual_status = SimpleNamespace(
-            doors=attribute(status, "doors"),
-            windows=attribute(status, "windows"),
-            is_plugged=evidence.get("plugged") is True,
-            is_charging=evidence.get("active_charging") is True,
-            battery=SimpleNamespace(is_charging=evidence.get("active_charging") is True),
+        render_state, render_components, render_layer_signature = _official_render_contract(
+            visual_components,
+            evidence,
         )
-        image_bytes = package.compose(visual_status, format="WEBP")
-        if not isinstance(image_bytes, bytes) or len(image_bytes) < 512 or len(image_bytes) > 2_500_000:
+        visual_status = _official_visual_status(render_components, render_state)
+        # Compose to PNG first. The upstream default WebP path is lossy and may
+        # amplify alpha artefacts in regional picture packages.
+        raw_composite = package.compose(visual_status, format="PNG")
+        if not isinstance(raw_composite, bytes):
             return None
+        image_bytes, cleanup = _clean_official_composite(raw_composite)
         sha256 = hashlib.sha256(image_bytes).hexdigest()
         changed = _IMAGE_LAST_HASH.get(remote_id) != sha256
         _IMAGE_LAST_HASH[remote_id] = sha256
+        rendered_components = sorted({
+            str(component).strip().lower()
+            for component in visual_components
+            if re.fullmatch(r"[a-z0-9-]{1,80}", str(component).strip().lower())
+        })[:64]
+        rendered_state = str(visual_primary_state or "parked").strip().lower()
+        if rendered_state not in {"parked", "unlocked", "driving", "plugged", "charging"}:
+            rendered_state = "parked"
+        consistency_source = json.dumps({
+            "sha256": sha256,
+            "state": rendered_state,
+            "signature": visual_signature,
+            "components": rendered_components,
+            "fingerprint": visual_fingerprint_value,
+            "layer_signature": render_layer_signature,
+        }, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
         payload = {
             "source": "leapmotor-picture-package",
             "available": True,
@@ -999,6 +1202,15 @@ def official_visual_image_payload(
             "sha256": sha256,
             "visual_fingerprint": visual_fingerprint_value,
             "visual_signature": visual_signature,
+            "rendered_primary_state": rendered_state,
+            "rendered_signature": visual_signature,
+            "rendered_components": rendered_components,
+            "rendered_layer_state": render_state,
+            "rendered_layer_signature": render_layer_signature,
+            "rendered_layer_components": render_components,
+            "image_cleanup": cleanup,
+            "render_contract_version": 9,
+            "consistency_hash": hashlib.sha256(consistency_source.encode("utf-8")).hexdigest(),
             "picture_key_hash": picture_key_hash if re.fullmatch(r"[a-f0-9]{64}", picture_key_hash or "") else None,
             "captured_at": captured_at,
         }
@@ -1519,7 +1731,7 @@ def serialize_vehicle(vehicle: Any, include_status: bool, client: Any, messages:
             "vehicle": attribute(vehicle, "raw", {}),
             "status": attribute(status, "raw", {}),
         }),
-        "mapping_version": "1.11.63",
+        "mapping_version": "1.11.64",
     }
     official_image = official_visual_image_payload(
         client,
@@ -1528,6 +1740,8 @@ def serialize_vehicle(vehicle: Any, include_status: bool, client: Any, messages:
         remote_id or vin,
         visual_fingerprint_value,
         visual_signature,
+        visual_primary_state,
+        visual_components,
         charging_evidence_data,
         captured_at,
     )
@@ -1543,6 +1757,9 @@ def serialize_vehicle(vehicle: Any, include_status: bool, client: Any, messages:
             "source": "leapmotor-picture-package",
             "available": False,
             "visual_fingerprint": visual_fingerprint_value,
+            "rendered_primary_state": visual_primary_state,
+            "rendered_signature": visual_signature,
+            "render_contract_version": 9,
         })
     result["telemetry"] = telemetry
     return result

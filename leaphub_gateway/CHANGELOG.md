@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.11.64
+
+- Corrige composição oficial, transparência e consistência entre porta/vidro e imagem.
+- Impede que leitura parcial feche visualmente uma abertura ainda ativa.
+
 ## 1.11.63
 
 - Usa o pacote oficial de imagens da API para compor localmente modelo, cor, portas, vidros, porta-malas e carga.
