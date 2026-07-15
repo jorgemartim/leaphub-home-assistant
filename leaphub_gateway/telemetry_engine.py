@@ -22,7 +22,7 @@ from cryptography.fernet import Fernet, InvalidToken
 import leaphub_connector as connector
 
 LOG = logging.getLogger("leaphub.telemetry")
-ENGINE_VERSION = "1.11.62"
+ENGINE_VERSION = "1.11.63"
 
 
 def utc_iso() -> str:
@@ -42,6 +42,7 @@ VOLATILE_SEMANTIC_KEYS = {
     "gateway_collected_at",
     "visual_sample_fingerprint",
     "sample_fingerprint",
+    "data_base64",
 }
 
 

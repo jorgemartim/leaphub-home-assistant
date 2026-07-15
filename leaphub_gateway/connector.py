@@ -7,21 +7,26 @@ Credentials never appear in command-line arguments or environment variables.
 
 from __future__ import annotations
 
+import base64
 import hashlib
+import io
 import json
 import os
 import re
 import shutil
 import sys
 import tempfile
+import time
+import zipfile
 from dataclasses import asdict, is_dataclass
 from datetime import date, datetime
 from enum import Enum
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
-CONNECTOR_VERSION = "1.11.62"
+CONNECTOR_VERSION = "1.11.63"
 MAX_INPUT_BYTES = 1024 * 1024
 
 COMMAND_METHODS: dict[str, str] = {
@@ -683,7 +688,7 @@ def visual_contract(component_states: dict[str, bool | None]) -> dict[str, Any]:
     active = sorted(key for key, value in component_states.items() if value is True)
     return {
         "schema": 1,
-        "version": 6,
+        "version": 7,
         "unknown_is_not_closed": True,
         "known_components": known,
         "unknown_components": unknown,
@@ -774,7 +779,7 @@ def visual_model_family(*values: Any) -> str | None:
     for value in values:
         text = str(value or "").strip().lower()
         normalized = "".join(char for char in text if char.isalnum())
-        if "c10" in normalized:
+        if "c10" in normalized or normalized in {"t03", "leapmotort03"}:
             return "c10"
         if "b10" in normalized:
             return "b10"
@@ -794,30 +799,222 @@ def safe_https_url(value: Any) -> str | None:
     return text
 
 
-def charging_label(status: Any) -> str:
-    charging = bool_or_none(attribute(status, "is_charging"))
-    plugged = bool_or_none(attribute(status, "is_plugged"))
-    parked = bool_or_none(attribute(status, "is_parked"))
-    regenerating = bool_or_none(attribute(status, "is_regening"))
+
+_IMAGE_LAST_HASH: dict[str, str] = {}
+_IMAGE_PACKAGE_CACHE: dict[str, tuple[float, Any, str]] = {}
+
+
+def charging_evidence(status: Any) -> dict[str, Any]:
     battery = attribute(status, "battery")
+    driving = attribute(status, "driving")
+    raw_charging = bool_or_none(attribute(status, "is_charging"))
+    top_plugged = bool_or_none(attribute(status, "is_plugged"))
+    fast_connector = first_bool(attribute(battery, "is_charge_fast_gun_insert"), attribute(battery, "dc_input_fast_charge"))
+    slow_connector = first_bool(attribute(battery, "is_charge_slow_gun_insert"), attribute(battery, "ac_input_slow_charge"))
+    connector_values = [value for value in (fast_connector, slow_connector) if value is not None]
+    connector_known = bool(connector_values)
+    connector_inserted = fast_connector is True or slow_connector is True
+    connectors_explicitly_out = connector_known and not connector_inserted
+    parked = bool_or_none(attribute(status, "is_parked"))
+    speed = first_numeric(attribute(driving, "speed"))
+    regenerating = bool_or_none(attribute(status, "is_regening"))
     completed = bool_or_none(attribute(battery, "charge_completed"))
-    state = value_of(attribute(battery, "charge_state"))
-    state_text = str(state or "").lower()
+    state_text = str(value_of(attribute(battery, "charge_state")) or "").strip().lower()
+    power = first_numeric(attribute(battery, "charging_power_kw"))
+    current = first_numeric(attribute(battery, "charging_current"), attribute(battery, "charge_current"))
+    voltage = first_numeric(attribute(battery, "charging_voltage"), attribute(battery, "charge_voltage"))
+    external_power = bool(
+        (power is not None and abs(power) >= 0.25)
+        or (current is not None and voltage is not None and abs(current) >= 0.5 and abs(voltage) >= 50.0)
+    )
+    moving = bool((speed is not None and speed > 1) or parked is False)
+    state_says_charging = "charging" in state_text and "not" not in state_text
+    state_says_regen = "regen" in state_text
 
-    if regenerating is True or "regen" in state_text:
-        return "regenerating"
-    if charging is True:
-        return "charging"
-    if completed is True or "finish" in state_text or "complete" in state_text:
-        return "completed"
-    if charging is False:
-        return "plugged" if plugged is True else "not_charging"
-    if "charging" in state_text and parked is not False:
-        return "charging"
-    if plugged is True:
-        return "plugged"
-    return "not_charging"
+    if regenerating is True or state_says_regen or (moving and raw_charging is True and not connector_inserted):
+        state = "regenerating"
+        active = False
+        plugged = connector_inserted or top_plugged is True
+    elif connectors_explicitly_out:
+        # Os sinais físicos dos conectores são mais específicos que o booleano
+        # genérico is_plugged/is_charging, que pode permanecer defasado na nuvem.
+        state = "not_charging"
+        active = False
+        plugged = False
+        external_power = False
+    else:
+        plugged = connector_inserted or top_plugged is True
+        active_signal = raw_charging is True or state_says_charging or external_power
+        active = bool(active_signal and plugged and not moving)
+        if active:
+            state = "charging"
+        elif completed is True or "finish" in state_text or "complete" in state_text:
+            state = "completed" if plugged else "not_charging"
+        elif plugged:
+            state = "plugged"
+        else:
+            state = "not_charging"
 
+    return compact_mapping({
+        "state": state,
+        "active_charging": active,
+        "plugged": plugged,
+        "raw_is_charging": raw_charging,
+        "raw_is_plugged": top_plugged,
+        "fast_connector": fast_connector,
+        "slow_connector": slow_connector,
+        "connector_known": connector_known,
+        "external_power": external_power,
+        "regenerating": regenerating,
+        "parked": parked,
+        "speed_kmh": speed,
+        "charge_state": state_text or None,
+    })
+
+
+def _picture_key(value: Any) -> str | None:
+    preferred = {"key", "picturekey", "picture_key", "carpicturekey", "car_picture_key", "packagekey", "package_key", "pickey"}
+    if isinstance(value, dict):
+        for key, candidate in value.items():
+            normalized = re.sub(r"[^a-z0-9_]", "", str(key).lower())
+            if normalized in preferred and isinstance(candidate, (str, int)):
+                text = str(candidate).strip()
+                if 8 <= len(text) <= 1000:
+                    return text
+        for candidate in value.values():
+            found = _picture_key(candidate)
+            if found:
+                return found
+    elif isinstance(value, (list, tuple)):
+        for candidate in value:
+            found = _picture_key(candidate)
+            if found:
+                return found
+    return None
+
+
+def _validate_picture_zip(raw: bytes) -> None:
+    if len(raw) < 512 or len(raw) > 25 * 1024 * 1024:
+        raise ValueError("Pacote oficial de imagens fora do limite permitido.")
+    with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+        entries = archive.infolist()
+        if len(entries) > 160:
+            raise ValueError("Pacote oficial de imagens possui arquivos demais.")
+        total = 0
+        for entry in entries:
+            total += max(0, int(entry.file_size))
+            if entry.file_size > 20 * 1024 * 1024 or total > 120 * 1024 * 1024:
+                raise ValueError("Pacote oficial de imagens descompactado excede o limite.")
+
+
+def _official_picture_package(client: Any, vehicle: Any, remote_id: str) -> tuple[Any, str] | None:
+    cache_key = hashlib.sha256(remote_id.encode("utf-8", "ignore")).hexdigest()
+    cached = _IMAGE_PACKAGE_CACHE.get(cache_key)
+    now = time.time()
+    if cached and now - cached[0] < 6 * 3600:
+        return cached[1], cached[2]
+    root = Path(os.environ.get("LEAPHUB_VEHICLE_IMAGE_DIR", "/data/runtime/vehicle-pictures"))
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    package_file = root / f"{cache_key}.zip"
+    metadata_file = root / f"{cache_key}.json"
+    old_meta: dict[str, Any] = {}
+    try:
+        if metadata_file.is_file():
+            decoded = json.loads(metadata_file.read_text(encoding="utf-8"))
+            old_meta = decoded if isinstance(decoded, dict) else {}
+    except Exception:
+        old_meta = {}
+
+    picture_key: str | None = None
+    raw: bytes | None = None
+    should_refresh = not package_file.is_file() or now - package_file.stat().st_mtime > 24 * 3600
+    if should_refresh:
+        try:
+            metadata = client.get_car_picture(vehicle)
+            picture_key = _picture_key(metadata)
+            if picture_key:
+                raw = client.download_car_picture_package(picture_key=picture_key)
+                _validate_picture_zip(raw)
+                temporary = package_file.with_suffix(f".tmp-{os.getpid()}")
+                temporary.write_bytes(raw)
+                os.chmod(temporary, 0o600)
+                temporary.replace(package_file)
+                metadata_file.write_text(json.dumps({
+                    "picture_key_hash": hashlib.sha256(picture_key.encode("utf-8")).hexdigest(),
+                    "updated_at": datetime.utcnow().isoformat() + "Z",
+                }, separators=(",", ":")), encoding="utf-8")
+                os.chmod(metadata_file, 0o600)
+        except Exception as exc:
+            print(f"Leap Hub: imagem oficial indisponível nesta leitura ({type(exc).__name__}).", file=sys.stderr)
+
+    if not package_file.is_file():
+        return None
+    try:
+        raw = package_file.read_bytes()
+        _validate_picture_zip(raw)
+        from leapmotor_api.image import CarImagePackage
+        package = CarImagePackage.from_zip(raw)
+        key_hash = str(old_meta.get("picture_key_hash") or "")
+        if picture_key:
+            key_hash = hashlib.sha256(picture_key.encode("utf-8")).hexdigest()
+        _IMAGE_PACKAGE_CACHE[cache_key] = (now, package, key_hash)
+        return package, key_hash
+    except Exception as exc:
+        print(f"Leap Hub: pacote oficial de imagem inválido ({type(exc).__name__}).", file=sys.stderr)
+        return None
+
+
+def official_visual_image_payload(
+    client: Any,
+    vehicle: Any,
+    status: Any,
+    remote_id: str,
+    visual_fingerprint_value: str,
+    visual_signature: str,
+    evidence: dict[str, Any],
+    captured_at: str,
+) -> dict[str, Any] | None:
+    resolved = _official_picture_package(client, vehicle, remote_id)
+    if resolved is None:
+        return None
+    package, picture_key_hash = resolved
+    try:
+        visual_status = SimpleNamespace(
+            doors=attribute(status, "doors"),
+            windows=attribute(status, "windows"),
+            is_plugged=evidence.get("plugged") is True,
+            is_charging=evidence.get("active_charging") is True,
+            battery=SimpleNamespace(is_charging=evidence.get("active_charging") is True),
+        )
+        image_bytes = package.compose(visual_status, format="WEBP")
+        if not isinstance(image_bytes, bytes) or len(image_bytes) < 512 or len(image_bytes) > 2_500_000:
+            return None
+        sha256 = hashlib.sha256(image_bytes).hexdigest()
+        changed = _IMAGE_LAST_HASH.get(remote_id) != sha256
+        _IMAGE_LAST_HASH[remote_id] = sha256
+        payload = {
+            "source": "leapmotor-picture-package",
+            "available": True,
+            "mime": "image/webp",
+            "sha256": sha256,
+            "visual_fingerprint": visual_fingerprint_value,
+            "visual_signature": visual_signature,
+            "picture_key_hash": picture_key_hash if re.fullmatch(r"[a-f0-9]{64}", picture_key_hash or "") else None,
+            "captured_at": captured_at,
+        }
+        # Reenvia os bytes apenas quando a composição mudou. Os metadados ficam
+        # disponíveis em todos os ciclos, sem transformar uma imagem já salva
+        # em "indisponível" só porque ela foi deduplicada.
+        if changed:
+            payload["data_base64"] = base64.b64encode(image_bytes).decode("ascii")
+        return payload
+    except Exception as exc:
+        print(f"Leap Hub: composição da imagem oficial falhou ({type(exc).__name__}).", file=sys.stderr)
+        return None
+
+
+def charging_label(status: Any) -> str:
+    return str(charging_evidence(status).get("state") or "not_charging")
 
 def serialize_vehicle(vehicle: Any, include_status: bool, client: Any, messages: list[Any] | None = None, allow_unscoped_messages: bool = False) -> dict[str, Any]:
     vin = str(attribute(vehicle, "vin", "") or "").strip()
@@ -892,9 +1089,10 @@ def serialize_vehicle(vehicle: Any, include_status: bool, client: Any, messages:
     parked_value = bool_or_none(attribute(status, "is_parked")) if attribute(status, "is_parked") is not None else bool_or_none(attribute(driving, "is_parked"))
     ready_value = bool_or_none(attribute(driving, "ready")) if attribute(driving, "ready") is not None else bool_or_none(attribute(status, "ready"))
     ignition_value = bool_or_none(attribute(driving, "vehicle_on")) if attribute(driving, "vehicle_on") is not None else bool_or_none(attribute(status, "is_on"))
-    charging_state = charging_label(status)
-    plugged_value = bool_or_none(attribute(status, "is_plugged"))
-    regenerating_value = bool_or_none(attribute(status, "is_regening"))
+    charging_evidence_data = charging_evidence(status)
+    charging_state = str(charging_evidence_data.get("state") or "not_charging")
+    plugged_value = bool_or_none(charging_evidence_data.get("plugged"))
+    regenerating_value = bool_or_none(charging_evidence_data.get("regenerating"))
     explicit_charging_power = first_numeric(attribute(battery, "charging_power_kw"))
     battery_power = first_numeric(attribute(battery, "battery_power"))
     battery_current = first_numeric(
@@ -1013,8 +1211,8 @@ def serialize_vehicle(vehicle: Any, include_status: bool, client: Any, messages:
     charge_plan = attribute(battery, "charge_plan")
     charge_state_details = compact_mapping({
         "remaining_minutes": first_numeric(attribute(battery, "charge_remain_time")),
-        "fast_connector": first_bool(attribute(battery, "is_charge_fast_gun_insert"), attribute(battery, "dc_input_fast_charge")),
-        "slow_connector": first_bool(attribute(battery, "is_charge_slow_gun_insert"), attribute(battery, "ac_input_slow_charge")),
+        "fast_connector": bool_or_none(charging_evidence_data.get("fast_connector")),
+        "slow_connector": bool_or_none(charging_evidence_data.get("slow_connector")),
         "completed": first_bool(attribute(battery, "charge_completed")),
         "healthy_charge": first_bool(attribute(battery, "healthy_charge_enabled")),
         "thermal_request": enum_or_value(attribute(battery, "battery_thermal_request")),
@@ -1123,7 +1321,7 @@ def serialize_vehicle(vehicle: Any, include_status: bool, client: Any, messages:
         if isinstance(group, dict) and str(group.get("status") or "") != "complete"
     ]
     visual_fingerprint_value = visual_fingerprint({
-        "version": 6,
+        "version": 7,
         "identity": visual_identity,
         "resolution_hints": visual_resolution_hints,
         "primary": visual_primary_state,
@@ -1273,11 +1471,12 @@ def serialize_vehicle(vehicle: Any, include_status: bool, client: Any, messages:
         "connectivity": connectivity_state,
         "climate_details": climate_state,
         "charging_details": charge_state_details,
+        "charging_evidence": charging_evidence_data,
         "tire_status": tire_states,
         "ignition_details": ignition_state,
         "vehicle_image_url": vehicle_image_url,
         "exterior_color": exterior_color,
-        "visual_state_version": 6,
+        "visual_state_version": 7,
         "visual_primary_state": visual_primary_state,
         "visual_components": visual_components,
         "visual_component_states": reported_visual_component_states,
@@ -1290,7 +1489,7 @@ def serialize_vehicle(vehicle: Any, include_status: bool, client: Any, messages:
         "visual_capabilities": reported_visual_capabilities,
         "visual_diagnostics": visual_diagnostics,
         "visual_state": {
-            "version": 6,
+            "version": 7,
             "captured_at": captured_at,
             "fingerprint": visual_fingerprint_value,
             "sample_fingerprint": visual_sample_fingerprint,
@@ -1320,8 +1519,31 @@ def serialize_vehicle(vehicle: Any, include_status: bool, client: Any, messages:
             "vehicle": attribute(vehicle, "raw", {}),
             "status": attribute(status, "raw", {}),
         }),
-        "mapping_version": "1.11.62",
+        "mapping_version": "1.11.63",
     }
+    official_image = official_visual_image_payload(
+        client,
+        vehicle,
+        status,
+        remote_id or vin,
+        visual_fingerprint_value,
+        visual_signature,
+        charging_evidence_data,
+        captured_at,
+    )
+    if official_image is not None:
+        # visual_image sem data_base64 funciona como heartbeat de metadados; o
+        # site mantém o último arquivo oficial persistido.
+        telemetry["visual_image"] = official_image
+        telemetry["official_visual_image"] = {
+            key: value for key, value in official_image.items() if key != "data_base64"
+        }
+    else:
+        telemetry["official_visual_image"] = compact_mapping({
+            "source": "leapmotor-picture-package",
+            "available": False,
+            "visual_fingerprint": visual_fingerprint_value,
+        })
     result["telemetry"] = telemetry
     return result
 

@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.11.63
+
+- Usa o pacote oficial de imagens da API para compor localmente modelo, cor, portas, vidros, porta-malas e carga.
+- Envia somente WebP final, hash e metadados seguros; não envia ZIP, chave do pacote, VIN ou credenciais.
+- Corrige falso carregamento cruzando conector rápido/lento, estado plugado, potência e movimento/regeneração.
+- Atualiza o contrato visual para a versão 7.
+
 ## 1.11.62
 
 - Publica o contrato visual versão 6 com estado explícito `true`, `false` ou desconhecido por componente.

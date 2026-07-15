@@ -1,4 +1,9 @@
-# Leap Hub Gateway 1.11.62
+# Leap Hub Gateway 1.11.63
+
+
+## Imagem oficial e validação de carregamento 1.11.63
+
+O Gateway baixa de forma autenticada o pacote de imagens associado ao próprio veículo, monta localmente a imagem conforme portas, vidros, porta-malas e carga e envia somente a composição final ao Leap Hub. O pacote original, a chave do pacote, VIN e credenciais permanecem no Gateway. O estado de carregamento agora exige evidência de conector ou alimentação externa e não confunde regeneração com carga na tomada.
 
 ## Visão geral
 
@@ -128,6 +133,6 @@ Confirme se o pacote `ghcr.io/jorgemartim/leaphub-gateway` está público no Git
 Remova e adicione novamente o repositório, depois use **Verificar atualizações**.
 
 
-## Telemetria contínua 1.11.62
+## Telemetria contínua 1.11.63
 
-O Gateway mantém a fila criptografada, a sequência por veículo e a deduplicação da 1.11.60. A versão 1.11.62 publica o estado visual versão 5 com pistas seguras de resolução do modelo e da cor, informa se a imagem oficial da nuvem estava disponível e identifica grupos de sensores incompletos sem tratar ausência como estado fechado. Esses dados não incluem VIN, credenciais, localização ou identificadores da conta.
+O Gateway mantém a fila criptografada, a sequência por veículo e a deduplicação da 1.11.60. A versão 1.11.63 publica o estado visual versão 7 com pistas seguras de resolução do modelo e da cor, informa se a imagem oficial da nuvem estava disponível e identifica grupos de sensores incompletos sem tratar ausência como estado fechado. Esses dados não incluem VIN, credenciais, localização ou identificadores da conta.
