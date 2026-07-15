@@ -26,7 +26,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-CONNECTOR_VERSION = "1.11.64"
+CONNECTOR_VERSION = "1.11.65"
 MAX_INPUT_BYTES = 1024 * 1024
 
 COMMAND_METHODS: dict[str, str] = {
@@ -802,6 +802,7 @@ def safe_https_url(value: Any) -> str | None:
 
 _IMAGE_LAST_HASH: dict[str, str] = {}
 _IMAGE_PACKAGE_CACHE: dict[str, tuple[float, Any, str]] = {}
+_IMAGE_RENDER_CACHE: dict[str, tuple[float, bytes, str, dict[str, Any]]] = {}
 
 _OFFICIAL_RENDER_COMPONENTS = {
     "front-left-open",
@@ -852,18 +853,26 @@ def _official_visual_status(render_components: list[str], render_state: str) -> 
     to closed while the visual contract still reports the opening.
     """
     active = set(render_components)
+    front_left_open = "front-left-open" in active
+    front_right_open = "front-right-open" in active
+    rear_left_open = "rear-left-open" in active
+    rear_right_open = "rear-right-open" in active
     doors = SimpleNamespace(
-        lbcm_driver_door_status="front-left-open" in active,
-        rbcm_driver_door_status="front-right-open" in active,
-        lbcm_left_rear_door_status="rear-left-open" in active,
-        rbcm_right_rear_door_status="rear-right-open" in active,
+        lbcm_driver_door_status=front_left_open,
+        rbcm_driver_door_status=front_right_open,
+        lbcm_left_rear_door_status=rear_left_open,
+        rbcm_right_rear_door_status=rear_right_open,
         bbcm_back_door_status="trunk-open" in active,
     )
+    # O pacote oficial posiciona o vidro fechado na posição da porta fechada.
+    # Quando a porta esquerda abre, manter essa camada cria o reflexo/painel cinza
+    # deslocado visto no card. Para renderização, a camada de vidro fechado deve
+    # ser omitida enquanto a porta correspondente estiver aberta.
     windows = SimpleNamespace(
-        left_front_window_percent=100 if "window-front-left-open" in active else 0,
-        right_front_window_percent=100 if "window-front-right-open" in active else 0,
-        left_rear_window_percent=100 if "window-rear-left-open" in active else 0,
-        right_rear_window_percent=100 if "window-rear-right-open" in active else 0,
+        left_front_window_percent=100 if front_left_open or "window-front-left-open" in active else 0,
+        right_front_window_percent=100 if front_right_open or "window-front-right-open" in active else 0,
+        left_rear_window_percent=100 if rear_left_open or "window-rear-left-open" in active else 0,
+        right_rear_window_percent=100 if rear_right_open or "window-rear-right-open" in active else 0,
     )
     charging = render_state == "charging"
     plugged = render_state in {"charging", "plugged"}
@@ -970,8 +979,14 @@ def _clean_official_composite(raw_png: bytes) -> tuple[bytes, dict[str, Any]]:
     )
     image = image.crop(crop)
 
+    # Os arquivos oficiais são camadas PNG transparentes. No tema escuro, reflexos
+    # semitransparentes podem parecer chapas soltas. A composição final é achatada
+    # sobre fundo branco, preservando a aparência prevista pelo material original.
+    white_matte = Image.new("RGB", image.size, (255, 255, 255))
+    white_matte.paste(image.convert("RGB"), mask=image.getchannel("A"))
+
     buffer = io.BytesIO()
-    image.save(buffer, format="WEBP", lossless=True, quality=100, method=6)
+    white_matte.save(buffer, format="WEBP", lossless=True, quality=100, method=6)
     output = buffer.getvalue()
     if len(output) < 512 or len(output) > 2_500_000:
         raise ValueError("A composição oficial processada ficou fora do limite.")
@@ -984,7 +999,9 @@ def _clean_official_composite(raw_png: bytes) -> tuple[bytes, dict[str, Any]]:
         "cropped": crop != (0, 0, width, height),
         "output_width": image.size[0],
         "output_height": image.size[1],
-        "format": "webp-lossless",
+        "format": "webp-lossless-rgb",
+        "background": "white",
+        "alpha_flattened": True,
     }
 
 
@@ -1027,9 +1044,17 @@ def charging_evidence(status: Any) -> dict[str, Any]:
         plugged = False
         external_power = False
     else:
-        plugged = connector_inserted or top_plugged is True
-        active_signal = raw_charging is True or state_says_charging or external_power
-        active = bool(active_signal and plugged and not moving)
+        if connector_known:
+            # Quando os sensores físicos existem, eles são a fonte de verdade.
+            plugged = connector_inserted
+            active_signal = raw_charging is True or state_says_charging or external_power
+            active = bool(active_signal and plugged and not moving)
+        else:
+            # Booleanos genéricos da nuvem podem permanecer presos no último estado.
+            # Sem confirmação AC/DC, só desenhamos cabo/carga quando há potência
+            # elétrica externa mensurável nesta leitura.
+            plugged = bool(external_power)
+            active = bool(external_power and not moving)
         if active:
             state = "charging"
         elif completed is True or "finish" in state_text or "complete" in state_text:
@@ -1053,6 +1078,7 @@ def charging_evidence(status: Any) -> dict[str, Any]:
         "parked": parked,
         "speed_kmh": speed,
         "charge_state": state_text or None,
+        "generic_plug_signal_trusted": connector_known or external_power,
     })
 
 
@@ -1148,6 +1174,35 @@ def _official_picture_package(client: Any, vehicle: Any, remote_id: str) -> tupl
         return None
 
 
+def _official_render_cache_key(remote_id: str, picture_key_hash: str, render_layer_signature: str) -> str:
+    source = "|".join([
+        str(remote_id or "").strip(),
+        str(picture_key_hash or "").strip().lower(),
+        str(render_layer_signature or "parked").strip().lower(),
+        "contract-11",
+    ])
+    return hashlib.sha256(source.encode("utf-8")).hexdigest()
+
+
+def _official_render_cache_get(cache_key: str) -> tuple[bytes, str, dict[str, Any]] | None:
+    cached = _IMAGE_RENDER_CACHE.get(cache_key)
+    if cached is None:
+        return None
+    stored_at, image_bytes, sha256, cleanup = cached
+    if time.time() - stored_at > 6 * 3600:
+        _IMAGE_RENDER_CACHE.pop(cache_key, None)
+        return None
+    return image_bytes, sha256, dict(cleanup)
+
+
+def _official_render_cache_put(cache_key: str, image_bytes: bytes, sha256: str, cleanup: dict[str, Any]) -> None:
+    _IMAGE_RENDER_CACHE[cache_key] = (time.time(), image_bytes, sha256, dict(cleanup))
+    if len(_IMAGE_RENDER_CACHE) <= 32:
+        return
+    for key, _value in sorted(_IMAGE_RENDER_CACHE.items(), key=lambda item: item[1][0])[: len(_IMAGE_RENDER_CACHE) - 24]:
+        _IMAGE_RENDER_CACHE.pop(key, None)
+
+
 def official_visual_image_payload(
     client: Any,
     vehicle: Any,
@@ -1169,14 +1224,21 @@ def official_visual_image_payload(
             visual_components,
             evidence,
         )
-        visual_status = _official_visual_status(render_components, render_state)
-        # Compose to PNG first. The upstream default WebP path is lossy and may
-        # amplify alpha artefacts in regional picture packages.
-        raw_composite = package.compose(visual_status, format="PNG")
-        if not isinstance(raw_composite, bytes):
-            return None
-        image_bytes, cleanup = _clean_official_composite(raw_composite)
-        sha256 = hashlib.sha256(image_bytes).hexdigest()
+        cache_key = _official_render_cache_key(remote_id, picture_key_hash, render_layer_signature)
+        cached_render = _official_render_cache_get(cache_key)
+        state_cache_hit = cached_render is not None
+        if cached_render is not None:
+            image_bytes, sha256, cleanup = cached_render
+        else:
+            visual_status = _official_visual_status(render_components, render_state)
+            # Compose to PNG first. The upstream default WebP path is lossy and may
+            # amplify alpha artefacts in regional picture packages.
+            raw_composite = package.compose(visual_status, format="PNG")
+            if not isinstance(raw_composite, bytes):
+                return None
+            image_bytes, cleanup = _clean_official_composite(raw_composite)
+            sha256 = hashlib.sha256(image_bytes).hexdigest()
+            _official_render_cache_put(cache_key, image_bytes, sha256, cleanup)
         changed = _IMAGE_LAST_HASH.get(remote_id) != sha256
         _IMAGE_LAST_HASH[remote_id] = sha256
         rendered_components = sorted({
@@ -1209,7 +1271,9 @@ def official_visual_image_payload(
             "rendered_layer_signature": render_layer_signature,
             "rendered_layer_components": render_components,
             "image_cleanup": cleanup,
-            "render_contract_version": 9,
+            "render_contract_version": 11,
+            "visual_image_state_key": cache_key,
+            "state_cache_hit": state_cache_hit,
             "consistency_hash": hashlib.sha256(consistency_source.encode("utf-8")).hexdigest(),
             "picture_key_hash": picture_key_hash if re.fullmatch(r"[a-f0-9]{64}", picture_key_hash or "") else None,
             "captured_at": captured_at,
@@ -1533,7 +1597,7 @@ def serialize_vehicle(vehicle: Any, include_status: bool, client: Any, messages:
         if isinstance(group, dict) and str(group.get("status") or "") != "complete"
     ]
     visual_fingerprint_value = visual_fingerprint({
-        "version": 7,
+        "version": 8,
         "identity": visual_identity,
         "resolution_hints": visual_resolution_hints,
         "primary": visual_primary_state,
@@ -1688,7 +1752,7 @@ def serialize_vehicle(vehicle: Any, include_status: bool, client: Any, messages:
         "ignition_details": ignition_state,
         "vehicle_image_url": vehicle_image_url,
         "exterior_color": exterior_color,
-        "visual_state_version": 7,
+        "visual_state_version": 8,
         "visual_primary_state": visual_primary_state,
         "visual_components": visual_components,
         "visual_component_states": reported_visual_component_states,
@@ -1701,7 +1765,7 @@ def serialize_vehicle(vehicle: Any, include_status: bool, client: Any, messages:
         "visual_capabilities": reported_visual_capabilities,
         "visual_diagnostics": visual_diagnostics,
         "visual_state": {
-            "version": 7,
+            "version": 8,
             "captured_at": captured_at,
             "fingerprint": visual_fingerprint_value,
             "sample_fingerprint": visual_sample_fingerprint,
@@ -1731,7 +1795,7 @@ def serialize_vehicle(vehicle: Any, include_status: bool, client: Any, messages:
             "vehicle": attribute(vehicle, "raw", {}),
             "status": attribute(status, "raw", {}),
         }),
-        "mapping_version": "1.11.64",
+        "mapping_version": "1.11.65",
     }
     official_image = official_visual_image_payload(
         client,
@@ -1759,7 +1823,7 @@ def serialize_vehicle(vehicle: Any, include_status: bool, client: Any, messages:
             "visual_fingerprint": visual_fingerprint_value,
             "rendered_primary_state": visual_primary_state,
             "rendered_signature": visual_signature,
-            "render_contract_version": 9,
+            "render_contract_version": 11,
         })
     result["telemetry"] = telemetry
     return result

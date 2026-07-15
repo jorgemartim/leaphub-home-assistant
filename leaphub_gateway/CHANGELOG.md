@@ -1,4 +1,10 @@
-# Changelog
+## 1.11.65
+
+- Corrige a camada de vidro fechado quando a porta correspondente está aberta.
+- Achata a composição oficial em fundo branco para eliminar artefatos de transparência no tema escuro.
+- Só exibe cabo/carregamento sem sensores AC/DC quando existe potência externa real.
+- Mantém biblioteca por assinatura visual e cache isolado por estado.
+- Contrato de renderização oficial versão 11.
 
 ## 1.11.64
 
