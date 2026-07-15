@@ -1,6 +1,6 @@
 # Leap Hub Home Assistant
 
-Versão atual do Gateway: **1.11.66**.
+Versão atual do Gateway: **1.11.67**.
 
 <p align="center">
   <img src="./leaphub_gateway/logo.png" alt="Leap Hub Gateway" width="420">
@@ -58,3 +58,7 @@ Arquiteturas disponíveis:
 ## Aviso
 
 Este projeto não é um produto oficial da Leapmotor, da Cloudflare ou do Home Assistant. Credenciais, chaves HMAC e tokens nunca devem ser enviados ao GitHub.
+
+## Teste de imagens por veículo
+
+Nas Configurações do Leap Hub, o administrador escolhe um ou mais veículos e solicita o pacote visual. O Gateway atualiza o pacote oficial, envia a composição e uma galeria sanitizada de camadas, sem VIN, token ou credenciais.

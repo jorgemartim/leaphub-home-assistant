@@ -1,6 +1,6 @@
 # Leap Hub Gateway
 
-## Biblioteca visual 1.11.66
+## Biblioteca visual 1.11.67
 
 Cada composição oficial agora informa o estado principal, a assinatura, os componentes usados e um hash de consistência. O Leap Hub rejeita automaticamente uma imagem antiga quando ela não corresponde à telemetria atual e usa a biblioteca local como fallback. Os bytes continuam sendo reenviados somente quando a imagem realmente muda.
 
@@ -20,3 +20,6 @@ Leia a aba **Documentação** antes de migrar os Apps antigos. O Tunnel vem desa
 ## Telemetria contínua 1.11.63
 
 O Gateway mantém a fila criptografada, a sequência por veículo e a deduplicação da 1.11.60. A versão 1.11.63 publica o estado visual versão 7 com pistas seguras de resolução do modelo e da cor, informa se a imagem oficial da nuvem estava disponível e identifica grupos de sensores incompletos sem tratar ausência como estado fechado. Esses dados não incluem VIN, credenciais, localização ou identificadores da conta.
+## Teste de imagens por veículo
+
+Nas Configurações do Leap Hub, o administrador escolhe um ou mais veículos e solicita o pacote visual. O Gateway atualiza o pacote oficial, envia a composição e uma galeria sanitizada de camadas, sem VIN, token ou credenciais.

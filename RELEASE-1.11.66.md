@@ -1,4 +1,4 @@
-# Leap Hub Gateway 1.11.66
+# Leap Hub Gateway 1.11.67
 
 - Cria uma galeria sanitizada das camadas do pacote oficial Leapmotor.
 - Envia ao site somente miniaturas WebP seguras, nomes sanitizados, dimensões e hashes.

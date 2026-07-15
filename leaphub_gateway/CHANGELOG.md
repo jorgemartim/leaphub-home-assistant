@@ -1,4 +1,9 @@
-## 1.11.66
+## 1.11.67
+
+- Canvas oficial preservado e animação de carregamento.
+- Teste de imagens por veículo acionado pelas Configurações do Leap Hub.
+
+## 1.11.67
 
 - Envia uma galeria sanitizada das camadas oficiais recebidas da API para diagnóstico administrativo.
 - Inclui prévias transparente, branca e escura da mesma composição.

@@ -26,7 +26,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-CONNECTOR_VERSION = "1.11.66"
+CONNECTOR_VERSION = "1.11.67"
 MAX_INPUT_BYTES = 1024 * 1024
 
 COMMAND_METHODS: dict[str, str] = {
@@ -904,109 +904,92 @@ def _edge_alpha_ratio(image: Any) -> float:
     return sum(1 for value in samples if value > 12) / len(samples)
 
 
-def _clean_official_composite(raw_png: bytes) -> tuple[bytes, dict[str, Any]]:
-    """Preserve alpha and remove edge-connected package backgrounds.
+def _encode_official_composite(raw_image: bytes, media_type: str = "image/png") -> tuple[bytes, dict[str, Any]]:
+    """Preserve the exact official canvas, alpha, shadow and wheel area.
 
-    Some regional picture packages contain semi-opaque canvas pixels in individual
-    layers. Stacking those layers creates the grey blocks/triangles seen around an
-    opened door. The cleanup only removes regions connected to the outer border; it
-    does not erase isolated bodywork or an opened door in the center of the canvas.
+    The package already contains aligned full-canvas layers. Cropping, edge flood-fill
+    and white flattening altered the official composition and could remove tires,
+    shadows or parts below an opened door. This encoder validates the image and
+    exports the complete canvas without interpreting its pixels.
     """
-    from PIL import Image, ImageDraw
+    from PIL import Image
 
-    image = Image.open(io.BytesIO(raw_png)).convert("RGBA")
+    image = Image.open(io.BytesIO(raw_image))
     width, height = image.size
     if width < 64 or height < 64 or width > 4096 or height > 4096:
         raise ValueError("Dimensões da composição oficial fora do limite.")
 
-    before = _edge_alpha_ratio(image)
-    original_alpha = image.getchannel("A")
-    work = image.convert("RGB")
-    marker = (255, 0, 255)
-    step_x = max(1, width // 12)
-    step_y = max(1, height // 12)
-    seeds = {(0, 0), (width - 1, 0), (0, height - 1), (width - 1, height - 1)}
-    for x in range(0, width, step_x):
-        seeds.add((x, 0))
-        seeds.add((x, height - 1))
-    for y in range(0, height, step_y):
-        seeds.add((0, y))
-        seeds.add((width - 1, y))
+    is_animated = bool(getattr(image, "is_animated", False)) and int(getattr(image, "n_frames", 1)) > 1
+    if is_animated and media_type.lower() == "image/webp":
+        output = raw_image
+        output_format = "webp-lossless-animated-official"
+        frame_count = int(getattr(image, "n_frames", 1))
+    else:
+        rgba = image.convert("RGBA")
+        buffer = io.BytesIO()
+        rgba.save(buffer, format="WEBP", lossless=True, quality=100, method=6)
+        output = buffer.getvalue()
+        output_format = "webp-lossless-rgba-official"
+        frame_count = 1
 
-    alpha_pixels = original_alpha.load()
-    for seed in seeds:
-        if int(alpha_pixels[seed[0], seed[1]]) <= 8:
-            continue
-        if work.getpixel(seed) == marker:
-            continue
-        ImageDraw.floodfill(work, seed, marker, thresh=34)
-
-    marked = list(work.getdata())
-    alpha_values = list(original_alpha.getdata())
-    removed = 0
-    for index, pixel in enumerate(marked):
-        if pixel == marker:
-            if alpha_values[index] > 0:
-                removed += 1
-            alpha_values[index] = 0
-        elif alpha_values[index] <= 6:
-            alpha_values[index] = 0
-    cleaned_alpha = Image.new("L", image.size)
-    cleaned_alpha.putdata(alpha_values)
-    image.putalpha(cleaned_alpha)
-
-    bbox = cleaned_alpha.getbbox()
-    if bbox is None:
-        raise ValueError("A composição oficial ficou vazia após a limpeza.")
-    left, top, right, bottom = bbox
-    visible_width = right - left
-    visible_height = bottom - top
-    if visible_width < width * 0.18 or visible_height < height * 0.18:
-        raise ValueError("A composição oficial não contém área útil suficiente.")
-
-    after = _edge_alpha_ratio(image)
-    if before >= 0.30 and after >= 0.22:
-        # Melhor exibir o asset local correto do que publicar uma composição com
-        # um fundo quebrado ocupando o card inteiro.
-        raise ValueError("O pacote oficial manteve um fundo opaco incompatível.")
-
-    padding_x = max(4, int(visible_width * 0.035))
-    padding_y = max(4, int(visible_height * 0.055))
-    crop = (
-        max(0, left - padding_x),
-        max(0, top - padding_y),
-        min(width, right + padding_x),
-        min(height, bottom + padding_y),
-    )
-    image = image.crop(crop)
-
-    # Os arquivos oficiais são camadas PNG transparentes. No tema escuro, reflexos
-    # semitransparentes podem parecer chapas soltas. A composição final é achatada
-    # sobre fundo branco, preservando a aparência prevista pelo material original.
-    white_matte = Image.new("RGB", image.size, (255, 255, 255))
-    white_matte.paste(image.convert("RGB"), mask=image.getchannel("A"))
-
-    buffer = io.BytesIO()
-    white_matte.save(buffer, format="WEBP", lossless=True, quality=100, method=6)
-    output = buffer.getvalue()
     if len(output) < 512 or len(output) > 2_500_000:
-        raise ValueError("A composição oficial processada ficou fora do limite.")
-    total = max(1, width * height)
+        raise ValueError("A composição oficial ficou fora do limite permitido.")
     return output, {
-        "edge_alpha_before": round(before, 4),
-        "edge_alpha_after": round(after, 4),
-        "removed_pixels": removed,
-        "removed_percent": round((removed / total) * 100, 2),
-        "cropped": crop != (0, 0, width, height),
-        "output_width": image.size[0],
-        "output_height": image.size[1],
-        "format": "webp-lossless-rgb",
-        "background": "white",
-        "alpha_flattened": True,
+        "edge_alpha_before": round(_edge_alpha_ratio(image.convert("RGBA")), 4),
+        "edge_alpha_after": round(_edge_alpha_ratio(image.convert("RGBA")), 4),
+        "removed_pixels": 0,
+        "removed_percent": 0.0,
+        "cropped": False,
+        "output_width": width,
+        "output_height": height,
+        "format": output_format,
+        "background": "transparent-official",
+        "alpha_flattened": False,
+        "frame_count": frame_count,
+        "official_canvas_preserved": True,
     }
 
 
-
+def _compose_official_output(package: Any, visual_status: Any, render_state: str) -> tuple[bytes, str, dict[str, Any]]:
+    """Return the official static or animated composition without local cropping."""
+    raw: bytes
+    media_type = "image/png"
+    if render_state == "charging":
+        animated = getattr(package, "compose_animated", None)
+        if callable(animated):
+            result = animated(visual_status, frame_duration=180)
+            if isinstance(result, tuple) and len(result) == 2 and isinstance(result[0], bytes):
+                raw = result[0]
+                media_type = str(result[1] or "image/webp")
+            else:
+                raw = package.compose(visual_status, charge_frame=2, format="PNG")
+        else:
+            # Compatibility with older library builds: build the official frames
+            # from the same package coordinates and preserve the complete canvas.
+            from PIL import Image
+            frames = []
+            for frame_number in range(2, 16):
+                frame_raw = package.compose(visual_status, charge_frame=frame_number, format="PNG")
+                frames.append(Image.open(io.BytesIO(frame_raw)).convert("RGBA"))
+            buffer = io.BytesIO()
+            frames[0].save(
+                buffer,
+                format="WEBP",
+                save_all=True,
+                append_images=frames[1:],
+                duration=180,
+                loop=0,
+                lossless=True,
+                method=6,
+            )
+            raw = buffer.getvalue()
+            media_type = "image/webp"
+    else:
+        raw = package.compose(visual_status, format="PNG")
+    if not isinstance(raw, bytes):
+        raise ValueError("A biblioteca não retornou a composição oficial.")
+    output, metadata = _encode_official_composite(raw, media_type)
+    return output, "image/webp", metadata
 
 def _debug_safe_name(value: str, index: int) -> str:
     raw = Path(str(value or "layer")).name.lower()
@@ -1050,17 +1033,18 @@ def _official_debug_payload(
     render_layer_signature: str,
     render_components: list[str],
     captured_at: str,
+    force: bool = False,
 ) -> dict[str, Any] | None:
     """Create a small sanitized gallery of the image layers received from the API.
 
     No VIN, account identifier, credentials or raw cloud payload are included. The
-    gallery is emitted only when the package/state combination changes.
+    gallery is normally emitted when the package/state combination changes; an authenticated settings test may force a safe resend.
     """
     try:
         package_bytes = package_file.read_bytes()
         package_hash = hashlib.sha256(package_bytes).hexdigest()
         debug_hash = hashlib.sha256(f"{package_hash}|{render_layer_signature}|debug-v1".encode()).hexdigest()
-        if _IMAGE_DEBUG_LAST_HASH.get(remote_id) == debug_hash:
+        if not force and _IMAGE_DEBUG_LAST_HASH.get(remote_id) == debug_hash:
             return None
 
         files: list[dict[str, Any]] = []
@@ -1275,10 +1259,13 @@ def _validate_picture_zip(raw: bytes) -> None:
                 raise ValueError("Pacote oficial de imagens descompactado excede o limite.")
 
 
-def _official_picture_package(client: Any, vehicle: Any, remote_id: str) -> tuple[Any, str, Path] | None:
+def _official_picture_package(client: Any, vehicle: Any, remote_id: str, force_refresh: bool = False) -> tuple[Any, str, Path] | None:
     cache_key = hashlib.sha256(remote_id.encode("utf-8", "ignore")).hexdigest()
     cached = _IMAGE_PACKAGE_CACHE.get(cache_key)
     now = time.time()
+    if force_refresh:
+        _IMAGE_PACKAGE_CACHE.pop(cache_key, None)
+        cached = None
     if cached and now - cached[0] < 6 * 3600:
         return cached[1], cached[2], cached[3]
     root = Path(os.environ.get("LEAPHUB_VEHICLE_IMAGE_DIR", "/data/runtime/vehicle-pictures"))
@@ -1295,7 +1282,7 @@ def _official_picture_package(client: Any, vehicle: Any, remote_id: str) -> tupl
 
     picture_key: str | None = None
     raw: bytes | None = None
-    should_refresh = not package_file.is_file() or now - package_file.stat().st_mtime > 24 * 3600
+    should_refresh = force_refresh or not package_file.is_file() or now - package_file.stat().st_mtime > 24 * 3600
     if should_refresh:
         try:
             metadata = client.get_car_picture(vehicle)
@@ -1337,7 +1324,7 @@ def _official_render_cache_key(remote_id: str, picture_key_hash: str, render_lay
         str(remote_id or "").strip(),
         str(picture_key_hash or "").strip().lower(),
         str(render_layer_signature or "parked").strip().lower(),
-        "contract-12",
+        "contract-13",
     ])
     return hashlib.sha256(source.encode("utf-8")).hexdigest()
 
@@ -1372,8 +1359,11 @@ def official_visual_image_payload(
     visual_components: list[str],
     evidence: dict[str, Any],
     captured_at: str,
+    force_visual_bytes: bool = False,
+    force_debug_package: bool = False,
+    force_package_refresh: bool = False,
 ) -> dict[str, Any] | None:
-    resolved = _official_picture_package(client, vehicle, remote_id)
+    resolved = _official_picture_package(client, vehicle, remote_id, force_refresh=force_package_refresh)
     if resolved is None:
         return None
     package, picture_key_hash, package_file = resolved
@@ -1383,21 +1373,16 @@ def official_visual_image_payload(
             evidence,
         )
         cache_key = _official_render_cache_key(remote_id, picture_key_hash, render_layer_signature)
-        cached_render = _official_render_cache_get(cache_key)
+        cached_render = None if force_package_refresh else _official_render_cache_get(cache_key)
         state_cache_hit = cached_render is not None
         visual_status = _official_visual_status(render_components, render_state)
         if cached_render is not None:
             image_bytes, sha256, cleanup = cached_render
         else:
-            # Compose to PNG first. The upstream default WebP path is lossy and may
-            # amplify alpha artefacts in regional picture packages.
-            raw_composite = package.compose(visual_status, format="PNG")
-            if not isinstance(raw_composite, bytes):
-                return None
-            image_bytes, cleanup = _clean_official_composite(raw_composite)
+            image_bytes, output_mime, cleanup = _compose_official_output(package, visual_status, render_state)
             sha256 = hashlib.sha256(image_bytes).hexdigest()
             _official_render_cache_put(cache_key, image_bytes, sha256, cleanup)
-        changed = _IMAGE_LAST_HASH.get(remote_id) != sha256
+        changed = force_visual_bytes or _IMAGE_LAST_HASH.get(remote_id) != sha256
         _IMAGE_LAST_HASH[remote_id] = sha256
         rendered_components = sorted({
             str(component).strip().lower()
@@ -1429,7 +1414,7 @@ def official_visual_image_payload(
             "rendered_layer_signature": render_layer_signature,
             "rendered_layer_components": render_components,
             "image_cleanup": cleanup,
-            "render_contract_version": 12,
+            "render_contract_version": 13,
             "visual_image_state_key": cache_key,
             "state_cache_hit": state_cache_hit,
             "consistency_hash": hashlib.sha256(consistency_source.encode("utf-8")).hexdigest(),
@@ -1444,6 +1429,7 @@ def official_visual_image_payload(
         debug_payload = _official_debug_payload(
             remote_id, package_file, package, visual_status, picture_key_hash,
             render_layer_signature, render_components, captured_at,
+            force=force_debug_package,
         )
         if debug_payload is not None:
             payload["debug_package"] = debug_payload
@@ -1456,7 +1442,16 @@ def official_visual_image_payload(
 def charging_label(status: Any) -> str:
     return str(charging_evidence(status).get("state") or "not_charging")
 
-def serialize_vehicle(vehicle: Any, include_status: bool, client: Any, messages: list[Any] | None = None, allow_unscoped_messages: bool = False) -> dict[str, Any]:
+def serialize_vehicle(
+    vehicle: Any,
+    include_status: bool,
+    client: Any,
+    messages: list[Any] | None = None,
+    allow_unscoped_messages: bool = False,
+    force_visual_bytes: bool = False,
+    force_debug_package: bool = False,
+    force_package_refresh: bool = False,
+) -> dict[str, Any]:
     vin = str(attribute(vehicle, "vin", "") or "").strip()
     remote_id = str(attribute(vehicle, "car_id", "") or vin).strip()
     model = str(attribute(vehicle, "car_type", "") or "Leapmotor").strip()
@@ -1959,7 +1954,7 @@ def serialize_vehicle(vehicle: Any, include_status: bool, client: Any, messages:
             "vehicle": attribute(vehicle, "raw", {}),
             "status": attribute(status, "raw", {}),
         }),
-        "mapping_version": "1.11.66",
+        "mapping_version": "1.11.67",
     }
     official_image = official_visual_image_payload(
         client,
@@ -1972,6 +1967,9 @@ def serialize_vehicle(vehicle: Any, include_status: bool, client: Any, messages:
         visual_components,
         charging_evidence_data,
         captured_at,
+        force_visual_bytes=force_visual_bytes,
+        force_debug_package=force_debug_package,
+        force_package_refresh=force_package_refresh,
     )
     if official_image is not None:
         # visual_image sem data_base64 funciona como heartbeat de metadados; o
@@ -1987,7 +1985,7 @@ def serialize_vehicle(vehicle: Any, include_status: bool, client: Any, messages:
             "visual_fingerprint": visual_fingerprint_value,
             "rendered_primary_state": visual_primary_state,
             "rendered_signature": visual_signature,
-            "render_contract_version": 12,
+            "render_contract_version": 13,
         })
     result["telemetry"] = telemetry
     return result
@@ -2042,6 +2040,9 @@ def handle_account(payload: dict[str, Any], sync: bool) -> dict[str, Any]:
     credentials_value = payload.get("credentials") if sync else payload
     credentials = credentials_value if isinstance(credentials_value, dict) else {}
     vehicle_id = str(payload.get("vehicle_id") or "").strip() if sync else ""
+    force_visual_bytes = bool(payload.get("force_visual_bytes")) if sync else False
+    force_debug_package = bool(payload.get("force_debug_package")) if sync else False
+    force_package_refresh = bool(payload.get("force_package_refresh")) if sync else False
     temp_dir = secure_temp_directory()
     client = None
     try:
@@ -2074,6 +2075,9 @@ def handle_account(payload: dict[str, Any], sync: bool) -> dict[str, Any]:
                 client=client,
                 messages=messages,
                 allow_unscoped_messages=len(selected) == 1,
+                force_visual_bytes=force_visual_bytes,
+                force_debug_package=force_debug_package,
+                force_package_refresh=force_package_refresh,
             )
             for item in selected
         ]
