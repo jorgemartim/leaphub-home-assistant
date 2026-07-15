@@ -20,7 +20,7 @@ from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any
 
-CONNECTOR_VERSION = "1.11.57"
+CONNECTOR_VERSION = "1.11.58"
 MAX_INPUT_BYTES = 1024 * 1024
 
 COMMAND_METHODS: dict[str, str] = {
@@ -575,6 +575,72 @@ def compact_mapping(values: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in values.items() if value is not None}
 
 
+def build_visual_signature(
+    primary_state: str,
+    doors: dict[str, Any],
+    windows: dict[str, Any],
+    roof_open: bool | None,
+    sunshade_open: bool | None,
+    lights: dict[str, Any],
+    security: dict[str, Any],
+) -> tuple[list[str], str]:
+    """Build a deterministic state key used by the site asset resolver."""
+    components: list[str] = []
+    door_names = {
+        "front_left": "front-left-open",
+        "front_right": "front-right-open",
+        "rear_left": "rear-left-open",
+        "rear_right": "rear-right-open",
+        "trunk": "trunk-open",
+    }
+    window_names = {
+        "front_left": "window-front-left-open",
+        "front_right": "window-front-right-open",
+        "rear_left": "window-rear-left-open",
+        "rear_right": "window-rear-right-open",
+    }
+    for key, component in door_names.items():
+        if doors.get(key) is True:
+            components.append(component)
+    for key, component in window_names.items():
+        if windows.get(key) is True:
+            components.append(component)
+    if roof_open is True:
+        components.append("roof-open")
+    if sunshade_open is True:
+        components.append("sunshade-open")
+    if lights.get("hazard") is True:
+        components.append("hazard-on")
+    elif any(value is True for value in lights.values()):
+        components.append("lights-on")
+    if security.get("sentry_mode") is True:
+        components.append("sentry-on")
+    if primary_state in {"charging", "plugged"}:
+        components.append(primary_state)
+    components = sorted(set(components))
+    signature_parts = [primary_state] + [item for item in components if item != primary_state]
+    return components, "--".join(signature_parts)
+
+
+def visual_capabilities(
+    doors: dict[str, Any],
+    windows: dict[str, Any],
+    roof_open: bool | None,
+    sunshade_open: bool | None,
+    lights: dict[str, Any],
+    security: dict[str, Any],
+) -> dict[str, Any]:
+    """Tell the site what was actually reported so unknown is not shown as closed."""
+    return {
+        "doors": sorted(key for key, value in doors.items() if value is not None),
+        "windows": sorted(key for key, value in windows.items() if value is not None),
+        "roof": roof_open is not None,
+        "sunshade": sunshade_open is not None,
+        "lights": sorted(key for key, value in lights.items() if value is not None),
+        "security": sorted(key for key, value in security.items() if value is not None),
+    }
+
+
 def safe_https_url(value: Any) -> str | None:
     text = text_value(value, 1000)
     if not text or not text.lower().startswith("https://"):
@@ -806,6 +872,34 @@ def serialize_vehicle(vehicle: Any, include_status: bool, client: Any, messages:
         "schedule_end": text_value(attribute(charge_plan, "end"), 20),
         "schedule_cycles": text_value(attribute(charge_plan, "cycles"), 30),
     })
+
+    visual_primary_state = "parked"
+    if charging_state == "charging":
+        visual_primary_state = "charging"
+    elif plugged_value is True or charging_state in {"plugged", "completed"}:
+        visual_primary_state = "plugged"
+    elif speed_value is not None and speed_value > 1:
+        visual_primary_state = "driving"
+    elif bool_or_none(attribute(status, "is_locked")) is False:
+        visual_primary_state = "unlocked"
+    visual_components, visual_signature = build_visual_signature(
+        visual_primary_state,
+        door_state,
+        window_state,
+        roof_state,
+        sunshade_state,
+        lights_state,
+        security_state,
+    )
+    reported_visual_capabilities = visual_capabilities(
+        door_state,
+        window_state,
+        roof_state,
+        sunshade_state,
+        lights_state,
+        security_state,
+    )
+
     tire_states = compact_mapping({
         "front_left": enum_or_value(attribute(tires, "front_left_state")),
         "front_right": enum_or_value(attribute(tires, "front_right_state")),
@@ -936,7 +1030,17 @@ def serialize_vehicle(vehicle: Any, include_status: bool, client: Any, messages:
         "ignition_details": ignition_state,
         "vehicle_image_url": vehicle_image_url,
         "exterior_color": exterior_color,
+        "visual_state_version": 2,
+        "visual_primary_state": visual_primary_state,
+        "visual_components": visual_components,
+        "visual_signature": visual_signature,
+        "visual_capabilities": reported_visual_capabilities,
         "visual_state": {
+            "version": 2,
+            "primary": visual_primary_state,
+            "signature": visual_signature,
+            "components": visual_components,
+            "capabilities": reported_visual_capabilities,
             "doors": door_state,
             "windows": window_state,
             "window_positions": compact_mapping(window_positions),
@@ -953,7 +1057,7 @@ def serialize_vehicle(vehicle: Any, include_status: bool, client: Any, messages:
             "vehicle": attribute(vehicle, "raw", {}),
             "status": attribute(status, "raw", {}),
         }),
-        "mapping_version": "1.11.57",
+        "mapping_version": "1.11.58",
     }
     result["telemetry"] = telemetry
     return result

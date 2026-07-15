@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.11.58
+
+- Gera uma assinatura visual determinística para cada combinação de estado do veículo.
+- Informa quais sensores de portas, vidros, teto, luzes e segurança realmente responderam.
+- Diferencia estado fechado de estado não informado, evitando alertas falsos na interface.
+- Prepara imagens completas e camadas transparentes por modelo, cor e componente.
+- Atualiza a versão do mapeamento para 1.11.58.
+
 ## 1.11.57
 
 - Envia `outColor` para o Leap Hub e preserva aliases de cor encontrados no retorno bruto.
