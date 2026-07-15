@@ -30,7 +30,7 @@ except ModuleNotFoundError as exc:
         "Módulo interno leaphub_connector ausente na imagem. Atualize o Leap Hub Gateway."
     ) from exc
 
-VERSION = "1.11.68"
+VERSION = "1.11.69"
 SERVICE = "Leap Hub Leapmotor Connector"
 MAX_BODY = 1024 * 1024
 WINDOW_SECONDS = 180
@@ -273,6 +273,16 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError, RuntimeError) as exc:
             self.send_json(422, {"ok": False, "message": connector.clean_message(str(exc)), "connector_version": connector.CONNECTOR_VERSION})
         except Exception as exc:  # noqa: BLE001
+            if connector.is_transient_cloud_error(exc):
+                LOG.warning("Falha temporária recuperável não classificada: %s", connector.clean_message(str(exc)))
+                self.send_json(503, {
+                    "ok": False,
+                    "temporary": True,
+                    "retry_after_seconds": 20,
+                    "message": connector.reconnect_message(exc),
+                    "connector_version": connector.CONNECTOR_VERSION,
+                })
+                return
             LOG.exception("Unhandled connector error")
             self.send_json(500, {"ok": False, "message": "Falha interna no conector.", "connector_version": connector.CONNECTOR_VERSION})
 

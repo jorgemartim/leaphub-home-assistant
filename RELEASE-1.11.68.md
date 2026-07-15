@@ -1,4 +1,4 @@
-# Leap Hub Gateway 1.11.68
+# Leap Hub Gateway 1.11.69
 
 - Recria a sessão e faz login novamente quando a nuvem Leapmotor expira token ou recusa temporariamente a verificação.
 - Tenta novamente a lista de veículos em até três sessões novas antes de considerar a credencial inválida.

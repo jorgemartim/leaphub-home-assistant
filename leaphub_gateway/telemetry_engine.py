@@ -22,7 +22,7 @@ from cryptography.fernet import Fernet, InvalidToken
 import leaphub_connector as connector
 
 LOG = logging.getLogger("leaphub.telemetry")
-ENGINE_VERSION = "1.11.68"
+ENGINE_VERSION = "1.11.69"
 
 
 def utc_iso() -> str:
@@ -96,6 +96,7 @@ class TelemetryEngine:
             "staging": bool(options.get("telemetry_beta_enabled", True)),
             "production": bool(options.get("telemetry_production_enabled", False)),
         }
+        self.watchdog_checked_at = 0.0
         self._init_db()
 
     def _bounded(self, key: str, default: int, minimum: int, maximum: int) -> int:
@@ -208,6 +209,7 @@ class TelemetryEngine:
     def start(self) -> None:
         if self.worker and self.worker.is_alive():
             return
+        self._wake_recoverable_subscriptions(startup=True)
         self.worker = threading.Thread(target=self._run, name="leaphub-telemetry", daemon=True)
         self.worker.start()
         LOG.info("Telemetria contínua iniciada com fila persistente em %s.", self.db_path)
@@ -316,6 +318,24 @@ class TelemetryEngine:
             },
             "recent": recent,
         }
+
+    def _wake_recoverable_subscriptions(self, startup: bool = False) -> None:
+        now = time.time()
+        with self.lock, self._db() as db:
+            cursor = db.execute(
+                """
+                UPDATE subscriptions
+                SET status='waiting', next_run_at=?, last_error=NULL, updated_at=?
+                WHERE enabled=1
+                  AND status IN ('error','recovering','waiting','queue_full')
+                  AND cooldown_until<=?
+                  AND (next_run_at>? OR ?=1)
+                """,
+                (now + 1.0, utc_iso(), now, now + 120.0, 1 if startup else 0),
+            )
+        if int(cursor.rowcount or 0) > 0:
+            LOG.info("Watchdog reativou %s assinatura(s) para reconexão automática.", int(cursor.rowcount or 0))
+            self.wake_event.set()
 
     def _run(self) -> None:
         while not self.stop_event.is_set():
@@ -721,6 +741,10 @@ class TelemetryEngine:
                 )
 
     def _maintenance(self) -> None:
+        now_epoch = time.time()
+        if now_epoch - self.watchdog_checked_at >= 60:
+            self.watchdog_checked_at = now_epoch
+            self._wake_recoverable_subscriptions(startup=False)
         # Executada de forma barata; o SQLite ignora as remoções quando não há registros antigos.
         cutoff = time.time() - self.retention_days * 86400
         cutoff_iso = datetime.fromtimestamp(cutoff, timezone.utc).isoformat().replace("+00:00", "Z")

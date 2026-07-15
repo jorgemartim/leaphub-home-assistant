@@ -1,4 +1,8 @@
-## Reconexão automática 1.11.68
+## Automação autônoma 1.11.69
+
+O Gateway reconecta, reativa assinaturas e continua a telemetria sem ação do usuário.
+
+## Reconexão automática 1.11.69
 
 O Gateway não depende de uma sessão permanente. Em cada ciclo ele autentica novamente usando as credenciais criptografadas. Quando a nuvem expira o token ou retorna uma falha temporária de verificação, o Gateway cria uma sessão nova, tenta até três vezes e agenda nova consulta sem desconectar a conta do Leap Hub. Somente uma recusa persistente e claramente relacionada à senha exige intervenção do usuário.
 

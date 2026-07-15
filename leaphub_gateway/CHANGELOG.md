@@ -1,4 +1,4 @@
-## 1.11.68
+## 1.11.69
 
 - Reconexão automática de sessão/token da Leapmotor.
 - Bloqueio por conta contra chamadas simultâneas.
