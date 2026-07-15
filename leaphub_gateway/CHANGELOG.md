@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.11.59
+
+- Atualiza a representação do veículo em tempo real sem recarregar a página inteira.
+- Publica o estado visual versão 3 com identidade do modelo, cor, horário e fingerprint determinístico.
+- Adiciona climatização, pré-aquecimento da bateria, carga concluída e retrovisores recolhidos aos componentes visuais.
+- Mantém o payload sem VIN, credenciais ou identificadores de conta dentro da assinatura visual.
+- Atualiza a versão do mapeamento para 1.11.59.
+
 ## 1.11.58
 
 - Gera uma assinatura visual determinística para cada combinação de estado do veículo.

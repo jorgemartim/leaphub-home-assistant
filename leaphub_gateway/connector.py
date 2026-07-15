@@ -7,6 +7,7 @@ Credentials never appear in command-line arguments or environment variables.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -20,7 +21,7 @@ from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any
 
-CONNECTOR_VERSION = "1.11.58"
+CONNECTOR_VERSION = "1.11.59"
 MAX_INPUT_BYTES = 1024 * 1024
 
 COMMAND_METHODS: dict[str, str] = {
@@ -583,6 +584,9 @@ def build_visual_signature(
     sunshade_open: bool | None,
     lights: dict[str, Any],
     security: dict[str, Any],
+    climate: dict[str, Any],
+    mirrors: dict[str, Any],
+    charging: dict[str, Any],
 ) -> tuple[list[str], str]:
     """Build a deterministic state key used by the site asset resolver."""
     components: list[str] = []
@@ -615,7 +619,15 @@ def build_visual_signature(
         components.append("lights-on")
     if security.get("sentry_mode") is True:
         components.append("sentry-on")
-    if primary_state in {"charging", "plugged"}:
+    if climate.get("on") is True:
+        components.append("climate-on")
+    if climate.get("battery_preheat") is True:
+        components.append("battery-preheat-on")
+    if mirrors.get("folded") is True:
+        components.append("mirrors-folded")
+    if charging.get("completed") is True:
+        components.append("charge-completed")
+    if primary_state != "parked":
         components.append(primary_state)
     components = sorted(set(components))
     signature_parts = [primary_state] + [item for item in components if item != primary_state]
@@ -629,6 +641,9 @@ def visual_capabilities(
     sunshade_open: bool | None,
     lights: dict[str, Any],
     security: dict[str, Any],
+    climate: dict[str, Any],
+    mirrors: dict[str, Any],
+    charging: dict[str, Any],
 ) -> dict[str, Any]:
     """Tell the site what was actually reported so unknown is not shown as closed."""
     return {
@@ -638,7 +653,16 @@ def visual_capabilities(
         "sunshade": sunshade_open is not None,
         "lights": sorted(key for key, value in lights.items() if value is not None),
         "security": sorted(key for key, value in security.items() if value is not None),
+        "climate": sorted(key for key, value in climate.items() if value is not None),
+        "mirrors": sorted(key for key, value in mirrors.items() if value is not None),
+        "charging": sorted(key for key, value in charging.items() if value is not None),
     }
+
+
+def visual_fingerprint(payload: dict[str, Any]) -> str:
+    """Create a stable fingerprint without VIN, credentials or account identifiers."""
+    canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=json_default)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def safe_https_url(value: Any) -> str | None:
@@ -858,6 +882,11 @@ def serialize_vehicle(vehicle: Any, include_status: bool, client: Any, messages:
         "rear_window_heating": first_bool(attribute(climate, "rear_window_heating")),
         "rapid_cooling": first_bool(attribute(climate, "rapid_cooling")),
         "rapid_heating": first_bool(attribute(climate, "rapid_heating")),
+        "battery_preheat": first_bool(
+            attribute(climate, "battery_preheat"),
+            attribute(climate, "battery_preheating"),
+            mapping_pick(cloud_scalars, ("batteryPreheat", "batteryPreheating", "batteryHeating")),
+        ),
     })
     charge_plan = attribute(battery, "charge_plan")
     charge_state_details = compact_mapping({
@@ -890,6 +919,9 @@ def serialize_vehicle(vehicle: Any, include_status: bool, client: Any, messages:
         sunshade_state,
         lights_state,
         security_state,
+        climate_state,
+        mirrors_state,
+        charge_state_details,
     )
     reported_visual_capabilities = visual_capabilities(
         door_state,
@@ -898,7 +930,41 @@ def serialize_vehicle(vehicle: Any, include_status: bool, client: Any, messages:
         sunshade_state,
         lights_state,
         security_state,
+        climate_state,
+        mirrors_state,
+        charge_state_details,
     )
+    captured_at = iso_timestamp(attribute(status, "collect_time") or attribute(status, "create_time"))
+    visual_identity = compact_mapping({
+        "model": model[:80],
+        "model_code": first_text(
+            map_text(vehicle_scalars, "modelCode", "carModel", "vehicleModel", "seriesCode"),
+            model,
+            max_length=80,
+        ),
+        "exterior_color": exterior_color,
+        "image_url": vehicle_image_url,
+        "model_source": "vehicle.car_type",
+        "color_source": "vehicle.out_color" if attribute(vehicle, "out_color") is not None else "vehicle.raw",
+    })
+    visual_fingerprint_value = visual_fingerprint({
+        "version": 3,
+        "captured_at": captured_at,
+        "identity": visual_identity,
+        "primary": visual_primary_state,
+        "signature": visual_signature,
+        "components": visual_components,
+        "doors": compact_mapping(door_state),
+        "windows": compact_mapping(window_state),
+        "window_positions": compact_mapping(window_positions),
+        "roof": compact_mapping({"open": roof_state, "percent": roof_opening}),
+        "sunshade": compact_mapping({"open": sunshade_state, "percent": sunshade_position}),
+        "lights": lights_state,
+        "mirrors": mirrors_state,
+        "security": security_state,
+        "climate": climate_state,
+        "charging": charge_state_details,
+    })
 
     tire_states = compact_mapping({
         "front_left": enum_or_value(attribute(tires, "front_left_state")),
@@ -1030,13 +1096,18 @@ def serialize_vehicle(vehicle: Any, include_status: bool, client: Any, messages:
         "ignition_details": ignition_state,
         "vehicle_image_url": vehicle_image_url,
         "exterior_color": exterior_color,
-        "visual_state_version": 2,
+        "visual_state_version": 3,
         "visual_primary_state": visual_primary_state,
         "visual_components": visual_components,
         "visual_signature": visual_signature,
+        "visual_fingerprint": visual_fingerprint_value,
+        "visual_identity": visual_identity,
         "visual_capabilities": reported_visual_capabilities,
         "visual_state": {
-            "version": 2,
+            "version": 3,
+            "captured_at": captured_at,
+            "fingerprint": visual_fingerprint_value,
+            "identity": visual_identity,
             "primary": visual_primary_state,
             "signature": visual_signature,
             "components": visual_components,
@@ -1049,15 +1120,16 @@ def serialize_vehicle(vehicle: Any, include_status: bool, client: Any, messages:
             "lights": lights_state,
             "mirrors": mirrors_state,
             "security": security_state,
+            "climate": climate_state,
             "charging": charge_state_details,
         },
         "tire_data": {key: numeric(value) for key, value in tire_data.items()},
-        "captured_at": iso_timestamp(attribute(status, "collect_time") or attribute(status, "create_time")),
+        "captured_at": captured_at,
         "cloud_raw_redacted": redacted_cloud_raw({
             "vehicle": attribute(vehicle, "raw", {}),
             "status": attribute(status, "raw", {}),
         }),
-        "mapping_version": "1.11.58",
+        "mapping_version": "1.11.59",
     }
     result["telemetry"] = telemetry
     return result
