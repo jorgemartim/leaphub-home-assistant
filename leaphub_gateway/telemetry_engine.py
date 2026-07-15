@@ -22,7 +22,7 @@ from cryptography.fernet import Fernet, InvalidToken
 import leaphub_connector as connector
 
 LOG = logging.getLogger("leaphub.telemetry")
-ENGINE_VERSION = "1.11.67"
+ENGINE_VERSION = "1.11.68"
 
 
 def utc_iso() -> str:
@@ -385,7 +385,14 @@ class TelemetryEngine:
         except Exception as exc:  # noqa: BLE001
             message = connector.clean_message(str(exc))
             failures = int(subscription["consecutive_failures"] or 0) + 1
-            if self._looks_rate_limited(message):
+            if connector.is_transient_cloud_error(exc) or isinstance(exc, connector.ConnectorTemporaryError):
+                delay = min(120, max(15, 15 * failures))
+                self._reschedule(sid, delay, "recovering", message, failed=True)
+                LOG.warning(
+                    "Sessão Leapmotor de %s será refeita automaticamente em %ss: %s",
+                    sid, delay, message,
+                )
+            elif self._looks_rate_limited(message):
                 delay = self.rate_limit_cooldown_seconds
                 now = utc_iso()
                 with self.lock, self._db() as db:
@@ -395,7 +402,7 @@ class TelemetryEngine:
                     )
                 LOG.warning("Proteção contra limite ativada para %s por %ss: %s", sid, delay, message)
             else:
-                delay = min(self.sleep_seconds, max(15, 10 * (2 ** min(failures, 6))))
+                delay = min(self.sleep_seconds, max(30, 15 * (2 ** min(failures, 5))))
                 self._reschedule(sid, delay, "error", message, failed=True)
             return
         finally:

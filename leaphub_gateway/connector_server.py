@@ -30,13 +30,15 @@ except ModuleNotFoundError as exc:
         "Módulo interno leaphub_connector ausente na imagem. Atualize o Leap Hub Gateway."
     ) from exc
 
-VERSION = "1.11.67"
+VERSION = "1.11.68"
 SERVICE = "Leap Hub Leapmotor Connector"
 MAX_BODY = 1024 * 1024
 WINDOW_SECONDS = 180
 STARTED_AT = time.time()
 NONCES: dict[str, float] = {}
 NONCE_LOCK = threading.Lock()
+ACCOUNT_LOCKS: dict[str, threading.Lock] = {}
+ACCOUNT_LOCKS_GUARD = threading.Lock()
 OPTIONS_PATH = Path(os.getenv("LEAPHUB_OPTIONS_PATH", "/data/options.json"))
 
 
@@ -100,6 +102,23 @@ def verify_signature(method: str, path: str, body: bytes, headers: Any) -> str:
             NONCES.pop(nonce_key, None)
         raise PermissionError("Assinatura inválida.")
     return environment
+
+
+def account_operation_key(environment: str, payload: dict[str, Any]) -> str:
+    credentials = payload.get("credentials") if isinstance(payload.get("credentials"), dict) else payload
+    email = str(credentials.get("email") or "").strip().lower() if isinstance(credentials, dict) else ""
+    stable = email or str(payload.get("account_id") or payload.get("vehicle_id") or "anonymous")
+    return hashlib.sha256(f"{environment}|{stable}".encode("utf-8")).hexdigest()
+
+
+def account_operation_lock(environment: str, payload: dict[str, Any]) -> threading.Lock:
+    key = account_operation_key(environment, payload)
+    with ACCOUNT_LOCKS_GUARD:
+        lock = ACCOUNT_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            ACCOUNT_LOCKS[key] = lock
+        return lock
 
 
 def connector_ready() -> bool:
@@ -212,6 +231,17 @@ class Handler(BaseHTTPRequestHandler):
             if not acquired:
                 self.send_json(503, {"ok": False, "message": "Conector ocupado. A solicitação não perdeu dados; tente novamente em instantes."})
                 return
+            account_lock = account_operation_lock(environment, payload)
+            account_acquired = account_lock.acquire(timeout=MANUAL_WAIT_SECONDS)
+            if not account_acquired:
+                SEMAPHORE.release()
+                self.send_json(503, {
+                    "ok": False,
+                    "temporary": True,
+                    "retry_after_seconds": 5,
+                    "message": "Esta conta já está sendo consultada. A atualização automática continuará em instantes.",
+                })
+                return
             try:
                 if self.path == "/v1/accounts/test":
                     result = connector.handle_account(payload, sync=False)
@@ -221,7 +251,25 @@ class Handler(BaseHTTPRequestHandler):
                     result = connector.handle_command(payload)
                 self.send_json(200, result)
             finally:
+                account_lock.release()
                 SEMAPHORE.release()
+        except connector.ConnectorTemporaryError as exc:
+            LOG.warning("Reconexão automática adiada: %s", connector.clean_message(str(exc)))
+            self.send_json(503, {
+                "ok": False,
+                "temporary": True,
+                "retry_after_seconds": 20,
+                "message": connector.clean_message(str(exc)),
+                "connector_version": connector.CONNECTOR_VERSION,
+            })
+        except connector.ConnectorAuthenticationError as exc:
+            LOG.warning("Reautenticação recusada pela conta Leapmotor.")
+            self.send_json(401, {
+                "ok": False,
+                "temporary": False,
+                "message": connector.clean_message(str(exc)),
+                "connector_version": connector.CONNECTOR_VERSION,
+            })
         except (ValueError, RuntimeError) as exc:
             self.send_json(422, {"ok": False, "message": connector.clean_message(str(exc)), "connector_version": connector.CONNECTOR_VERSION})
         except Exception as exc:  # noqa: BLE001

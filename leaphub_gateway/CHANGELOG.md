@@ -1,3 +1,10 @@
+## 1.11.68
+
+- Reconexão automática de sessão/token da Leapmotor.
+- Bloqueio por conta contra chamadas simultâneas.
+- Falhas temporárias retornam 503 e entram em recuperação automática.
+- A credencial só é indicada para revisão quando a reautenticação é realmente recusada.
+
 ## 1.11.67
 
 - Canvas oficial preservado e animação de carregamento.

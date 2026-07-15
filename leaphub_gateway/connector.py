@@ -26,7 +26,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-CONNECTOR_VERSION = "1.11.67"
+CONNECTOR_VERSION = "1.11.68"
 MAX_INPUT_BYTES = 1024 * 1024
 
 COMMAND_METHODS: dict[str, str] = {
@@ -75,6 +75,75 @@ def clean_message(message: str) -> str:
         if marker in text:
             return "Falha de autenticação ou certificado inválido."
     return text[:900] or "Falha desconhecida no conector."
+
+
+class ConnectorTemporaryError(RuntimeError):
+    """Falha temporária da nuvem que deve ser tentada novamente."""
+
+
+class ConnectorAuthenticationError(RuntimeError):
+    """Credencial realmente recusada depois das tentativas de reautenticação."""
+
+
+TRANSIENT_CLOUD_MARKERS = (
+    "information verification failed",
+    "please try again later",
+    "try again later",
+    "temporarily unavailable",
+    "temporary unavailable",
+    "service unavailable",
+    "gateway timeout",
+    "timed out",
+    "timeout",
+    "connection reset",
+    "connection aborted",
+    "remote disconnected",
+    "too many requests",
+    "rate limit",
+    "request limit",
+    "token expired",
+    "session expired",
+    "login expired",
+    "invalid token",
+    "bad gateway",
+    "http 502",
+    "http 503",
+    "http 504",
+)
+
+AUTHENTICATION_MARKERS = (
+    "incorrect password",
+    "wrong password",
+    "invalid password",
+    "invalid credentials",
+    "credential invalid",
+    "authentication failed",
+    "login failed",
+    "account locked",
+    "account disabled",
+    "certificate invalid",
+    "certificate expired",
+    "unauthorized",
+)
+
+
+def is_transient_cloud_error(value: Any) -> bool:
+    message = clean_message(str(value)).lower()
+    return any(marker in message for marker in TRANSIENT_CLOUD_MARKERS)
+
+
+def is_authentication_error(value: Any) -> bool:
+    message = clean_message(str(value)).lower()
+    return not is_transient_cloud_error(message) and any(marker in message for marker in AUTHENTICATION_MARKERS)
+
+
+def reconnect_message(value: Any) -> str:
+    message = clean_message(str(value))
+    return (
+        "A nuvem Leapmotor recusou temporariamente a validação. "
+        "O Gateway preservou as credenciais protegidas e tentará reconectar automaticamente. "
+        f"Detalhe: {message}"
+    )[:900]
 
 
 def package_version() -> str | None:
@@ -1954,7 +2023,7 @@ def serialize_vehicle(
             "vehicle": attribute(vehicle, "raw", {}),
             "status": attribute(status, "raw", {}),
         }),
-        "mapping_version": "1.11.67",
+        "mapping_version": "1.11.68",
     }
     official_image = official_visual_image_payload(
         client,
@@ -2045,12 +2114,43 @@ def handle_account(payload: dict[str, Any], sync: bool) -> dict[str, Any]:
     force_package_refresh = bool(payload.get("force_package_refresh")) if sync else False
     temp_dir = secure_temp_directory()
     client = None
+    login_attempts = 0
+    reconnected = False
     try:
-        client = create_client(credentials, temp_dir, None)
-        client.login()
-        vehicles = client.get_vehicle_list()
-        if not isinstance(vehicles, list):
-            vehicles = list(vehicles or [])
+        vehicles: list[Any] = []
+        last_error: Exception | None = None
+        for attempt in range(1, 4):
+            login_attempts = attempt
+            try:
+                attempt_dir = temp_dir / f"attempt-{attempt}"
+                attempt_dir.mkdir(mode=0o700, parents=True, exist_ok=False)
+                client = create_client(credentials, attempt_dir, None)
+                client.login()
+                vehicles_value = client.get_vehicle_list()
+                vehicles = vehicles_value if isinstance(vehicles_value, list) else list(vehicles_value or [])
+                reconnected = attempt > 1
+                break
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+                if client is not None:
+                    try:
+                        client.close()
+                    except Exception:
+                        pass
+                    client = None
+                if is_transient_cloud_error(exc) and attempt < 3:
+                    time.sleep((1.0, 3.0)[attempt - 1])
+                    continue
+                if is_transient_cloud_error(exc):
+                    raise ConnectorTemporaryError(reconnect_message(exc)) from exc
+                if is_authentication_error(exc):
+                    raise ConnectorAuthenticationError(
+                        "A conta Leapmotor recusou a reautenticação automática. "
+                        "Confirme a senha somente se esta mensagem continuar após novas tentativas."
+                    ) from exc
+                raise RuntimeError(clean_message(str(exc))) from exc
+        else:
+            raise ConnectorTemporaryError(reconnect_message(last_error or "falha temporária"))
         selected = vehicles
         if vehicle_id:
             selected = [
@@ -2089,6 +2189,8 @@ def handle_account(payload: dict[str, Any], sync: bool) -> dict[str, Any]:
             "vehicles": serialized,
             "connector_version": CONNECTOR_VERSION,
             "library_version": package_version(),
+            "login_attempts": login_attempts,
+            "reconnected": reconnected,
         }
     finally:
         if client is not None:
