@@ -1,6 +1,6 @@
 # Leap Hub Home Assistant
 
-Versão atual do Gateway: **1.11.65**.
+Versão atual do Gateway: **1.11.66**.
 
 <p align="center">
   <img src="./leaphub_gateway/logo.png" alt="Leap Hub Gateway" width="420">

@@ -1,6 +1,6 @@
 # Leap Hub Gateway
 
-## Biblioteca visual 1.11.65
+## Biblioteca visual 1.11.66
 
 Cada composição oficial agora informa o estado principal, a assinatura, os componentes usados e um hash de consistência. O Leap Hub rejeita automaticamente uma imagem antiga quando ela não corresponde à telemetria atual e usa a biblioteca local como fallback. Os bytes continuam sendo reenviados somente quando a imagem realmente muda.
 

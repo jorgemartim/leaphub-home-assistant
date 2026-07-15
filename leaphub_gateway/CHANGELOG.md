@@ -1,3 +1,11 @@
+## 1.11.66
+
+- Envia uma galeria sanitizada das camadas oficiais recebidas da API para diagnóstico administrativo.
+- Inclui prévias transparente, branca e escura da mesma composição.
+- Limita quantidade, resolução e tamanho total das imagens de diagnóstico.
+- Não envia VIN, conta, token, certificado, chave privada nem payload bruto.
+- Contrato oficial de renderização versão 12.
+
 ## 1.11.65
 
 - Corrige a camada de vidro fechado quando a porta correspondente está aberta.

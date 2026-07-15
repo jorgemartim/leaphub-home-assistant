@@ -26,7 +26,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-CONNECTOR_VERSION = "1.11.65"
+CONNECTOR_VERSION = "1.11.66"
 MAX_INPUT_BYTES = 1024 * 1024
 
 COMMAND_METHODS: dict[str, str] = {
@@ -801,8 +801,9 @@ def safe_https_url(value: Any) -> str | None:
 
 
 _IMAGE_LAST_HASH: dict[str, str] = {}
-_IMAGE_PACKAGE_CACHE: dict[str, tuple[float, Any, str]] = {}
+_IMAGE_PACKAGE_CACHE: dict[str, tuple[float, Any, str, Path]] = {}
 _IMAGE_RENDER_CACHE: dict[str, tuple[float, bytes, str, dict[str, Any]]] = {}
+_IMAGE_DEBUG_LAST_HASH: dict[str, str] = {}
 
 _OFFICIAL_RENDER_COMPONENTS = {
     "front-left-open",
@@ -1005,6 +1006,163 @@ def _clean_official_composite(raw_png: bytes) -> tuple[bytes, dict[str, Any]]:
     }
 
 
+
+
+def _debug_safe_name(value: str, index: int) -> str:
+    raw = Path(str(value or "layer")).name.lower()
+    stem = re.sub(r"[^a-z0-9._-]+", "-", raw).strip(".-_") or f"layer-{index:02d}"
+    stem = re.sub(r"[a-f0-9]{20,}", "redacted", stem)
+    if not stem.endswith((".webp", ".png", ".jpg", ".jpeg")):
+        stem += ".webp"
+    base = stem.rsplit(".", 1)[0][:70]
+    return f"{index:02d}-{base}.webp"
+
+
+def _debug_webp(raw: bytes, background: tuple[int, int, int] | None = None, max_side: int = 760) -> tuple[bytes, int, int] | None:
+    try:
+        from PIL import Image
+        image = Image.open(io.BytesIO(raw)).convert("RGBA")
+        if image.width < 8 or image.height < 8 or image.width > 8192 or image.height > 8192:
+            return None
+        image.thumbnail((max_side, max_side), Image.Resampling.LANCZOS)
+        if background is not None:
+            canvas = Image.new("RGB", image.size, background)
+            canvas.paste(image.convert("RGB"), mask=image.getchannel("A"))
+            image_out = canvas
+        else:
+            image_out = image
+        buffer = io.BytesIO()
+        image_out.save(buffer, format="WEBP", quality=90, method=6, lossless=False)
+        data = buffer.getvalue()
+        if len(data) < 128 or len(data) > 420_000:
+            return None
+        return data, image.width, image.height
+    except Exception:
+        return None
+
+
+def _official_debug_payload(
+    remote_id: str,
+    package_file: Path,
+    package: Any,
+    visual_status: Any,
+    picture_key_hash: str,
+    render_layer_signature: str,
+    render_components: list[str],
+    captured_at: str,
+) -> dict[str, Any] | None:
+    """Create a small sanitized gallery of the image layers received from the API.
+
+    No VIN, account identifier, credentials or raw cloud payload are included. The
+    gallery is emitted only when the package/state combination changes.
+    """
+    try:
+        package_bytes = package_file.read_bytes()
+        package_hash = hashlib.sha256(package_bytes).hexdigest()
+        debug_hash = hashlib.sha256(f"{package_hash}|{render_layer_signature}|debug-v1".encode()).hexdigest()
+        if _IMAGE_DEBUG_LAST_HASH.get(remote_id) == debug_hash:
+            return None
+
+        files: list[dict[str, Any]] = []
+        total_bytes = 0
+        max_total = 1_350_000
+
+        raw_composite = package.compose(visual_status, format="PNG")
+        if isinstance(raw_composite, bytes):
+            previews = [
+                ("preview-transparent.webp", None, "preview-transparent"),
+                ("preview-white.webp", (255, 255, 255), "preview-white"),
+                ("preview-dark.webp", (12, 25, 42), "preview-dark"),
+            ]
+            for name, background, kind in previews:
+                converted = _debug_webp(raw_composite, background=background, max_side=860)
+                if converted is None:
+                    continue
+                data, width, height = converted
+                if total_bytes + len(data) > max_total:
+                    break
+                total_bytes += len(data)
+                files.append({
+                    "name": name,
+                    "kind": kind,
+                    "mime": "image/webp",
+                    "sha256": hashlib.sha256(data).hexdigest(),
+                    "width": width,
+                    "height": height,
+                    "data_base64": base64.b64encode(data).decode("ascii"),
+                })
+
+        with zipfile.ZipFile(io.BytesIO(package_bytes), "r") as archive:
+            candidates = []
+            for info in archive.infolist():
+                if info.is_dir() or info.file_size <= 0 or info.file_size > 12 * 1024 * 1024:
+                    continue
+                lower = info.filename.lower()
+                if not lower.endswith((".png", ".webp", ".jpg", ".jpeg")):
+                    continue
+                score = 0
+                for token, weight in (
+                    ("body", 100), ("base", 90), ("door", 80), ("open", 75),
+                    ("window", 70), ("charge", 65), ("tail", 60), ("trunk", 60),
+                    ("trip", 40), ("close", 20), ("carpic", 10),
+                ):
+                    if token in lower:
+                        score += weight
+                candidates.append((score, info.filename, info))
+            candidates.sort(key=lambda item: (-item[0], item[1].lower()))
+            used_names: set[str] = set()
+            for index, (_score, original_name, info) in enumerate(candidates[:28], start=1):
+                if len(files) >= 22 or total_bytes >= max_total:
+                    break
+                raw = archive.read(info)
+                converted = _debug_webp(raw, background=None, max_side=760)
+                if converted is None:
+                    continue
+                data, width, height = converted
+                if total_bytes + len(data) > max_total:
+                    continue
+                safe_name = _debug_safe_name(original_name, index)
+                suffix = 1
+                base_name = safe_name
+                while safe_name in used_names:
+                    suffix += 1
+                    safe_name = base_name[:-5] + f"-{suffix}.webp"
+                used_names.add(safe_name)
+                total_bytes += len(data)
+                original_basename = Path(original_name).name[:120]
+                original_basename = re.sub(r"[a-fA-F0-9]{20,}", "[redacted]", original_basename)
+                files.append({
+                    "name": safe_name,
+                    "kind": "layer",
+                    "original_name": original_basename,
+                    "mime": "image/webp",
+                    "sha256": hashlib.sha256(data).hexdigest(),
+                    "width": width,
+                    "height": height,
+                    "data_base64": base64.b64encode(data).decode("ascii"),
+                })
+
+        if not files:
+            return None
+        _IMAGE_DEBUG_LAST_HASH[remote_id] = debug_hash
+        return {
+            "schema": 1,
+            "source": "leapmotor-picture-package-sanitized",
+            "package_hash": package_hash,
+            "picture_key_hash": picture_key_hash if re.fullmatch(r"[a-f0-9]{64}", picture_key_hash or "") else None,
+            "render_layer_signature": render_layer_signature,
+            "render_components": render_components,
+            "captured_at": captured_at,
+            "created_at": datetime.utcnow().isoformat() + "Z",
+            "files": files,
+            "file_count": len(files),
+            "total_bytes": total_bytes,
+        }
+    except Exception as exc:
+        print(f"Leap Hub: diagnóstico das camadas oficiais indisponível ({type(exc).__name__}).", file=sys.stderr)
+        return None
+
+
 def charging_evidence(status: Any) -> dict[str, Any]:
     battery = attribute(status, "battery")
     driving = attribute(status, "driving")
@@ -1117,12 +1275,12 @@ def _validate_picture_zip(raw: bytes) -> None:
                 raise ValueError("Pacote oficial de imagens descompactado excede o limite.")
 
 
-def _official_picture_package(client: Any, vehicle: Any, remote_id: str) -> tuple[Any, str] | None:
+def _official_picture_package(client: Any, vehicle: Any, remote_id: str) -> tuple[Any, str, Path] | None:
     cache_key = hashlib.sha256(remote_id.encode("utf-8", "ignore")).hexdigest()
     cached = _IMAGE_PACKAGE_CACHE.get(cache_key)
     now = time.time()
     if cached and now - cached[0] < 6 * 3600:
-        return cached[1], cached[2]
+        return cached[1], cached[2], cached[3]
     root = Path(os.environ.get("LEAPHUB_VEHICLE_IMAGE_DIR", "/data/runtime/vehicle-pictures"))
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
     package_file = root / f"{cache_key}.zip"
@@ -1167,8 +1325,8 @@ def _official_picture_package(client: Any, vehicle: Any, remote_id: str) -> tupl
         key_hash = str(old_meta.get("picture_key_hash") or "")
         if picture_key:
             key_hash = hashlib.sha256(picture_key.encode("utf-8")).hexdigest()
-        _IMAGE_PACKAGE_CACHE[cache_key] = (now, package, key_hash)
-        return package, key_hash
+        _IMAGE_PACKAGE_CACHE[cache_key] = (now, package, key_hash, package_file)
+        return package, key_hash, package_file
     except Exception as exc:
         print(f"Leap Hub: pacote oficial de imagem inválido ({type(exc).__name__}).", file=sys.stderr)
         return None
@@ -1179,7 +1337,7 @@ def _official_render_cache_key(remote_id: str, picture_key_hash: str, render_lay
         str(remote_id or "").strip(),
         str(picture_key_hash or "").strip().lower(),
         str(render_layer_signature or "parked").strip().lower(),
-        "contract-11",
+        "contract-12",
     ])
     return hashlib.sha256(source.encode("utf-8")).hexdigest()
 
@@ -1218,7 +1376,7 @@ def official_visual_image_payload(
     resolved = _official_picture_package(client, vehicle, remote_id)
     if resolved is None:
         return None
-    package, picture_key_hash = resolved
+    package, picture_key_hash, package_file = resolved
     try:
         render_state, render_components, render_layer_signature = _official_render_contract(
             visual_components,
@@ -1227,10 +1385,10 @@ def official_visual_image_payload(
         cache_key = _official_render_cache_key(remote_id, picture_key_hash, render_layer_signature)
         cached_render = _official_render_cache_get(cache_key)
         state_cache_hit = cached_render is not None
+        visual_status = _official_visual_status(render_components, render_state)
         if cached_render is not None:
             image_bytes, sha256, cleanup = cached_render
         else:
-            visual_status = _official_visual_status(render_components, render_state)
             # Compose to PNG first. The upstream default WebP path is lossy and may
             # amplify alpha artefacts in regional picture packages.
             raw_composite = package.compose(visual_status, format="PNG")
@@ -1271,7 +1429,7 @@ def official_visual_image_payload(
             "rendered_layer_signature": render_layer_signature,
             "rendered_layer_components": render_components,
             "image_cleanup": cleanup,
-            "render_contract_version": 11,
+            "render_contract_version": 12,
             "visual_image_state_key": cache_key,
             "state_cache_hit": state_cache_hit,
             "consistency_hash": hashlib.sha256(consistency_source.encode("utf-8")).hexdigest(),
@@ -1283,6 +1441,12 @@ def official_visual_image_payload(
         # em "indisponível" só porque ela foi deduplicada.
         if changed:
             payload["data_base64"] = base64.b64encode(image_bytes).decode("ascii")
+        debug_payload = _official_debug_payload(
+            remote_id, package_file, package, visual_status, picture_key_hash,
+            render_layer_signature, render_components, captured_at,
+        )
+        if debug_payload is not None:
+            payload["debug_package"] = debug_payload
         return payload
     except Exception as exc:
         print(f"Leap Hub: composição da imagem oficial falhou ({type(exc).__name__}).", file=sys.stderr)
@@ -1795,7 +1959,7 @@ def serialize_vehicle(vehicle: Any, include_status: bool, client: Any, messages:
             "vehicle": attribute(vehicle, "raw", {}),
             "status": attribute(status, "raw", {}),
         }),
-        "mapping_version": "1.11.65",
+        "mapping_version": "1.11.66",
     }
     official_image = official_visual_image_payload(
         client,
@@ -1823,7 +1987,7 @@ def serialize_vehicle(vehicle: Any, include_status: bool, client: Any, messages:
             "visual_fingerprint": visual_fingerprint_value,
             "rendered_primary_state": visual_primary_state,
             "rendered_signature": visual_signature,
-            "render_contract_version": 11,
+            "render_contract_version": 12,
         })
     result["telemetry"] = telemetry
     return result
