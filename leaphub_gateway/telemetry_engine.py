@@ -23,7 +23,7 @@ from cryptography.fernet import Fernet, InvalidToken
 import leaphub_connector as connector
 
 LOG = logging.getLogger("leaphub.telemetry")
-ENGINE_VERSION = "1.11.70"
+ENGINE_VERSION = "1.11.71"
 
 
 def utc_iso() -> str:
@@ -108,7 +108,12 @@ class TelemetryEngine:
             "production": bool(options.get("telemetry_production_enabled", False)),
         }
         self.sessions: dict[str, dict[str, Any]] = {}
+        # A tabela de sessões usa uma trava curta. Cada conta possui uma trava
+        # própria para que contas diferentes possam ser consultadas em paralelo
+        # sem permitir que upsert/remoção fechem uma sessão durante a leitura.
         self.session_lock = threading.RLock()
+        self.session_locks_guard = threading.RLock()
+        self.session_locks: dict[str, threading.RLock] = {}
         self.session_max_age_seconds = 2700
         self.session_idle_seconds = 900
         self._init_db()
@@ -647,22 +652,33 @@ class TelemetryEngine:
             )
         self.wake_event.set()
 
+    def _session_operation_lock(self, subscription_id: str) -> threading.RLock:
+        key = str(subscription_id or "").strip()
+        with self.session_locks_guard:
+            lock = self.session_locks.get(key)
+            if lock is None:
+                lock = threading.RLock()
+                self.session_locks[key] = lock
+            return lock
+
     def _collect_with_session(self, subscription_id: str, credentials: dict[str, Any], vehicle_ids: set[str]) -> dict[str, Any]:
-        # Upsert, remoção e coleta podem acontecer em threads diferentes. A
-        # sessão não pode ser fechada enquanto uma leitura ainda a utiliza.
-        with self.session_lock:
+        # Somente a sessão desta conta fica bloqueada durante a chamada de rede.
+        # Outras contas respeitam o limite global do Connector, mas não ficam
+        # paradas atrás de uma autenticação lenta ou de um veículo offline.
+        with self._session_operation_lock(subscription_id):
             return self._collect_with_session_locked(subscription_id, credentials, vehicle_ids)
 
     def _collect_with_session_locked(self, subscription_id: str, credentials: dict[str, Any], vehicle_ids: set[str]) -> dict[str, Any]:
         now_epoch = time.time()
         credential_hash = hashlib.sha256(canonical_json(credentials)).hexdigest()
-        session = self.sessions.get(subscription_id)
+        with self.session_lock:
+            session = self.sessions.get(subscription_id)
         if session is not None and (
             session.get("credential_hash") != credential_hash
             or now_epoch - float(session.get("created_at") or 0) >= self.session_max_age_seconds
             or now_epoch - float(session.get("last_used_at") or 0) >= self.session_idle_seconds
         ):
-            self._close_session(subscription_id)
+            self._close_session_locked(subscription_id)
             session = None
 
         if session is None:
@@ -688,7 +704,8 @@ class TelemetryEngine:
                 "created_at": now_epoch,
                 "last_used_at": now_epoch,
             }
-            self.sessions[subscription_id] = session
+            with self.session_lock:
+                self.sessions[subscription_id] = session
             LOG.info("Sessão Leapmotor criada para %s; será reutilizada durante a janela ativa.", subscription_id)
 
         client = session["client"]
@@ -731,23 +748,27 @@ class TelemetryEngine:
                 "session_reused": True,
             }
         except Exception:
-            self._close_session(subscription_id)
+            self._close_session_locked(subscription_id)
             raise
 
-    def _close_session(self, subscription_id: str) -> None:
+    def _close_session_locked(self, subscription_id: str) -> None:
         with self.session_lock:
             session = self.sessions.pop(str(subscription_id), None)
-            if not session:
-                return
-            client = session.get("client")
-            if client is not None:
-                try:
-                    client.close()
-                except Exception:
-                    pass
-            temp_dir = session.get("temp_dir")
-            if temp_dir:
-                shutil.rmtree(Path(temp_dir), ignore_errors=True)
+        if not session:
+            return
+        client = session.get("client")
+        if client is not None:
+            try:
+                client.close()
+            except Exception:
+                pass
+        temp_dir = session.get("temp_dir")
+        if temp_dir:
+            shutil.rmtree(Path(temp_dir), ignore_errors=True)
+
+    def _close_session(self, subscription_id: str) -> None:
+        with self._session_operation_lock(subscription_id):
+            self._close_session_locked(subscription_id)
 
     def _close_all_sessions(self) -> None:
         with self.session_lock:

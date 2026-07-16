@@ -1,3 +1,10 @@
+## 1.11.71
+
+- Sessões Leapmotor agora possuem trava isolada por conta.
+- Contas diferentes podem usar o paralelismo configurado sem ficarem bloqueadas por uma chamada lenta de outra conta.
+- Upsert, remoção, expiração e coleta continuam impedidos de fechar a mesma sessão durante uma leitura.
+- Mantida uma única tentativa de login por ciclo, cooldown persistente e bloqueio compartilhado com operações manuais.
+
 ## 1.11.70
 
 - A telemetria só consulta a Leapmotor durante uma janela ativada pela presença do usuário no Leap Hub.

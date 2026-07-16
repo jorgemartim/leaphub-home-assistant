@@ -1,4 +1,4 @@
-## Proteção de sessão 1.11.70
+## Proteção de sessão 1.11.71
 
 - A telemetria só consulta a Leapmotor durante uma janela ativada pela presença do usuário no Leap Hub.
 - A sessão autenticada é reutilizada; não existe mais um novo login em cada ciclo de coleta.

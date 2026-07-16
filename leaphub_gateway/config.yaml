@@ -1,5 +1,5 @@
 name: "Leap Hub Gateway"
-version: "1.11.70"
+version: "1.11.71"
 slug: "leaphub_gateway"
 description: "Gateway unificado com sincronização automática adaptativa, fila persistente, Leapmotor, OCPP e Cloudflare Tunnel."
 url: "https://github.com/jorgemartim/leaphub-home-assistant"

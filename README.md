@@ -1,4 +1,4 @@
-## Proteção de sessão 1.11.70
+## Proteção de sessão 1.11.71
 
 - A telemetria só consulta a Leapmotor durante uma janela ativada pela presença do usuário no Leap Hub.
 - A sessão autenticada é reutilizada; não existe mais um novo login em cada ciclo de coleta.
@@ -15,7 +15,7 @@ O Gateway reconecta, reativa assinaturas e continua a telemetria sem ação do u
 
 # Leap Hub Home Assistant
 
-Versão atual do Gateway: **1.11.70**.
+Versão atual do Gateway: **1.11.71**.
 
 <p align="center">
   <img src="./leaphub_gateway/logo.png" alt="Leap Hub Gateway" width="420">
