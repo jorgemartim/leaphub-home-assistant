@@ -1,4 +1,8 @@
-## 1.11.72
+## Presença e timeout 1.11.73
+
+A janela interativa encerra ao fechar a última aba. Timeouts temporários preservam a sessão e usam repetição curta protegida, sem novo login imediato.
+
+## 1.11.73
 
 - Telemetria interativa com sessão reutilizada e encerramento automático.
 - Heartbeat de leitura confirmado durante a presença do usuário.

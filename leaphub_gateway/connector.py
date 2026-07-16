@@ -26,7 +26,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-CONNECTOR_VERSION = "1.11.72"
+CONNECTOR_VERSION = "1.11.73"
 MAX_INPUT_BYTES = 1024 * 1024
 
 COMMAND_METHODS: dict[str, str] = {
@@ -2022,7 +2022,7 @@ def serialize_vehicle(
             "vehicle": attribute(vehicle, "raw", {}),
             "status": attribute(status, "raw", {}),
         }),
-        "mapping_version": "1.11.72",
+        "mapping_version": "1.11.73",
     }
     official_image = official_visual_image_payload(
         client,

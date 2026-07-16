@@ -23,7 +23,7 @@ from cryptography.fernet import Fernet, InvalidToken
 import leaphub_connector as connector
 
 LOG = logging.getLogger("leaphub.telemetry")
-ENGINE_VERSION = "1.11.72"
+ENGINE_VERSION = "1.11.73"
 
 
 def utc_iso() -> str:
@@ -404,6 +404,34 @@ class TelemetryEngine:
         self.wake_event.set()
         return {"ok": True, "subscription_id": subscription_id, "disabled": cursor.rowcount > 0}
 
+    def release_interactive(self, subscription_id: str) -> dict[str, Any]:
+        subscription_id = str(subscription_id or "").strip()[:190]
+        if not subscription_id:
+            raise ValueError("Identificador da assinatura ausente.")
+        now_epoch = time.time()
+        now_iso = utc_iso()
+        with self.lock, self._db() as db:
+            row = db.execute(
+                "SELECT enabled, status, next_run_at FROM subscriptions WHERE subscription_id=? LIMIT 1",
+                (subscription_id,),
+            ).fetchone()
+            if row is None:
+                return {"ok": True, "subscription_id": subscription_id, "released": False}
+            status = str(row["status"] or "")
+            next_run = float(row["next_run_at"] or 0)
+            # Encerrar a aba não invalida a sessão autenticada. Apenas remove a
+            # janela rápida e estaciona novas consultas; a sessão expira pelo
+            # idle normal ou é reutilizada se o usuário voltar logo.
+            if status not in {"auth_required", "cooldown", "recovering", "error"}:
+                status = "idle"
+                next_run = max(next_run, now_epoch + self.sleep_seconds)
+            cursor = db.execute(
+                "UPDATE subscriptions SET status=?,interactive_until=0,active_until=MIN(active_until,?),next_run_at=?,updated_at=? WHERE subscription_id=?",
+                (status, now_epoch, next_run, now_iso, subscription_id),
+            )
+        self.wake_event.set()
+        return {"ok": True, "subscription_id": subscription_id, "released": cursor.rowcount > 0}
+
     def boost(self, subscription_id: str, seconds: int = 900, profile: str = "background") -> dict[str, Any]:
         subscription_id = str(subscription_id or "").strip()[:190]
         profile = "interactive" if str(profile or "").strip().lower() == "interactive" else "background"
@@ -412,7 +440,7 @@ class TelemetryEngine:
         now_iso = utc_iso()
         with self.lock, self._db() as db:
             row = db.execute(
-                "SELECT auth_required, cooldown_until, enabled, next_run_at FROM subscriptions WHERE subscription_id=? LIMIT 1",
+                "SELECT auth_required, cooldown_until, enabled, next_run_at, status FROM subscriptions WHERE subscription_id=? LIMIT 1",
                 (subscription_id,),
             ).fetchone()
             if row is None or int(row["enabled"] or 0) != 1:
@@ -429,8 +457,22 @@ class TelemetryEngine:
                     "message": "Proteção contra limite de requisições ainda está ativa.",
                 }
             current_next = float(row["next_run_at"] or 0)
+            current_status = str(row["status"] or "").strip().lower()
+            protected_wait = current_status in {"recovering", "error", "cooldown", "auth_required"} and current_next > now_epoch
             requested_next = now_epoch + 0.5
-            next_run = min(current_next, requested_next) if current_next > now_epoch else requested_next
+            next_run = current_next if protected_wait else (min(current_next, requested_next) if current_next > now_epoch else requested_next)
+            if protected_wait:
+                cursor = db.execute(
+                    "UPDATE subscriptions SET active_until=MAX(active_until,?),interactive_until=MAX(interactive_until,?),last_presence_at=?,updated_at=? WHERE subscription_id=? AND enabled=1",
+                    (now_epoch + seconds, now_epoch + seconds if profile == "interactive" else 0, now_iso, now_iso, subscription_id),
+                )
+                return {
+                    "ok": True,
+                    "subscription_id": subscription_id,
+                    "profile": profile,
+                    "protected_wait": True,
+                    "retry_after_seconds": max(1, int(current_next - now_epoch)),
+                }
             if profile == "interactive":
                 cursor = db.execute(
                     "UPDATE subscriptions SET status='waiting', next_run_at=?, active_until=MAX(active_until, ?), "
@@ -618,8 +660,11 @@ class TelemetryEngine:
         except Exception as exc:  # noqa: BLE001
             message = connector.clean_message(str(exc))
             failures = int(subscription["consecutive_failures"] or 0) + 1
-            self._close_session(sid)
+            transient = connector.is_transient_cloud_error(exc) or isinstance(exc, connector.ConnectorTemporaryError)
+            if not transient or failures >= 3:
+                self._close_session(sid)
             if self._looks_rate_limited(message):
+                self._close_session(sid)
                 delay = self.rate_limit_cooldown_seconds
                 now = utc_iso()
                 with self.lock, self._db() as db:
@@ -631,10 +676,13 @@ class TelemetryEngine:
             elif isinstance(exc, connector.ConnectorAuthenticationError) or connector.is_authentication_error(exc):
                 self._mark_auth_required(sid, message)
                 LOG.warning("A assinatura %s foi pausada até as credenciais serem confirmadas: %s", sid, message)
-            elif connector.is_transient_cloud_error(exc) or isinstance(exc, connector.ConnectorTemporaryError):
-                delay = self._failure_backoff(failures)
+            elif transient:
+                delay = self._transient_backoff(failures, interactive)
                 self._reschedule(sid, delay, "recovering", message, failed=True)
-                LOG.warning("Sessão Leapmotor de %s será refeita uma única vez após %ss: %s", sid, delay, message)
+                if failures >= 3:
+                    LOG.warning("Sessão Leapmotor de %s será refeita após %ss por falhas temporárias repetidas: %s", sid, delay, message)
+                else:
+                    LOG.warning("Falha temporária em %s; sessão preservada e nova leitura em %ss: %s", sid, delay, message)
             else:
                 delay = self._failure_backoff(failures)
                 self._reschedule(sid, delay, "error", message, failed=True)
@@ -781,7 +829,12 @@ class TelemetryEngine:
                 "library_version": connector.package_version(),
                 "session_reused": True,
             }
-        except Exception:
+        except Exception as exc:
+            if connector.is_transient_cloud_error(exc) or isinstance(exc, connector.ConnectorTemporaryError):
+                # Um timeout de transporte não prova que o token morreu. A
+                # sessão é mantida nas primeiras falhas para evitar novo login.
+                session["last_used_at"] = time.time()
+                raise
             self._close_session_locked(subscription_id)
             raise
 
@@ -821,6 +874,11 @@ class TelemetryEngine:
                 "UPDATE subscriptions SET status='auth_required', auth_required=1, active_until=0, interactive_until=0, next_run_at=?, last_run_at=?, last_error=?, consecutive_failures=consecutive_failures+1, updated_at=? WHERE subscription_id=?",
                 (time.time() + 86400, now, str(message or "")[:500], now, subscription_id),
             )
+
+    @staticmethod
+    def _transient_backoff(failures: int, interactive: bool) -> int:
+        schedule = (30, 60, 120, 300, 900, 1800) if interactive else (120, 300, 900, 1800, 3600, 10800)
+        return schedule[min(max(1, int(failures)), len(schedule)) - 1]
 
     @staticmethod
     def _failure_backoff(failures: int) -> int:

@@ -30,7 +30,7 @@ except ModuleNotFoundError as exc:
         "Módulo interno leaphub_connector ausente na imagem. Atualize o Leap Hub Gateway."
     ) from exc
 
-VERSION = "1.11.72"
+VERSION = "1.11.73"
 SERVICE = "Leap Hub Leapmotor Connector"
 MAX_BODY = 1024 * 1024
 WINDOW_SECONDS = 180
@@ -203,7 +203,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json(404, {"ok": False, "message": "Página não encontrada."})
 
     def do_POST(self) -> None:
-        if self.path not in {"/v1/accounts/test", "/v1/vehicles/sync", "/v1/vehicles/command", "/v1/telemetry/subscriptions/upsert", "/v1/telemetry/subscriptions/remove", "/v1/telemetry/subscriptions/boost"}:
+        if self.path not in {"/v1/accounts/test", "/v1/vehicles/sync", "/v1/vehicles/command", "/v1/telemetry/subscriptions/upsert", "/v1/telemetry/subscriptions/remove", "/v1/telemetry/subscriptions/boost", "/v1/telemetry/subscriptions/release"}:
             self.send_json(404, {"ok": False, "message": "Página não encontrada."})
             return
         try:
@@ -240,6 +240,11 @@ class Handler(BaseHTTPRequestHandler):
                     str(payload.get("subscription_id") or ""),
                     int(payload.get("seconds") or 900),
                     str(payload.get("profile") or "background"),
+                ))
+                return
+            if self.path == "/v1/telemetry/subscriptions/release":
+                self.send_json(200, TELEMETRY.release_interactive(
+                    str(payload.get("subscription_id") or ""),
                 ))
                 return
             acquired = SEMAPHORE.acquire(timeout=MANUAL_WAIT_SECONDS)
