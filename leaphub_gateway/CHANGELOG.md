@@ -1,3 +1,9 @@
+## 1.11.72
+
+- Telemetria interativa com sessão reutilizada e encerramento automático.
+- Heartbeat de leitura confirmado durante a presença do usuário.
+- Correção do mapeamento entre porta do motorista e camadas de vidros.
+
 ## 1.11.71
 
 - Sessões Leapmotor agora possuem trava isolada por conta.

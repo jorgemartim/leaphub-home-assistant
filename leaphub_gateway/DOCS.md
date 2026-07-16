@@ -1,3 +1,7 @@
+## Telemetria interativa 1.11.72
+
+Enquanto uma aba autenticada do Leap Hub permanece visível, o site renova uma janela curta de presença. O Gateway reutiliza a sessão da conta, consulta em intervalo configurável (20 s por padrão) e encerra o perfil rápido automaticamente após a saída. Portas e vidros são compostos de forma independente.
+
 ## Proteção de sessão 1.11.71
 
 - A telemetria só consulta a Leapmotor durante uma janela ativada pela presença do usuário no Leap Hub.

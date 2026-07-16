@@ -26,7 +26,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-CONNECTOR_VERSION = "1.11.71"
+CONNECTOR_VERSION = "1.11.72"
 MAX_INPUT_BYTES = 1024 * 1024
 
 COMMAND_METHODS: dict[str, str] = {
@@ -757,7 +757,7 @@ def visual_contract(component_states: dict[str, bool | None]) -> dict[str, Any]:
     active = sorted(key for key, value in component_states.items() if value is True)
     return {
         "schema": 1,
-        "version": 8,
+        "version": 9,
         "unknown_is_not_closed": True,
         "known_components": known,
         "unknown_components": unknown,
@@ -934,15 +934,14 @@ def _official_visual_status(render_components: list[str], render_state: str) -> 
         rbcm_right_rear_door_status=rear_right_open,
         bbcm_back_door_status="trunk-open" in active,
     )
-    # O pacote oficial posiciona o vidro fechado na posição da porta fechada.
-    # Quando a porta esquerda abre, manter essa camada cria o reflexo/painel cinza
-    # deslocado visto no card. Para renderização, a camada de vidro fechado deve
-    # ser omitida enquanto a porta correspondente estiver aberta.
+    # Portas e vidros são camadas independentes. Forçar um vidro como aberto
+    # apenas porque a porta abriu selecionava a camada errada do pacote oficial
+    # (em especial o vidro traseiro sobre a porta do motorista).
     windows = SimpleNamespace(
-        left_front_window_percent=100 if front_left_open or "window-front-left-open" in active else 0,
-        right_front_window_percent=100 if front_right_open or "window-front-right-open" in active else 0,
-        left_rear_window_percent=100 if rear_left_open or "window-rear-left-open" in active else 0,
-        right_rear_window_percent=100 if rear_right_open or "window-rear-right-open" in active else 0,
+        left_front_window_percent=100 if "window-front-left-open" in active else 0,
+        right_front_window_percent=100 if "window-front-right-open" in active else 0,
+        left_rear_window_percent=100 if "window-rear-left-open" in active else 0,
+        right_rear_window_percent=100 if "window-rear-right-open" in active else 0,
     )
     charging = render_state == "charging"
     plugged = render_state in {"charging", "plugged"}
@@ -1483,7 +1482,7 @@ def official_visual_image_payload(
             "rendered_layer_signature": render_layer_signature,
             "rendered_layer_components": render_components,
             "image_cleanup": cleanup,
-            "render_contract_version": 13,
+            "render_contract_version": 14,
             "visual_image_state_key": cache_key,
             "state_cache_hit": state_cache_hit,
             "consistency_hash": hashlib.sha256(consistency_source.encode("utf-8")).hexdigest(),
@@ -1825,7 +1824,7 @@ def serialize_vehicle(
         if isinstance(group, dict) and str(group.get("status") or "") != "complete"
     ]
     visual_fingerprint_value = visual_fingerprint({
-        "version": 8,
+        "version": 9,
         "identity": visual_identity,
         "resolution_hints": visual_resolution_hints,
         "primary": visual_primary_state,
@@ -1980,7 +1979,7 @@ def serialize_vehicle(
         "ignition_details": ignition_state,
         "vehicle_image_url": vehicle_image_url,
         "exterior_color": exterior_color,
-        "visual_state_version": 8,
+        "visual_state_version": 9,
         "visual_primary_state": visual_primary_state,
         "visual_components": visual_components,
         "visual_component_states": reported_visual_component_states,
@@ -1993,7 +1992,7 @@ def serialize_vehicle(
         "visual_capabilities": reported_visual_capabilities,
         "visual_diagnostics": visual_diagnostics,
         "visual_state": {
-            "version": 8,
+            "version": 9,
             "captured_at": captured_at,
             "fingerprint": visual_fingerprint_value,
             "sample_fingerprint": visual_sample_fingerprint,
@@ -2023,7 +2022,7 @@ def serialize_vehicle(
             "vehicle": attribute(vehicle, "raw", {}),
             "status": attribute(status, "raw", {}),
         }),
-        "mapping_version": "1.11.71",
+        "mapping_version": "1.11.72",
     }
     official_image = official_visual_image_payload(
         client,
@@ -2054,7 +2053,7 @@ def serialize_vehicle(
             "visual_fingerprint": visual_fingerprint_value,
             "rendered_primary_state": visual_primary_state,
             "rendered_signature": visual_signature,
-            "render_contract_version": 13,
+            "render_contract_version": 14,
         })
     result["telemetry"] = telemetry
     return result

@@ -30,7 +30,7 @@ except ModuleNotFoundError as exc:
         "Módulo interno leaphub_connector ausente na imagem. Atualize o Leap Hub Gateway."
     ) from exc
 
-VERSION = "1.11.71"
+VERSION = "1.11.72"
 SERVICE = "Leap Hub Leapmotor Connector"
 MAX_BODY = 1024 * 1024
 WINDOW_SECONDS = 180
@@ -236,7 +236,11 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(200, TELEMETRY.remove(str(payload.get("subscription_id") or "")))
                 return
             if self.path == "/v1/telemetry/subscriptions/boost":
-                self.send_json(200, TELEMETRY.boost(str(payload.get("subscription_id") or ""), int(payload.get("seconds") or 900)))
+                self.send_json(200, TELEMETRY.boost(
+                    str(payload.get("subscription_id") or ""),
+                    int(payload.get("seconds") or 900),
+                    str(payload.get("profile") or "background"),
+                ))
                 return
             acquired = SEMAPHORE.acquire(timeout=MANUAL_WAIT_SECONDS)
             if not acquired:
