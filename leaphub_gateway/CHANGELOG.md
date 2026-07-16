@@ -1,8 +1,13 @@
-## Presença e timeout 1.11.74
+## Hotfix de sessão e OCPP 1.11.75
+
+- Corrige status OCPP e reduz recriações de sessão durante navegação.
+- Protege a conta Leapmotor com backoff conservador.
+
+## Presença e timeout 1.11.75
 
 A janela interativa encerra ao fechar a última aba. Timeouts temporários preservam a sessão e usam repetição curta protegida, sem novo login imediato.
 
-## 1.11.74
+## 1.11.75
 
 - Segurança: nonce HMAC persistente, telemetria iniciada uma única vez e estado explícito de reautenticação.
 

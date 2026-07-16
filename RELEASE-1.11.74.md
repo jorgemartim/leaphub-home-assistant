@@ -1,4 +1,4 @@
-# Leap Hub Gateway 1.11.74
+# Leap Hub Gateway 1.11.75
 
 - Nonce e assinatura canônica nas chamadas internas OCPP.
 - Timeout de leitura por conexão HTTP para reduzir slowloris.

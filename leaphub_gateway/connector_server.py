@@ -31,7 +31,7 @@ except ModuleNotFoundError as exc:
         "Módulo interno leaphub_connector ausente na imagem. Atualize o Leap Hub Gateway."
     ) from exc
 
-VERSION = "1.11.74"
+VERSION = "1.11.75"
 SERVICE = "Leap Hub Leapmotor Connector"
 MAX_BODY = 1024 * 1024
 WINDOW_SECONDS = 180
@@ -271,7 +271,10 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         try:
-            LOG.info("Action %s accepted for %s", self.path, environment)
+            if self.path in {"/v1/telemetry/subscriptions/boost", "/v1/telemetry/subscriptions/release"}:
+                LOG.debug("Action %s accepted for %s", self.path, environment)
+            else:
+                LOG.info("Action %s accepted for %s", self.path, environment)
             if self.path == "/v1/telemetry/subscriptions/upsert":
                 self.send_json(200, TELEMETRY.upsert(environment, payload))
                 return

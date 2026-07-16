@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import signal
 import struct
 import sys
@@ -29,7 +30,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-GATEWAY_VERSION = "1.11.74"
+GATEWAY_VERSION = "1.11.75"
 IS_RAILWAY = bool(os.getenv("RAILWAY_ENVIRONMENT_NAME") or os.getenv("RAILWAY_SERVICE_ID"))
 RUNTIME_DIR = Path(os.getenv("LEAPHUB_RUNTIME_DIR", "/tmp/leaphub-ocpp" if IS_RAILWAY else "."))
 BIND = os.getenv("LEAPHUB_OCPP_BIND", "0.0.0.0")
@@ -59,6 +60,8 @@ AUTH_BLOCK_SECONDS = max(60, int(os.getenv("LEAPHUB_OCPP_AUTH_BLOCK_SECONDS", "6
 STARTED_AT = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 DIAGNOSTIC_WINDOW_SECONDS = 180
 DIAGNOSTIC_NONCES: dict[str, float] = {}
+STATUS_API_LAST_ERROR = ""
+STATUS_API_LAST_LOG_AT = 0.0
 
 
 for path in (STATUS_FILE, PID_FILE, LOG_FILE):
@@ -752,7 +755,18 @@ async def status_loop() -> None:
         try:
             await asyncio.to_thread(api_call, {"action": "gateway_status", **status}, 8.0)
         except Exception as exc:  # noqa: BLE001
-            LOG.warning("Gateway status API failed: %s", exc)
+            # Não inunda o log a cada 15 segundos quando a API interna está
+            # temporariamente indisponível. Erros novos são exibidos na hora;
+            # o mesmo erro volta a ser lembrado no máximo a cada cinco minutos.
+            global STATUS_API_LAST_ERROR, STATUS_API_LAST_LOG_AT
+            message = str(exc)
+            now = time.monotonic()
+            if message != STATUS_API_LAST_ERROR or now - STATUS_API_LAST_LOG_AT >= 300:
+                LOG.warning("Gateway status API failed: %s", message)
+                STATUS_API_LAST_ERROR = message
+                STATUS_API_LAST_LOG_AT = now
+            else:
+                LOG.debug("Gateway status API ainda indisponível: %s", message)
         try:
             await asyncio.wait_for(STOP_EVENT.wait(), timeout=15)
         except asyncio.TimeoutError:

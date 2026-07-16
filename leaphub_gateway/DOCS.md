@@ -1,8 +1,13 @@
-## Presença e timeout 1.11.74
+## Hotfix de sessão e OCPP 1.11.75
+
+- Corrige status OCPP e reduz recriações de sessão durante navegação.
+- Protege a conta Leapmotor com backoff conservador.
+
+## Presença e timeout 1.11.75
 
 A janela interativa encerra ao fechar a última aba. Timeouts temporários preservam a sessão e usam repetição curta protegida, sem novo login imediato.
 
-## Telemetria interativa 1.11.74
+## Telemetria interativa 1.11.75
 
 Enquanto uma aba autenticada do Leap Hub permanece visível, o site renova uma janela curta de presença. O Gateway reutiliza a sessão da conta, consulta em intervalo configurável (20 s por padrão) e encerra o perfil rápido automaticamente após a saída. Portas e vidros são compostos de forma independente.
 

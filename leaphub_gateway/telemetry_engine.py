@@ -23,7 +23,7 @@ from cryptography.fernet import Fernet, InvalidToken
 import leaphub_connector as connector
 
 LOG = logging.getLogger("leaphub.telemetry")
-ENGINE_VERSION = "1.11.74"
+ENGINE_VERSION = "1.11.75"
 
 
 def utc_iso() -> str:
@@ -426,11 +426,16 @@ class TelemetryEngine:
                 status = "idle"
                 next_run = max(next_run, now_epoch + self.sleep_seconds)
             cursor = db.execute(
-                "UPDATE subscriptions SET status=?,interactive_until=0,active_until=MIN(active_until,?),next_run_at=?,updated_at=? WHERE subscription_id=?",
-                (status, now_epoch, next_run, now_iso, subscription_id),
+                "UPDATE subscriptions SET status=?,interactive_until=0,next_run_at=?,updated_at=? WHERE subscription_id=?",
+                (status, next_run, now_iso, subscription_id),
             )
         self.wake_event.set()
-        return {"ok": True, "subscription_id": subscription_id, "released": cursor.rowcount > 0}
+        return {
+            "ok": True,
+            "subscription_id": subscription_id,
+            "released": cursor.rowcount > 0,
+            "session_preserved": self._has_session(subscription_id),
+        }
 
     def boost(self, subscription_id: str, seconds: int = 900, profile: str = "background") -> dict[str, Any]:
         subscription_id = str(subscription_id or "").strip()[:190]
@@ -677,7 +682,18 @@ class TelemetryEngine:
                 self._mark_auth_required(sid, message)
                 LOG.warning("A assinatura %s foi pausada até as credenciais serem confirmadas: %s", sid, message)
             elif transient:
-                delay = self._transient_backoff(failures, interactive)
+                verification_challenge = any(marker in message.lower() for marker in (
+                    "information verification failed",
+                    "please try again later",
+                ))
+                if verification_challenge:
+                    # Esta resposta pode ser uma proteção da nuvem contra
+                    # consultas frequentes. O backoff é mais conservador para
+                    # evitar insistência e possível bloqueio da conta.
+                    schedule = (120, 300, 900, 1800, 3600, 10800)
+                    delay = schedule[min(max(1, failures) - 1, len(schedule) - 1)]
+                else:
+                    delay = self._transient_backoff(failures, interactive)
                 self._reschedule(sid, delay, "recovering", message, failed=True)
                 if failures >= 3:
                     LOG.warning("Sessão Leapmotor de %s será refeita após %ss por falhas temporárias repetidas: %s", sid, delay, message)
