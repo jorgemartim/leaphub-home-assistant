@@ -26,7 +26,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-CONNECTOR_VERSION = "1.11.69"
+CONNECTOR_VERSION = "1.11.70"
 MAX_INPUT_BYTES = 1024 * 1024
 
 COMMAND_METHODS: dict[str, str] = {
@@ -2023,7 +2023,7 @@ def serialize_vehicle(
             "vehicle": attribute(vehicle, "raw", {}),
             "status": attribute(status, "raw", {}),
         }),
-        "mapping_version": "1.11.69",
+        "mapping_version": "1.11.70",
     }
     official_image = official_visual_image_payload(
         client,
@@ -2114,43 +2114,27 @@ def handle_account(payload: dict[str, Any], sync: bool) -> dict[str, Any]:
     force_package_refresh = bool(payload.get("force_package_refresh")) if sync else False
     temp_dir = secure_temp_directory()
     client = None
-    login_attempts = 0
-    reconnected = False
     try:
-        vehicles: list[Any] = []
-        last_error: Exception | None = None
-        for attempt in range(1, 4):
-            login_attempts = attempt
-            try:
-                attempt_dir = temp_dir / f"attempt-{attempt}"
-                attempt_dir.mkdir(mode=0o700, parents=True, exist_ok=False)
-                client = create_client(credentials, attempt_dir, None)
-                client.login()
-                vehicles_value = client.get_vehicle_list()
-                vehicles = vehicles_value if isinstance(vehicles_value, list) else list(vehicles_value or [])
-                reconnected = attempt > 1
-                break
-            except Exception as exc:  # noqa: BLE001
-                last_error = exc
-                if client is not None:
-                    try:
-                        client.close()
-                    except Exception:
-                        pass
-                    client = None
-                if is_transient_cloud_error(exc) and attempt < 3:
-                    time.sleep((1.0, 3.0)[attempt - 1])
-                    continue
-                if is_transient_cloud_error(exc):
-                    raise ConnectorTemporaryError(reconnect_message(exc)) from exc
-                if is_authentication_error(exc):
-                    raise ConnectorAuthenticationError(
-                        "A conta Leapmotor recusou a reautenticação automática. "
-                        "Confirme a senha somente se esta mensagem continuar após novas tentativas."
-                    ) from exc
-                raise RuntimeError(clean_message(str(exc))) from exc
-        else:
-            raise ConnectorTemporaryError(reconnect_message(last_error or "falha temporária"))
+        try:
+            attempt_dir = temp_dir / "attempt-1"
+            attempt_dir.mkdir(mode=0o700, parents=True, exist_ok=False)
+            client = create_client(credentials, attempt_dir, None)
+            # Uma solicitação gera no máximo um login. Falhas transitórias são
+            # devolvidas ao scheduler, que aplica espera progressiva antes de
+            # qualquer nova autenticação.
+            client.login()
+            vehicles_value = client.get_vehicle_list()
+            vehicles = vehicles_value if isinstance(vehicles_value, list) else list(vehicles_value or [])
+        except Exception as exc:  # noqa: BLE001
+            if is_transient_cloud_error(exc):
+                raise ConnectorTemporaryError(reconnect_message(exc)) from exc
+            if is_authentication_error(exc):
+                raise ConnectorAuthenticationError(
+                    "A conta Leapmotor recusou a autenticação. "
+                    "Nenhuma nova tentativa automática será feita até a conta ser confirmada."
+                ) from exc
+            raise RuntimeError(clean_message(str(exc))) from exc
+
         selected = vehicles
         if vehicle_id:
             selected = [
@@ -2171,7 +2155,7 @@ def handle_account(payload: dict[str, Any], sync: bool) -> dict[str, Any]:
         serialized = [
             serialize_vehicle(
                 item,
-                include_status=True,
+                include_status=sync,
                 client=client,
                 messages=messages,
                 allow_unscoped_messages=len(selected) == 1,
@@ -2189,8 +2173,8 @@ def handle_account(payload: dict[str, Any], sync: bool) -> dict[str, Any]:
             "vehicles": serialized,
             "connector_version": CONNECTOR_VERSION,
             "library_version": package_version(),
-            "login_attempts": login_attempts,
-            "reconnected": reconnected,
+            "login_attempts": 1,
+            "reconnected": False,
         }
     finally:
         if client is not None:

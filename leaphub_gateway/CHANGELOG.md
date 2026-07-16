@@ -1,3 +1,16 @@
+## 1.11.70
+
+- A telemetria só consulta a Leapmotor durante uma janela ativada pela presença do usuário no Leap Hub.
+- A sessão autenticada é reutilizada; não existe mais um novo login em cada ciclo de coleta.
+- Cada operação cria no máximo uma tentativa de login e falhas usam espera progressiva de 5 min até 6 h.
+- Falha de autenticação pausa a assinatura até nova confirmação das credenciais.
+- Reenvios com as mesmas credenciais não removem a proteção de autenticação ou cooldown.
+- Limite de requisições ativa cooldown padrão de 6 horas.
+- Intervalos seguros: 30 s dirigindo/carregando, 5 min estacionado e 15 min em repouso.
+- Quando a janela de presença termina, a sessão é encerrada e nenhuma consulta à nuvem continua.
+- Sincronização manual e telemetria compartilham o mesmo lock por conta, impedindo logins paralelos.
+- As opções `connector_max_parallel` e `connector_manual_wait_seconds` passam a ser aplicadas corretamente.
+
 ## 1.11.69
 
 - Reconexão automática de sessão/token da Leapmotor.

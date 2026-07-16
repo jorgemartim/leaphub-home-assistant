@@ -30,7 +30,7 @@ except ModuleNotFoundError as exc:
         "Módulo interno leaphub_connector ausente na imagem. Atualize o Leap Hub Gateway."
     ) from exc
 
-VERSION = "1.11.69"
+VERSION = "1.11.70"
 SERVICE = "Leap Hub Leapmotor Connector"
 MAX_BODY = 1024 * 1024
 WINDOW_SECONDS = 180
@@ -55,13 +55,13 @@ SECRETS = {
     "staging": str(OPTIONS.get("staging_secret") or "").strip(),
     "production": str(OPTIONS.get("production_secret") or "").strip(),
 }
-MAX_PARALLEL = max(1, min(8, int(OPTIONS.get("max_parallel_requests") or 2)))
+MAX_PARALLEL = max(1, min(8, int(OPTIONS.get("connector_max_parallel") or OPTIONS.get("max_parallel_requests") or 2)))
 SEMAPHORE = threading.BoundedSemaphore(MAX_PARALLEL)
-MANUAL_WAIT_SECONDS = max(2, min(60, int(OPTIONS.get("manual_wait_seconds") or 20)))
+MANUAL_WAIT_SECONDS = max(2, min(60, int(OPTIONS.get("connector_manual_wait_seconds") or OPTIONS.get("manual_wait_seconds") or 20)))
 LOG_LEVEL = str(OPTIONS.get("log_level") or "INFO").upper()
 logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO), format="%(asctime)s %(levelname)s %(message)s")
 LOG = logging.getLogger("leaphub.connector")
-TELEMETRY = TelemetryEngine(OPTIONS, SECRETS, SEMAPHORE)
+TELEMETRY: TelemetryEngine
 
 
 def json_bytes(payload: dict[str, Any]) -> bytes:
@@ -119,6 +119,17 @@ def account_operation_lock(environment: str, payload: dict[str, Any]) -> threadi
             lock = threading.Lock()
             ACCOUNT_LOCKS[key] = lock
         return lock
+
+
+# A telemetria e as operações manuais usam o mesmo lock por conta. Isso impede
+# que uma leitura automática e uma sincronização manual façam login em paralelo.
+TELEMETRY = TelemetryEngine(
+    OPTIONS,
+    SECRETS,
+    SEMAPHORE,
+    account_lock_provider=account_operation_lock,
+    account_wait_seconds=MANUAL_WAIT_SECONDS,
+)
 
 
 def connector_ready() -> bool:

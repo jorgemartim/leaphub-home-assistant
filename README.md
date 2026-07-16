@@ -1,10 +1,21 @@
+## Proteção de sessão 1.11.70
+
+- A telemetria só consulta a Leapmotor durante uma janela ativada pela presença do usuário no Leap Hub.
+- A sessão autenticada é reutilizada; não existe mais um novo login em cada ciclo de coleta.
+- Cada operação cria no máximo uma tentativa de login e falhas usam espera progressiva de 5 min até 6 h.
+- Falha de autenticação pausa a assinatura até nova confirmação das credenciais.
+- Reenvios com as mesmas credenciais não removem a proteção de autenticação ou cooldown.
+- Limite de requisições ativa cooldown padrão de 6 horas.
+- Intervalos seguros: 30 s dirigindo/carregando, 5 min estacionado e 15 min em repouso.
+- Quando a janela de presença termina, a sessão é encerrada e nenhuma consulta à nuvem continua.
+
 ## Automação autônoma 1.11.69
 
 O Gateway reconecta, reativa assinaturas e continua a telemetria sem ação do usuário.
 
 # Leap Hub Home Assistant
 
-Versão atual do Gateway: **1.11.69**.
+Versão atual do Gateway: **1.11.70**.
 
 <p align="center">
   <img src="./leaphub_gateway/logo.png" alt="Leap Hub Gateway" width="420">
