@@ -1,4 +1,4 @@
-# Gateway 1.11.73
+# Gateway 1.11.74
 
 - Endpoint para encerrar imediatamente a janela interativa quando a última aba fecha.
 - Timeout temporário preserva a sessão nas duas primeiras falhas.

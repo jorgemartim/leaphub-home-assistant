@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import re
+import sqlite3
 import sys
 import threading
 import time
@@ -30,14 +31,16 @@ except ModuleNotFoundError as exc:
         "Módulo interno leaphub_connector ausente na imagem. Atualize o Leap Hub Gateway."
     ) from exc
 
-VERSION = "1.11.73"
+VERSION = "1.11.74"
 SERVICE = "Leap Hub Leapmotor Connector"
 MAX_BODY = 1024 * 1024
 WINDOW_SECONDS = 180
 STARTED_AT = time.time()
 NONCES: dict[str, float] = {}
 NONCE_LOCK = threading.Lock()
+NONCE_DB_PATH = Path(os.getenv("LEAPHUB_NONCE_DB_PATH", "/data/security/connector-nonces.sqlite"))
 ACCOUNT_LOCKS: dict[str, threading.Lock] = {}
+ACCOUNT_LOCK_LAST_USED: dict[str, float] = {}
 ACCOUNT_LOCKS_GUARD = threading.Lock()
 OPTIONS_PATH = Path(os.getenv("LEAPHUB_OPTIONS_PATH", "/data/options.json"))
 
@@ -74,6 +77,39 @@ def cleanup_nonces(now: float) -> None:
         NONCES.pop(key, None)
 
 
+def remember_nonce(environment: str, nonce: str, now: float) -> None:
+    """Persist replay protection across Gateway restarts, with an in-memory fallback."""
+    nonce_hash = hashlib.sha256(f"{environment}|{nonce}".encode("utf-8")).hexdigest()
+    expires_at = now + WINDOW_SECONDS + 30
+    try:
+        NONCE_DB_PATH.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        with sqlite3.connect(NONCE_DB_PATH, timeout=3.0) as db:
+            db.execute("PRAGMA busy_timeout = 3000")
+            db.execute("CREATE TABLE IF NOT EXISTS connector_nonces (nonce_hash TEXT PRIMARY KEY, expires_at REAL NOT NULL)")
+            db.execute("DELETE FROM connector_nonces WHERE expires_at < ?", (now,))
+            try:
+                db.execute("INSERT INTO connector_nonces (nonce_hash, expires_at) VALUES (?, ?)", (nonce_hash, expires_at))
+            except sqlite3.IntegrityError as exc:
+                raise PermissionError("Requisição repetida.") from exc
+            db.commit()
+        try:
+            os.chmod(NONCE_DB_PATH, 0o600)
+        except OSError:
+            pass
+        return
+    except PermissionError:
+        raise
+    except (OSError, sqlite3.Error) as exc:
+        LOG.warning("Proteção persistente de nonce indisponível; usando memória: %s", exc)
+
+    nonce_key = environment + ":" + nonce
+    with NONCE_LOCK:
+        cleanup_nonces(now)
+        if nonce_key in NONCES:
+            raise PermissionError("Requisição repetida.")
+        NONCES[nonce_key] = now
+
+
 def verify_signature(method: str, path: str, body: bytes, headers: Any) -> str:
     timestamp = str(headers.get("X-LeapHub-Timestamp") or "").strip()
     nonce = str(headers.get("X-LeapHub-Nonce") or "").strip()
@@ -87,20 +123,13 @@ def verify_signature(method: str, path: str, body: bytes, headers: Any) -> str:
         raise PermissionError("Nonce inválido.")
     if re.fullmatch(r"[a-f0-9]{64}", signature) is None:
         raise PermissionError("Assinatura ausente.")
-    nonce_key = environment + ":" + nonce
     now = time.time()
-    with NONCE_LOCK:
-        cleanup_nonces(now)
-        if nonce_key in NONCES:
-            raise PermissionError("Requisição repetida.")
-        NONCES[nonce_key] = now
     body_hash = hashlib.sha256(body).hexdigest()
     canonical = f"{method.upper()}\n{path}\n{timestamp}\n{nonce}\n{body_hash}".encode("utf-8")
     expected = hmac.new(SECRETS[environment].encode("utf-8"), canonical, hashlib.sha256).hexdigest()
     if not hmac.compare_digest(expected, signature):
-        with NONCE_LOCK:
-            NONCES.pop(nonce_key, None)
         raise PermissionError("Assinatura inválida.")
+    remember_nonce(environment, nonce, now)
     return environment
 
 
@@ -113,11 +142,21 @@ def account_operation_key(environment: str, payload: dict[str, Any]) -> str:
 
 def account_operation_lock(environment: str, payload: dict[str, Any]) -> threading.Lock:
     key = account_operation_key(environment, payload)
+    now = time.time()
     with ACCOUNT_LOCKS_GUARD:
+        if len(ACCOUNT_LOCKS) > 1024:
+            stale = [
+                item_key for item_key, used_at in ACCOUNT_LOCK_LAST_USED.items()
+                if used_at < now - 3600 and not ACCOUNT_LOCKS.get(item_key, threading.Lock()).locked()
+            ]
+            for item_key in stale[:256]:
+                ACCOUNT_LOCKS.pop(item_key, None)
+                ACCOUNT_LOCK_LAST_USED.pop(item_key, None)
         lock = ACCOUNT_LOCKS.get(key)
         if lock is None:
             lock = threading.Lock()
             ACCOUNT_LOCKS[key] = lock
+        ACCOUNT_LOCK_LAST_USED[key] = now
         return lock
 
 
@@ -160,6 +199,10 @@ def detailed_health_payload(environment: str) -> dict[str, Any]:
 class Handler(BaseHTTPRequestHandler):
     server_version = "LeapHubConnector"
     sys_version = ""
+
+    def setup(self) -> None:
+        super().setup()
+        self.connection.settimeout(15.0)
 
     def log_message(self, fmt: str, *args: Any) -> None:
         line = fmt % args
@@ -287,6 +330,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(401, {
                 "ok": False,
                 "temporary": False,
+                "auth_required": True,
                 "message": connector.clean_message(str(exc)),
                 "connector_version": connector.CONNECTOR_VERSION,
             })

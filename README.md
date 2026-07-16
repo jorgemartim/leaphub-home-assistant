@@ -1,8 +1,8 @@
-## Presença e timeout 1.11.73
+## Presença e timeout 1.11.74
 
 A janela interativa encerra ao fechar a última aba. Timeouts temporários preservam a sessão e usam repetição curta protegida, sem novo login imediato.
 
-## Telemetria interativa 1.11.73
+## Telemetria interativa 1.11.74
 
 Enquanto uma aba autenticada do Leap Hub permanece visível, o site renova uma janela curta de presença. O Gateway reutiliza a sessão da conta, consulta em intervalo configurável (20 s por padrão) e encerra o perfil rápido automaticamente após a saída. Portas e vidros são compostos de forma independente.
 
@@ -23,7 +23,7 @@ O Gateway reconecta, reativa assinaturas e continua a telemetria sem ação do u
 
 # Leap Hub Home Assistant
 
-Versão atual do Gateway: **1.11.73**.
+Versão atual do Gateway: **1.11.74**.
 
 <p align="center">
   <img src="./leaphub_gateway/logo.png" alt="Leap Hub Gateway" width="420">

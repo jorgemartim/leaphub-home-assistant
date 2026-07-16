@@ -1,8 +1,10 @@
-## Presença e timeout 1.11.73
+## Presença e timeout 1.11.74
 
 A janela interativa encerra ao fechar a última aba. Timeouts temporários preservam a sessão e usam repetição curta protegida, sem novo login imediato.
 
-## 1.11.73
+## 1.11.74
+
+- Segurança: nonce HMAC persistente, telemetria iniciada uma única vez e estado explícito de reautenticação.
 
 - Telemetria interativa com sessão reutilizada e encerramento automático.
 - Heartbeat de leitura confirmado durante a presença do usuário.

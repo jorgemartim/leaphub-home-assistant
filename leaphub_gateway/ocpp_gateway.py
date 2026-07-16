@@ -29,7 +29,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-GATEWAY_VERSION = "1.11.73"
+GATEWAY_VERSION = "1.11.74"
 IS_RAILWAY = bool(os.getenv("RAILWAY_ENVIRONMENT_NAME") or os.getenv("RAILWAY_SERVICE_ID"))
 RUNTIME_DIR = Path(os.getenv("LEAPHUB_RUNTIME_DIR", "/tmp/leaphub-ocpp" if IS_RAILWAY else "."))
 BIND = os.getenv("LEAPHUB_OCPP_BIND", "0.0.0.0")
@@ -92,11 +92,10 @@ GATEWAY_SECRET = load_secret()
 def api_call(payload: dict[str, Any], timeout: float = 20.0) -> dict[str, Any]:
     body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     timestamp = str(int(time.time()))
-    signature = hmac.new(
-        GATEWAY_SECRET.encode("utf-8"),
-        timestamp.encode("ascii") + b"\n" + body,
-        hashlib.sha256,
-    ).hexdigest()
+    nonce = secrets.token_hex(16)
+    path = urllib.parse.urlsplit(INTERNAL_URL).path or "/api/internal/ocpp"
+    canonical = f"POST\n{path}\n{timestamp}\n{nonce}\n{hashlib.sha256(body).hexdigest()}".encode("utf-8")
+    signature = hmac.new(GATEWAY_SECRET.encode("utf-8"), canonical, hashlib.sha256).hexdigest()
     request = urllib.request.Request(
         INTERNAL_URL,
         data=body,
@@ -105,6 +104,7 @@ def api_call(payload: dict[str, Any], timeout: float = 20.0) -> dict[str, Any]:
             "Content-Type": "application/json",
             "Accept": "application/json",
             "X-LeapHub-Timestamp": timestamp,
+            "X-LeapHub-Nonce": nonce,
             "X-LeapHub-Signature": signature,
             "User-Agent": f"LeapHub-OCPP-Gateway/{GATEWAY_VERSION}",
         },
