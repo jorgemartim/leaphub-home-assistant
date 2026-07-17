@@ -161,3 +161,9 @@ A janela interativa encerra ao fechar a última aba. Timeouts temporários prese
 - Token do Tunnel fora da linha de comando.
 - Migração reversível.
 - Ícone, logotipo, traduções, documentação e política AppArmor.
+
+## 1.11.76
+
+- Corrige a classificação de `Failed to issue certificate`: falha temporária da nuvem não bloqueia mais a conta como senha incorreta.
+- Permite limpar com segurança um `auth_required` preso quando o Leap Hub comprova uma sincronização manual bem-sucedida.
+- Corrige a composição oficial do veículo com portas abertas, removendo o reflexo do vidro fechado que aparecia deslocado na frente da porta.

@@ -26,7 +26,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-CONNECTOR_VERSION = "1.11.75"
+CONNECTOR_VERSION = "1.11.76"
 MAX_INPUT_BYTES = 1024 * 1024
 
 COMMAND_METHODS: dict[str, str] = {
@@ -106,6 +106,10 @@ TRANSIENT_CLOUD_MARKERS = (
     "login expired",
     "invalid token",
     "bad gateway",
+    "failed to issue certificate",
+    "could not issue certificate",
+    "certificate issuance failed",
+    "certificate service unavailable",
     "http 502",
     "http 503",
     "http 504",
@@ -118,7 +122,6 @@ AUTHENTICATION_MARKERS = (
     "invalid credentials",
     "credential invalid",
     "authentication failed",
-    "login failed",
     "account locked",
     "account disabled",
     "certificate invalid",
@@ -934,14 +937,15 @@ def _official_visual_status(render_components: list[str], render_state: str) -> 
         rbcm_right_rear_door_status=rear_right_open,
         bbcm_back_door_status="trunk-open" in active,
     )
-    # Portas e vidros são camadas independentes. Forçar um vidro como aberto
-    # apenas porque a porta abriu selecionava a camada errada do pacote oficial
-    # (em especial o vidro traseiro sobre a porta do motorista).
+    # O pacote oficial posiciona o vidro fechado na posição da porta fechada.
+    # Quando uma porta abre, manter essa camada cria um reflexo/painel deslocado
+    # na frente da abertura. A correção é somente visual: a telemetria original
+    # do vidro continua intacta e apenas a composição omite o vidro fechado.
     windows = SimpleNamespace(
-        left_front_window_percent=100 if "window-front-left-open" in active else 0,
-        right_front_window_percent=100 if "window-front-right-open" in active else 0,
-        left_rear_window_percent=100 if "window-rear-left-open" in active else 0,
-        right_rear_window_percent=100 if "window-rear-right-open" in active else 0,
+        left_front_window_percent=100 if front_left_open or "window-front-left-open" in active else 0,
+        right_front_window_percent=100 if front_right_open or "window-front-right-open" in active else 0,
+        left_rear_window_percent=100 if rear_left_open or "window-rear-left-open" in active else 0,
+        right_rear_window_percent=100 if rear_right_open or "window-rear-right-open" in active else 0,
     )
     charging = render_state == "charging"
     plugged = render_state in {"charging", "plugged"}

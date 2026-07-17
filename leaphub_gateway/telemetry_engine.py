@@ -23,7 +23,7 @@ from cryptography.fernet import Fernet, InvalidToken
 import leaphub_connector as connector
 
 LOG = logging.getLogger("leaphub.telemetry")
-ENGINE_VERSION = "1.11.75"
+ENGINE_VERSION = "1.11.76"
 
 
 def utc_iso() -> str:
@@ -263,6 +263,7 @@ class TelemetryEngine:
         credentials = payload.get("credentials")
         ids = payload.get("vehicle_ids")
         enabled = bool(payload.get("enabled", True))
+        credentials_verified = bool(payload.get("credentials_verified", False))
         if not subscription_id or account_id < 1 or not isinstance(credentials, dict) or not isinstance(ids, list):
             raise ValueError("Assinatura de telemetria incompleta.")
         if environment not in self.secrets or len(self.secrets[environment]) < 32:
@@ -297,12 +298,13 @@ class TelemetryEngine:
         credentials_changed = existing is None or not previous_hash or not hmac.compare_digest(previous_hash, credential_hash)
         existing_auth_required = bool(existing is not None and int(existing["auth_required"] or 0) == 1)
         existing_cooldown_until = float(existing["cooldown_until"] or 0) if existing is not None else 0.0
-        protected_auth = enabled and existing_auth_required and not credentials_changed
-        protected_cooldown = enabled and existing_cooldown_until > now_epoch and not credentials_changed
+        protected_auth = enabled and existing_auth_required and not credentials_changed and not credentials_verified
+        protected_cooldown = enabled and existing_cooldown_until > now_epoch and not credentials_changed and not credentials_verified
 
-        # Reenvios de configuração com as mesmas credenciais nunca removem uma
-        # proteção de autenticação ou limite. Somente credenciais realmente
-        # alteradas autorizam uma nova tentativa de login.
+        # Reenvios comuns com as mesmas credenciais preservam a proteção. O site
+        # pode enviar credentials_verified somente depois de uma consulta manual
+        # bem-sucedida à nuvem. Essa confirmação assinada elimina o bloqueio preso
+        # sem exigir que o usuário altere e salve a mesma senha novamente.
         if protected_auth:
             status = "auth_required"
             active_until = 0.0
@@ -335,7 +337,7 @@ class TelemetryEngine:
             auth_required = 0
             cooldown_until = 0.0
 
-        if credentials_changed or not enabled or protected_auth or protected_cooldown:
+        if credentials_changed or credentials_verified or not enabled or protected_auth or protected_cooldown:
             self._close_session(subscription_id)
         encrypted = self.fernet.encrypt(canonical_json(credentials))
         with self.lock, self._db() as db:
@@ -388,7 +390,10 @@ class TelemetryEngine:
             "active_seconds": max(0, int(active_until - time.time())),
             "next_run_seconds": int(max(0, next_run - time.time())),
             "credentials_changed": credentials_changed,
-            "session_preserved": not credentials_changed and self._has_session(subscription_id),
+            "credentials_verified": credentials_verified,
+            "auth_reset": credentials_verified and existing_auth_required,
+            "cooldown_reset": credentials_verified and existing_cooldown_until > now_epoch,
+            "session_preserved": not credentials_changed and not credentials_verified and self._has_session(subscription_id),
         }
 
     def remove(self, subscription_id: str) -> dict[str, Any]:
