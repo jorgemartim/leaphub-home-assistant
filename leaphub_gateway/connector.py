@@ -26,7 +26,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-CONNECTOR_VERSION = "1.11.76"
+CONNECTOR_VERSION = "1.11.77"
 MAX_INPUT_BYTES = 1024 * 1024
 
 COMMAND_METHODS: dict[str, str] = {
@@ -2188,6 +2188,82 @@ def handle_account(payload: dict[str, Any], sync: bool) -> dict[str, Any]:
         shutil.rmtree(temp_dir, ignore_errors=True)
 
 
+
+VEHICLE_SLEEP_MARKERS = (
+    "vehicle asleep", "vehicle is asleep", "car asleep", "car is asleep",
+    "sleeping", "deep sleep", "vehicle offline", "car offline",
+    "not awake", "not ready", "vehicle unavailable", "car unavailable",
+    "wake up vehicle", "wake vehicle", "please wake", "dormindo",
+    "veículo offline", "veiculo offline", "não está pronto", "nao esta pronto",
+)
+
+
+def is_vehicle_sleep_error(value: Any) -> bool:
+    message = clean_message(str(value)).lower()
+    return any(marker in message for marker in VEHICLE_SLEEP_MARKERS)
+
+
+def is_remote_command_confirmation_timeout(value: Any) -> bool:
+    """The cloud accepted the command but the library did not receive final confirmation.
+
+    leapmotor-api raises this only after /remote/ctl returned a remoteCtlId and
+    the subsequent result polling exceeded its deadline. Re-sending the command
+    would be unsafe; the telemetry confirmation window must resolve the state.
+    """
+    message = clean_message(str(value)).lower()
+    return "timed out waiting for remote control result" in message
+
+
+def try_wake_vehicle(client: Any, vehicle_id: str) -> dict[str, Any]:
+    """Use an explicit wake primitive when the installed library exposes one.
+
+    Different releases of leapmotor-api used different method names. Reflection
+    keeps the connector compatible and never treats absence of a wake method as
+    a failure because many command endpoints wake the car themselves.
+    """
+    for method_name in (
+        "wake_vehicle", "wake_up_vehicle", "wakeup_vehicle",
+        "wake_vehicle_up", "wake_up", "wakeup",
+    ):
+        method = getattr(client, method_name, None)
+        if not callable(method):
+            continue
+        try:
+            try:
+                result = method(vehicle_id)
+            except TypeError:
+                result = method()
+            return {"attempted": True, "method": method_name, "result_type": type(result).__name__}
+        except Exception as exc:  # noqa: BLE001
+            if is_authentication_error(exc):
+                raise
+            # The cloud may answer that the vehicle is already awake. In that
+            # case the command itself is the authoritative next step.
+            message = clean_message(str(exc)).lower()
+            if any(token in message for token in ("already awake", "already online", "já está acordado", "ja esta acordado")):
+                return {"attempted": True, "method": method_name, "already_awake": True}
+            if is_transient_cloud_error(exc) or is_vehicle_sleep_error(exc):
+                return {"attempted": True, "method": method_name, "temporary": True, "message": clean_message(str(exc))}
+            return {"attempted": True, "method": method_name, "failed": True, "message": clean_message(str(exc))}
+    return {"attempted": False, "method": None}
+
+
+def execute_vehicle_command(method: Any, command: str, vehicle_id: str, parameters: dict[str, Any]) -> Any:
+    if command == "set_charge_limit":
+        value = int(parameters.get("charge_limit_percent", 80))
+        if value < 50 or value > 100 or value % 5 != 0:
+            raise ValueError("Limite de carga inválido.")
+        return method(vehicle_id, charge_limit_percent=value)
+    if command == "send_destination":
+        name = str(parameters.get("name") or "Destino")[:100]
+        address = str(parameters.get("address") or "")[:240]
+        latitude = float(parameters.get("latitude"))
+        longitude = float(parameters.get("longitude"))
+        if latitude < -90 or latitude > 90 or longitude < -180 or longitude > 180:
+            raise ValueError("Coordenadas inválidas.")
+        return method(vehicle_id, name=name, address=address, latitude=latitude, longitude=longitude)
+    return method(vehicle_id)
+
 def handle_command(payload: dict[str, Any]) -> dict[str, Any]:
     credentials = payload.get("credentials")
     if not isinstance(credentials, dict):
@@ -2200,6 +2276,12 @@ def handle_command(payload: dict[str, Any]) -> dict[str, Any]:
     if command not in COMMAND_METHODS:
         raise ValueError("Comando remoto não suportado pelo conector.")
     operation_password = require_text(credentials, "operation_password", "o PIN do veículo", 20)
+    wake_before = bool(payload.get("wake_before", True))
+    verify_after = bool(payload.get("verify_after", True))
+    try:
+        wake_timeout = max(10, min(90, int(payload.get("wake_timeout_seconds") or 45)))
+    except (TypeError, ValueError):
+        wake_timeout = 45
 
     temp_dir = secure_temp_directory()
     client = None
@@ -2211,29 +2293,64 @@ def handle_command(payload: dict[str, Any]) -> dict[str, Any]:
         if not callable(method):
             raise RuntimeError("A versão instalada da biblioteca não possui este comando.")
 
-        if command == "set_charge_limit":
-            value = int(parameters.get("charge_limit_percent", 80))
-            if value < 50 or value > 100 or value % 5 != 0:
-                raise ValueError("Limite de carga inválido.")
-            result = method(vehicle_id, charge_limit_percent=value)
-        elif command == "send_destination":
-            name = str(parameters.get("name") or "Destino")[:100]
-            address = str(parameters.get("address") or "")[:240]
-            latitude = float(parameters.get("latitude"))
-            longitude = float(parameters.get("longitude"))
-            if latitude < -90 or latitude > 90 or longitude < -180 or longitude > 180:
-                raise ValueError("Coordenadas inválidas.")
-            result = method(vehicle_id, name=name, address=address, latitude=latitude, longitude=longitude)
-        else:
-            result = method(vehicle_id)
+        wake_info = {"attempted": False, "method": None}
+        if wake_before:
+            wake_info = try_wake_vehicle(client, vehicle_id)
+            # Give the telematics unit a short opportunity to leave deep sleep.
+            # We never wait the full timeout before the first command because the
+            # official endpoint often wakes and executes in one request.
+            if wake_info.get("attempted") and not wake_info.get("already_awake"):
+                time.sleep(min(2.0, max(0.5, wake_timeout / 30)))
 
+        attempts = 0
+        last_error: Exception | None = None
+        confirmation_pending = False
+        for attempt in range(1, 4):
+            attempts = attempt
+            try:
+                result = execute_vehicle_command(method, command, vehicle_id, parameters)
+                last_error = None
+                break
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+                if is_authentication_error(exc):
+                    raise ConnectorAuthenticationError(clean_message(str(exc))) from exc
+                # leapmotor-api only emits this timeout after the write endpoint
+                # accepted the command and returned a remoteCtlId. The final cloud
+                # confirmation can arrive later, so never send the command twice.
+                if is_remote_command_confirmation_timeout(exc):
+                    confirmation_pending = True
+                    result = {"accepted": True, "confirmation_pending": True}
+                    last_error = None
+                    break
+                # Retry only when the cloud explicitly reports sleep/offline/not-ready.
+                # This avoids duplicating a command after an ambiguous generic timeout.
+                if attempt >= 3 or not is_vehicle_sleep_error(exc):
+                    if is_transient_cloud_error(exc):
+                        raise ConnectorTemporaryError(reconnect_message(exc)) from exc
+                    raise RuntimeError(clean_message(str(exc))) from exc
+                retry_wake = try_wake_vehicle(client, vehicle_id)
+                if retry_wake.get("attempted"):
+                    wake_info = retry_wake
+                time.sleep(min(6.0, 1.5 * attempt))
+        if last_error is not None:
+            raise RuntimeError(clean_message(str(last_error))) from last_error
+
+        # Verification is intentionally best-effort. The Gateway performs the
+        # authoritative 3-second command window and persists the new snapshot.
+        verification_requested = bool(verify_after)
         return {
             "ok": True,
-            "message": "Comando enviado à nuvem Leapmotor.",
+            "message": "Comando aceito pela nuvem Leapmotor. O estado será confirmado automaticamente.",
             "command": command,
             "result_type": type(result).__name__,
             "connector_version": CONNECTOR_VERSION,
             "library_version": package_version(),
+            "wake_attempted": bool(wake_info.get("attempted")),
+            "wake_method": wake_info.get("method"),
+            "attempts": attempts,
+            "verification_requested": verification_requested,
+            "confirmation_pending": confirmation_pending,
         }
     finally:
         if client is not None:

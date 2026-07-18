@@ -23,7 +23,7 @@ from cryptography.fernet import Fernet, InvalidToken
 import leaphub_connector as connector
 
 LOG = logging.getLogger("leaphub.telemetry")
-ENGINE_VERSION = "1.11.76"
+ENGINE_VERSION = "1.11.77"
 
 
 def utc_iso() -> str:
@@ -91,6 +91,10 @@ class TelemetryEngine:
         self.lock = threading.RLock()
         self.active_seconds = self._bounded("telemetry_active_seconds", 30, 15, 300)
         self.interactive_seconds = self._bounded("telemetry_interactive_seconds", 20, 15, 60)
+        # Janela curta após comandos remotos. É propositalmente separada da
+        # navegação comum para confirmar rapidamente o novo estado sem manter
+        # consultas agressivas à nuvem durante todo o dia.
+        self.command_seconds = self._bounded("telemetry_command_seconds", 3, 3, 10)
         self.charging_seconds = self._bounded("telemetry_charging_seconds", 30, 15, 600)
         self.parked_seconds = self._bounded("telemetry_parked_seconds", 300, 60, 3600)
         self.sleep_seconds = self._bounded("telemetry_sleep_seconds", 900, 300, 14400)
@@ -171,6 +175,7 @@ class TelemetryEngine:
                     cooldown_until REAL NOT NULL DEFAULT 0,
                     active_until REAL NOT NULL DEFAULT 0,
                     interactive_until REAL NOT NULL DEFAULT 0,
+                    command_until REAL NOT NULL DEFAULT 0,
                     last_presence_at TEXT NULL,
                     auth_required INTEGER NOT NULL DEFAULT 0,
                     credential_hash TEXT NULL,
@@ -206,6 +211,8 @@ class TelemetryEngine:
                 db.execute("ALTER TABLE subscriptions ADD COLUMN active_until REAL NOT NULL DEFAULT 0")
             if "interactive_until" not in columns:
                 db.execute("ALTER TABLE subscriptions ADD COLUMN interactive_until REAL NOT NULL DEFAULT 0")
+            if "command_until" not in columns:
+                db.execute("ALTER TABLE subscriptions ADD COLUMN command_until REAL NOT NULL DEFAULT 0")
             if "last_presence_at" not in columns:
                 db.execute("ALTER TABLE subscriptions ADD COLUMN last_presence_at TEXT NULL")
             if "auth_required" not in columns:
@@ -280,7 +287,7 @@ class TelemetryEngine:
         credential_hash = hashlib.sha256(canonical_json(credentials)).hexdigest()
         with self.lock, self._db() as db:
             existing = db.execute(
-                "SELECT credential_hash, credentials_encrypted, auth_required, cooldown_until, active_until, interactive_until, next_run_at, status, enabled "
+                "SELECT credential_hash, credentials_encrypted, auth_required, cooldown_until, active_until, interactive_until, command_until, next_run_at, status, enabled "
                 "FROM subscriptions WHERE subscription_id=? LIMIT 1",
                 (subscription_id,),
             ).fetchone()
@@ -309,6 +316,7 @@ class TelemetryEngine:
             status = "auth_required"
             active_until = 0.0
             interactive_until = 0.0
+            command_until = 0.0
             next_run = now_epoch + 86400
             auth_required = 1
             cooldown_until = 0.0
@@ -316,6 +324,7 @@ class TelemetryEngine:
             status = "cooldown"
             active_until = 0.0
             interactive_until = 0.0
+            command_until = 0.0
             next_run = existing_cooldown_until
             auth_required = 0
             cooldown_until = existing_cooldown_until
@@ -323,6 +332,7 @@ class TelemetryEngine:
             status = "disabled"
             active_until = 0.0
             interactive_until = 0.0
+            command_until = 0.0
             next_run = now_epoch + self.sleep_seconds
             auth_required = 0
             cooldown_until = 0.0
@@ -332,6 +342,8 @@ class TelemetryEngine:
             active_until = max(previous_active, now_epoch + self.presence_window_seconds)
             previous_interactive = float(existing["interactive_until"] or 0) if existing is not None and not credentials_changed else 0.0
             interactive_until = max(0.0, previous_interactive)
+            previous_command = float(existing["command_until"] or 0) if existing is not None and not credentials_changed else 0.0
+            command_until = max(0.0, previous_command)
             previous_next = float(existing["next_run_at"] or 0) if existing is not None else 0.0
             next_run = min(previous_next, now_epoch + 1.0) if previous_next > now_epoch else now_epoch + random.uniform(0.5, 1.5)
             auth_required = 0
@@ -346,8 +358,8 @@ class TelemetryEngine:
                 INSERT INTO subscriptions
                 (subscription_id, environment, account_id, credentials_encrypted, vehicle_ids_json, enabled, status, next_run_at,
                  last_run_at, last_success_at, last_delivery_at, last_error, last_state, parked_streak, consecutive_failures,
-                 cooldown_until, active_until, interactive_until, last_presence_at, auth_required, credential_hash, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, 0, 0, ?, ?, ?, ?, ?, ?, ?, ?)
+                 cooldown_until, active_until, interactive_until, command_until, last_presence_at, auth_required, credential_hash, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, 0, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(subscription_id) DO UPDATE SET
                     environment=excluded.environment, account_id=excluded.account_id,
                     credentials_encrypted=excluded.credentials_encrypted, vehicle_ids_json=excluded.vehicle_ids_json,
@@ -356,11 +368,12 @@ class TelemetryEngine:
                     consecutive_failures=CASE WHEN excluded.status IN ('auth_required','cooldown') THEN subscriptions.consecutive_failures ELSE 0 END,
                     cooldown_until=excluded.cooldown_until, active_until=excluded.active_until,
                     interactive_until=excluded.interactive_until,
+                    command_until=excluded.command_until,
                     last_presence_at=excluded.last_presence_at, auth_required=excluded.auth_required,
                     credential_hash=excluded.credential_hash, updated_at=excluded.updated_at
                 """,
                 (subscription_id, environment, account_id, encrypted, json.dumps(vehicle_ids), 1 if enabled else 0,
-                 status, next_run, cooldown_until, active_until, interactive_until, now, auth_required, credential_hash, now, now),
+                 status, next_run, cooldown_until, active_until, interactive_until, command_until, now, auth_required, credential_hash, now, now),
             )
 
         self.wake_event.set()
@@ -403,7 +416,7 @@ class TelemetryEngine:
         self._close_session(subscription_id)
         with self.lock, self._db() as db:
             cursor = db.execute(
-                "UPDATE subscriptions SET enabled=0, status='disabled', active_until=0, interactive_until=0, updated_at=? WHERE subscription_id=?",
+                "UPDATE subscriptions SET enabled=0, status='disabled', active_until=0, interactive_until=0, command_until=0, updated_at=? WHERE subscription_id=?",
                 (utc_iso(), subscription_id),
             )
         self.wake_event.set()
@@ -417,17 +430,22 @@ class TelemetryEngine:
         now_iso = utc_iso()
         with self.lock, self._db() as db:
             row = db.execute(
-                "SELECT enabled, status, next_run_at FROM subscriptions WHERE subscription_id=? LIMIT 1",
+                "SELECT enabled, status, next_run_at, command_until FROM subscriptions WHERE subscription_id=? LIMIT 1",
                 (subscription_id,),
             ).fetchone()
             if row is None:
                 return {"ok": True, "subscription_id": subscription_id, "released": False}
             status = str(row["status"] or "")
             next_run = float(row["next_run_at"] or 0)
-            # Encerrar a aba não invalida a sessão autenticada. Apenas remove a
-            # janela rápida e estaciona novas consultas; a sessão expira pelo
-            # idle normal ou é reutilizada se o usuário voltar logo.
-            if status not in {"auth_required", "cooldown", "recovering", "error"}:
+            command_active = float(row["command_until"] or 0) > now_epoch
+            # Fechar a aba remove somente a janela interativa normal. Uma janela
+            # de confirmação criada por comando remoto continua ativa para que o
+            # carro possa acordar e o novo estado chegue mesmo sem a tela aberta.
+            if command_active:
+                if status not in {"auth_required", "cooldown", "recovering", "error"}:
+                    status = "waiting"
+                    next_run = min(next_run, now_epoch + 0.5) if next_run > now_epoch else now_epoch + 0.5
+            elif status not in {"auth_required", "cooldown", "recovering", "error"}:
                 status = "idle"
                 next_run = max(next_run, now_epoch + self.sleep_seconds)
             cursor = db.execute(
@@ -439,13 +457,20 @@ class TelemetryEngine:
             "ok": True,
             "subscription_id": subscription_id,
             "released": cursor.rowcount > 0,
+            "command_window_preserved": command_active,
             "session_preserved": self._has_session(subscription_id),
         }
 
     def boost(self, subscription_id: str, seconds: int = 900, profile: str = "background") -> dict[str, Any]:
         subscription_id = str(subscription_id or "").strip()[:190]
-        profile = "interactive" if str(profile or "").strip().lower() == "interactive" else "background"
-        seconds = max(60 if profile == "interactive" else 300, min(3600, int(seconds)))
+        requested_profile = str(profile or "").strip().lower()
+        profile = requested_profile if requested_profile in {"background", "interactive", "command"} else "background"
+        if profile == "command":
+            seconds = max(30, min(90, int(seconds)))
+        elif profile == "interactive":
+            seconds = max(60, min(3600, int(seconds)))
+        else:
+            seconds = max(300, min(3600, int(seconds)))
         now_epoch = time.time()
         now_iso = utc_iso()
         with self.lock, self._db() as db:
@@ -469,12 +494,15 @@ class TelemetryEngine:
             current_next = float(row["next_run_at"] or 0)
             current_status = str(row["status"] or "").strip().lower()
             protected_wait = current_status in {"recovering", "error", "cooldown", "auth_required"} and current_next > now_epoch
-            requested_next = now_epoch + 0.5
+            requested_next = now_epoch + 0.35
             next_run = current_next if protected_wait else (min(current_next, requested_next) if current_next > now_epoch else requested_next)
+            interactive_until = now_epoch + seconds if profile in {"interactive", "command"} else 0.0
+            command_until = now_epoch + seconds if profile == "command" else 0.0
             if protected_wait:
                 cursor = db.execute(
-                    "UPDATE subscriptions SET active_until=MAX(active_until,?),interactive_until=MAX(interactive_until,?),last_presence_at=?,updated_at=? WHERE subscription_id=? AND enabled=1",
-                    (now_epoch + seconds, now_epoch + seconds if profile == "interactive" else 0, now_iso, now_iso, subscription_id),
+                    "UPDATE subscriptions SET active_until=MAX(active_until,?),interactive_until=MAX(interactive_until,?),"
+                    "command_until=MAX(command_until,?),last_presence_at=?,updated_at=? WHERE subscription_id=? AND enabled=1",
+                    (now_epoch + seconds, interactive_until, command_until, now_iso, now_iso, subscription_id),
                 )
                 return {
                     "ok": True,
@@ -483,12 +511,19 @@ class TelemetryEngine:
                     "protected_wait": True,
                     "retry_after_seconds": max(1, int(current_next - now_epoch)),
                 }
-            if profile == "interactive":
+            if profile == "command":
+                cursor = db.execute(
+                    "UPDATE subscriptions SET status='waiting', next_run_at=?, active_until=MAX(active_until, ?), "
+                    "interactive_until=MAX(interactive_until, ?), command_until=MAX(command_until, ?), "
+                    "last_presence_at=?, last_error=NULL, updated_at=? WHERE subscription_id=? AND enabled=1",
+                    (next_run, now_epoch + seconds, interactive_until, command_until, now_iso, now_iso, subscription_id),
+                )
+            elif profile == "interactive":
                 cursor = db.execute(
                     "UPDATE subscriptions SET status='waiting', next_run_at=?, active_until=MAX(active_until, ?), "
                     "interactive_until=MAX(interactive_until, ?), last_presence_at=?, last_error=NULL, updated_at=? "
                     "WHERE subscription_id=? AND enabled=1",
-                    (next_run, now_epoch + seconds, now_epoch + seconds, now_iso, now_iso, subscription_id),
+                    (next_run, now_epoch + seconds, interactive_until, now_iso, now_iso, subscription_id),
                 )
             else:
                 cursor = db.execute(
@@ -502,7 +537,9 @@ class TelemetryEngine:
             "subscription_id": subscription_id,
             "boost_seconds": seconds,
             "profile": profile,
-            "interactive": profile == "interactive",
+            "interactive": profile in {"interactive", "command"},
+            "command_confirmation": profile == "command",
+            "poll_seconds": self.command_seconds if profile == "command" else self.interactive_seconds,
         }
 
     def status(self) -> dict[str, Any]:
@@ -511,8 +548,9 @@ class TelemetryEngine:
                 "SELECT COUNT(*) subscriptions, SUM(CASE WHEN enabled=1 THEN 1 ELSE 0 END) enabled, "
                 "SUM(CASE WHEN status IN ('error','auth_required') THEN 1 ELSE 0 END) errors, "
                 "SUM(CASE WHEN enabled=1 AND active_until>? THEN 1 ELSE 0 END) active_windows, "
-                "SUM(CASE WHEN enabled=1 AND interactive_until>? THEN 1 ELSE 0 END) interactive_windows FROM subscriptions",
-                (time.time(), time.time()),
+                "SUM(CASE WHEN enabled=1 AND interactive_until>? THEN 1 ELSE 0 END) interactive_windows, "
+                "SUM(CASE WHEN enabled=1 AND command_until>? THEN 1 ELSE 0 END) command_windows FROM subscriptions",
+                (time.time(), time.time(), time.time()),
             ).fetchone()
             queue = db.execute(
                 "SELECT COALESCE(SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END),0) pending, "
@@ -521,7 +559,7 @@ class TelemetryEngine:
             ).fetchone()
             recent = [dict(row) for row in db.execute(
                 "SELECT subscription_id, environment, account_id, status, last_run_at, last_success_at, last_delivery_at, "
-                "last_error, last_state, next_run_at, active_until, interactive_until, last_presence_at, auth_required, cooldown_until "
+                "last_error, last_state, next_run_at, active_until, interactive_until, command_until, last_presence_at, auth_required, cooldown_until "
                 "FROM subscriptions ORDER BY updated_at DESC LIMIT 20"
             ).fetchall()]
             dedupe = db.execute(
@@ -535,6 +573,7 @@ class TelemetryEngine:
             item["next_run_in_seconds"] = max(0, int(float(item.pop("next_run_at") or 0) - now_epoch))
             item["active_for_seconds"] = max(0, int(float(item.pop("active_until") or 0) - now_epoch))
             item["interactive_for_seconds"] = max(0, int(float(item.pop("interactive_until") or 0) - now_epoch))
+            item["command_for_seconds"] = max(0, int(float(item.pop("command_until") or 0) - now_epoch))
             item["cooldown_seconds"] = max(0, int(float(item.pop("cooldown_until") or 0) - now_epoch))
             item["session_reused"] = self._has_session(str(item.get("subscription_id") or ""))
             if item.get("last_error"):
@@ -545,6 +584,7 @@ class TelemetryEngine:
             "enabled_subscriptions": int(totals["enabled"] or 0),
             "active_windows": int(totals["active_windows"] or 0),
             "interactive_windows": int(totals["interactive_windows"] or 0),
+            "command_windows": int(totals["command_windows"] or 0),
             "subscription_errors": int(totals["errors"] or 0),
             "pending_events": int(queue["pending"] or 0),
             "delivered_events": int(queue["delivered"] or 0),
@@ -555,6 +595,7 @@ class TelemetryEngine:
             "profiles": {
                 "driving_seconds": self.active_seconds,
                 "interactive_seconds": self.interactive_seconds,
+                "command_seconds": self.command_seconds,
                 "charging_seconds": self.charging_seconds,
                 "charge_watch_seconds": self.charge_watch_seconds,
                 "parked_seconds": self.parked_seconds,
@@ -602,11 +643,13 @@ class TelemetryEngine:
         now_epoch = time.time()
         active_until = float(subscription["active_until"] or 0)
         interactive = float(subscription["interactive_until"] or 0) > now_epoch
+        command_mode = float(subscription["command_until"] or 0) > now_epoch
+        fast_mode = interactive or command_mode
         if active_until <= now_epoch:
             self._close_session(sid)
             with self.lock, self._db() as db:
                 db.execute(
-                    "UPDATE subscriptions SET status='idle', next_run_at=?, interactive_until=0, last_error=NULL, updated_at=? WHERE subscription_id=?",
+                    "UPDATE subscriptions SET status='idle', next_run_at=?, interactive_until=0, command_until=0, last_error=NULL, updated_at=? WHERE subscription_id=?",
                     (now_epoch + self.sleep_seconds, utc_iso(), sid),
                 )
             return
@@ -679,7 +722,7 @@ class TelemetryEngine:
                 now = utc_iso()
                 with self.lock, self._db() as db:
                     db.execute(
-                        "UPDATE subscriptions SET status='cooldown', cooldown_until=?, active_until=0, interactive_until=0, next_run_at=?, last_run_at=?, last_error=?, consecutive_failures=consecutive_failures+1, updated_at=? WHERE subscription_id=?",
+                        "UPDATE subscriptions SET status='cooldown', cooldown_until=?, active_until=0, interactive_until=0, command_until=0, next_run_at=?, last_run_at=?, last_error=?, consecutive_failures=consecutive_failures+1, updated_at=? WHERE subscription_id=?",
                         (time.time() + delay, time.time() + delay, now, message[:500], now, sid),
                     )
                 LOG.warning("Proteção contra limite ativada para %s por %ss: %s", sid, delay, message)
@@ -698,7 +741,7 @@ class TelemetryEngine:
                     schedule = (120, 300, 900, 1800, 3600, 10800)
                     delay = schedule[min(max(1, failures) - 1, len(schedule) - 1)]
                 else:
-                    delay = self._transient_backoff(failures, interactive)
+                    delay = self._transient_backoff(failures, fast_mode)
                 self._reschedule(sid, delay, "recovering", message, failed=True)
                 if failures >= 3:
                     LOG.warning("Sessão Leapmotor de %s será refeita após %ss por falhas temporárias repetidas: %s", sid, delay, message)
@@ -730,14 +773,19 @@ class TelemetryEngine:
             source_at = str(telemetry.get("captured_at") or utc_iso())
             state = self._state_of(telemetry)
             states.append(state)
-            queued = self._queue_event(subscription, vehicle, source_at, state, interactive=interactive)
+            queued = self._queue_event(subscription, vehicle, source_at, state, interactive=fast_mode)
             if queued.get("queued"):
                 queued_events += 1
             else:
                 skipped_events += 1
 
         previous_state = str(subscription["last_state"] or "")
-        interval, aggregate_state, parked_streak = self._adaptive_interval(states, int(subscription["parked_streak"] or 0), interactive=interactive)
+        interval, aggregate_state, parked_streak = self._adaptive_interval(
+            states,
+            int(subscription["parked_streak"] or 0),
+            interactive=interactive,
+            command_mode=command_mode,
+        )
         jitter = random.uniform(0, min(4.0, max(0.5, interval * 0.04)))
         now = utc_iso()
         next_run = time.time() + interval + jitter
@@ -892,7 +940,7 @@ class TelemetryEngine:
         now = utc_iso()
         with self.lock, self._db() as db:
             db.execute(
-                "UPDATE subscriptions SET status='auth_required', auth_required=1, active_until=0, interactive_until=0, next_run_at=?, last_run_at=?, last_error=?, consecutive_failures=consecutive_failures+1, updated_at=? WHERE subscription_id=?",
+                "UPDATE subscriptions SET status='auth_required', auth_required=1, active_until=0, interactive_until=0, command_until=0, next_run_at=?, last_run_at=?, last_error=?, consecutive_failures=consecutive_failures+1, updated_at=? WHERE subscription_id=?",
                 (time.time() + 86400, now, str(message or "")[:500], now, subscription_id),
             )
 
@@ -923,7 +971,26 @@ class TelemetryEngine:
             return "parked"
         return "sleep"
 
-    def _adaptive_interval(self, states: list[str], previous_parked_streak: int, interactive: bool = False) -> tuple[int, str, int]:
+    def _adaptive_interval(
+        self,
+        states: list[str],
+        previous_parked_streak: int,
+        interactive: bool = False,
+        command_mode: bool = False,
+    ) -> tuple[int, str, int]:
+        if command_mode:
+            if "driving" in states:
+                aggregate = "driving"
+            elif "charging" in states:
+                aggregate = "charging"
+            elif "charge_watch" in states:
+                aggregate = "charge_watch"
+            elif "parked" in states:
+                aggregate = "parked"
+            else:
+                aggregate = "sleep"
+            streak = 0 if aggregate in {"driving", "charging"} else previous_parked_streak + 1
+            return self.command_seconds, aggregate, streak
         if interactive:
             if "driving" in states:
                 return min(self.active_seconds, self.interactive_seconds), "driving", 0
@@ -1204,7 +1271,7 @@ class TelemetryEngine:
             if expired_sessions:
                 placeholders = ",".join("?" for _ in expired_sessions)
                 db.execute(
-                    f"UPDATE subscriptions SET status='idle', interactive_until=0, last_error=NULL, updated_at=? WHERE subscription_id IN ({placeholders})",
+                    f"UPDATE subscriptions SET status='idle', interactive_until=0, command_until=0, last_error=NULL, updated_at=? WHERE subscription_id IN ({placeholders})",
                     (utc_iso(), *expired_sessions),
                 )
             db.execute("DELETE FROM events WHERE status='delivered' AND delivered_at<?", (cutoff_iso,))

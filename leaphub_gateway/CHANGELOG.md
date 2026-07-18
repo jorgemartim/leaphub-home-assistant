@@ -1,3 +1,13 @@
+## 1.11.77
+
+- Comandos remotos tentam acordar o veículo antes da execução quando a biblioteca instalada oferece essa função.
+- O próprio comando continua sendo enviado quando não existe um método de despertar separado, porque a nuvem pode acordar e executar na mesma chamada.
+- Repete apenas respostas explícitas de veículo dormindo, offline ou ainda não pronto; timeouts ambíguos não são repetidos para evitar comandos duplicados.
+- Cria uma janela de confirmação de 90 segundos com leitura a cada 3 segundos após um comando remoto.
+- Corrige o repasse das opções de janela interativa, presença e confirmação de comando ao processo de telemetria.
+- A janela de confirmação continua ativa mesmo quando o usuário fecha ou troca de tela.
+- Mantém os intervalos adaptativos normais fora dessa janela para reduzir risco de limitação da conta.
+
 ## Hotfix de sessão e OCPP 1.11.75
 
 - Corrige status OCPP e reduz recriações de sessão durante navegação.
