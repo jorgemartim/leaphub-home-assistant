@@ -23,7 +23,7 @@ from cryptography.fernet import Fernet, InvalidToken
 import leaphub_connector as connector
 
 LOG = logging.getLogger("leaphub.telemetry")
-ENGINE_VERSION = "1.11.79"
+ENGINE_VERSION = "1.11.80"
 
 
 def utc_iso() -> str:
@@ -62,6 +62,10 @@ def semantic_snapshot(value: Any, parent_key: str = "") -> Any:
     if isinstance(value, list):
         return [semantic_snapshot(item, parent_key) for item in value]
     return value
+
+
+class TelemetryYieldForManual(RuntimeError):
+    """A coleta automática cedeu a conta para uma operação manual."""
 
 
 class TelemetryEngine:
@@ -801,8 +805,23 @@ class TelemetryEngine:
                     failed=False,
                 )
                 return
+        manual_should_yield = (
+            (lambda: bool(self.manual_pending_provider and self.manual_pending_provider(environment, operation_payload)))
+            if self.manual_pending_provider is not None
+            else None
+        )
         try:
-            result = self._collect_with_session(sid, credentials, vehicle_ids, command_mode=command_mode)
+            result = self._collect_with_session(
+                sid,
+                credentials,
+                vehicle_ids,
+                command_mode=command_mode,
+                manual_should_yield=manual_should_yield,
+            )
+        except TelemetryYieldForManual:
+            self._reschedule(sid, 2, "waiting", "Telemetria cedeu a conta para o comando do usuário.", failed=False)
+            LOG.info("Telemetria de %s interrompida em ponto seguro para priorizar comando manual.", sid)
+            return
         except Exception as exc:  # noqa: BLE001
             message = connector.clean_message(str(exc))
             failures = int(subscription["consecutive_failures"] or 0) + 1
@@ -828,10 +847,12 @@ class TelemetryEngine:
                     "please try again later",
                 ))
                 if verification_challenge:
-                    # Esta resposta pode ser uma proteção da nuvem contra
-                    # consultas frequentes. O backoff é mais conservador para
-                    # evitar insistência e possível bloqueio da conta.
-                    schedule = (120, 300, 900, 1800, 3600, 10800)
+                    # Logo após um comando a nuvem pode invalidar o token usado
+                    # na leitura anterior. Em janela de confirmação, encerra a
+                    # sessão e tenta uma única reconexão moderada antes de adotar
+                    # o backoff conservador normal.
+                    self._close_session(sid)
+                    schedule = (30, 60, 180, 600, 1800, 3600) if command_mode else (120, 300, 900, 1800, 3600, 10800)
                     delay = schedule[min(max(1, failures) - 1, len(schedule) - 1)]
                 else:
                     delay = self._transient_backoff(failures, fast_mode)
@@ -953,12 +974,19 @@ class TelemetryEngine:
         credentials: dict[str, Any],
         vehicle_ids: set[str],
         command_mode: bool = False,
+        manual_should_yield: Callable[[], bool] | None = None,
     ) -> dict[str, Any]:
         # Somente a sessão desta conta fica bloqueada durante a chamada de rede.
         # Outras contas respeitam o limite global do Connector, mas não ficam
         # paradas atrás de uma autenticação lenta ou de um veículo offline.
         with self._session_operation_lock(subscription_id):
-            return self._collect_with_session_locked(subscription_id, credentials, vehicle_ids, command_mode=command_mode)
+            return self._collect_with_session_locked(
+                subscription_id,
+                credentials,
+                vehicle_ids,
+                command_mode=command_mode,
+                manual_should_yield=manual_should_yield,
+            )
 
     def _collect_with_session_locked(
         self,
@@ -966,6 +994,7 @@ class TelemetryEngine:
         credentials: dict[str, Any],
         vehicle_ids: set[str],
         command_mode: bool = False,
+        manual_should_yield: Callable[[], bool] | None = None,
     ) -> dict[str, Any]:
         now_epoch = time.time()
         credential_hash = hashlib.sha256(canonical_json(credentials)).hexdigest()
@@ -983,7 +1012,7 @@ class TelemetryEngine:
             temp_dir = connector.secure_temp_directory()
             client = None
             try:
-                client = connector.create_client(credentials, temp_dir, None)
+                client = connector.create_client(credentials, temp_dir, None, request_timeout_seconds=20)
                 # Uma única tentativa de login. Falhas nunca geram uma sequência
                 # imediata de novas autenticações.
                 client.login()
@@ -1010,6 +1039,8 @@ class TelemetryEngine:
         try:
             vehicles_value = client.get_vehicle_list()
             vehicles = vehicles_value if isinstance(vehicles_value, list) else list(vehicles_value or [])
+            if manual_should_yield is not None and manual_should_yield():
+                raise TelemetryYieldForManual("Operação manual aguardando a conta.")
             selected = vehicles
             if vehicle_ids:
                 selected = [
@@ -1019,21 +1050,26 @@ class TelemetryEngine:
             messages: list[Any] = []
             get_messages = getattr(client, "get_message_list", None)
             if not command_mode and callable(get_messages):
+                if manual_should_yield is not None and manual_should_yield():
+                    raise TelemetryYieldForManual("Operação manual aguardando a conta.")
                 try:
                     message_page = get_messages(page_no=1, page_size=100)
                     messages = list(connector.attribute(message_page, "messages", []) or [])
                 except Exception:
                     messages = []
-            serialized = [
-                connector.serialize_vehicle(
-                    item,
-                    include_status=True,
-                    client=client,
-                    messages=messages,
-                    allow_unscoped_messages=len(selected) == 1,
+            serialized: list[dict[str, Any]] = []
+            for item in selected:
+                if manual_should_yield is not None and manual_should_yield():
+                    raise TelemetryYieldForManual("Operação manual aguardando a conta.")
+                serialized.append(
+                    connector.serialize_vehicle(
+                        item,
+                        include_status=True,
+                        client=client,
+                        messages=messages,
+                        allow_unscoped_messages=len(selected) == 1,
+                    )
                 )
-                for item in selected
-            ]
             if not serialized:
                 raise RuntimeError("Nenhum veículo foi encontrado para esta conta.")
             session["last_used_at"] = time.time()
@@ -1045,6 +1081,9 @@ class TelemetryEngine:
                 "library_version": connector.package_version(),
                 "session_reused": True,
             }
+        except TelemetryYieldForManual:
+            session["last_used_at"] = time.time()
+            raise
         except Exception as exc:
             if connector.is_transient_cloud_error(exc) or isinstance(exc, connector.ConnectorTemporaryError):
                 # Um timeout de transporte não prova que o token morreu. A

@@ -1,3 +1,12 @@
+## 1.11.80
+
+- Trata perda de token somente na consulta do resultado como comando já aceito, sem reenviar a ação.
+- Aguarda a estabilização da sessão antes de retomar telemetria após comandos remotos.
+- Telemetria cede a conta em pontos seguros quando existe comando manual aguardando.
+- Reduz o timeout das leituras automáticas e amplia a espera do comando manual.
+- Remove VIN e valores criptográficos dos logs e higieniza registros antigos.
+- Adiciona diário persistente por identificador de solicitação para impedir repetição após perda da resposta HTTP.
+
 ## 1.11.79
 
 - Corrige comandos remotos que recebiam `car_id` no lugar do VIN e terminavam em HTTP 422.

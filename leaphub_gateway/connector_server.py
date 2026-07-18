@@ -31,7 +31,7 @@ except ModuleNotFoundError as exc:
         "Módulo interno leaphub_connector ausente na imagem. Atualize o Leap Hub Gateway."
     ) from exc
 
-VERSION = "1.11.79"
+VERSION = "1.11.80"
 SERVICE = "Leap Hub Leapmotor Connector"
 MAX_BODY = 1024 * 1024
 WINDOW_SECONDS = 180
@@ -39,10 +39,12 @@ STARTED_AT = time.time()
 NONCES: dict[str, float] = {}
 NONCE_LOCK = threading.Lock()
 NONCE_DB_PATH = Path(os.getenv("LEAPHUB_NONCE_DB_PATH", "/data/security/connector-nonces.sqlite"))
+COMMAND_DB_PATH = Path(os.getenv("LEAPHUB_COMMAND_DB_PATH", "/data/security/connector-commands.sqlite"))
 ACCOUNT_LOCKS: dict[str, threading.Lock] = {}
 ACCOUNT_LOCK_LAST_USED: dict[str, float] = {}
 ACCOUNT_LOCKS_GUARD = threading.Lock()
 MANUAL_PENDING: dict[str, int] = {}
+MANUAL_DEFER_UNTIL: dict[str, float] = {}
 MANUAL_PENDING_GUARD = threading.Lock()
 OPTIONS_PATH = Path(os.getenv("LEAPHUB_OPTIONS_PATH", "/data/options.json"))
 
@@ -62,15 +64,135 @@ SECRETS = {
 }
 MAX_PARALLEL = max(1, min(8, int(OPTIONS.get("connector_max_parallel") or OPTIONS.get("max_parallel_requests") or 2)))
 SEMAPHORE = threading.BoundedSemaphore(MAX_PARALLEL)
-MANUAL_WAIT_SECONDS = max(2, min(60, int(OPTIONS.get("connector_manual_wait_seconds") or OPTIONS.get("manual_wait_seconds") or 20)))
+MANUAL_WAIT_SECONDS = max(2, min(60, int(OPTIONS.get("connector_manual_wait_seconds") or OPTIONS.get("manual_wait_seconds") or 35)))
 LOG_LEVEL = str(OPTIONS.get("log_level") or "INFO").upper()
 logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO), format="%(asctime)s %(levelname)s %(message)s")
 LOG = logging.getLogger("leaphub.connector")
+logging.getLogger("leapmotor_api").setLevel(logging.WARNING)
 TELEMETRY: TelemetryEngine
 
 
 def json_bytes(payload: dict[str, Any]) -> bytes:
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"), default=connector.json_default).encode("utf-8")
+
+
+def request_identifier(payload: dict[str, Any]) -> str:
+    value = str(payload.get("request_id") or "").strip().lower()
+    return value if re.fullmatch(r"[a-z0-9][a-z0-9._:-]{15,95}", value) else ""
+
+
+def command_payload_hash(payload: dict[str, Any]) -> str:
+    safe = {
+        "account_id": int(payload.get("account_id") or 0),
+        "vehicle_id": str(payload.get("vehicle_id") or "")[:190],
+        "vehicle_vin": str(payload.get("vehicle_vin") or "")[:40],
+        "command": str(payload.get("command") or "")[:80],
+        "parameters": payload.get("parameters") if isinstance(payload.get("parameters"), dict) else {},
+    }
+    raw = json.dumps(safe, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=connector.json_default)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def command_db() -> sqlite3.Connection:
+    COMMAND_DB_PATH.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    db = sqlite3.connect(COMMAND_DB_PATH, timeout=5.0)
+    db.row_factory = sqlite3.Row
+    db.execute("PRAGMA busy_timeout = 5000")
+    db.execute("PRAGMA journal_mode = WAL")
+    db.execute(
+        "CREATE TABLE IF NOT EXISTS command_requests ("
+        "request_hash TEXT PRIMARY KEY,payload_hash TEXT NOT NULL,status TEXT NOT NULL,"
+        "response_json TEXT NULL,created_at REAL NOT NULL,updated_at REAL NOT NULL,expires_at REAL NOT NULL)"
+    )
+    try:
+        os.chmod(COMMAND_DB_PATH, 0o600)
+    except OSError:
+        pass
+    return db
+
+
+def command_journal_begin(environment: str, payload: dict[str, Any]) -> tuple[str | None, dict[str, Any] | None]:
+    request_id = request_identifier(payload)
+    if not request_id:
+        return None, None
+    now = time.time()
+    request_hash = hashlib.sha256(f"{environment}|{request_id}".encode("utf-8")).hexdigest()
+    payload_hash = command_payload_hash(payload)
+    try:
+        with command_db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute("DELETE FROM command_requests WHERE expires_at<?", (now,))
+            row = db.execute(
+                "SELECT payload_hash,status,response_json,updated_at FROM command_requests WHERE request_hash=?",
+                (request_hash,),
+            ).fetchone()
+            if row is not None:
+                if not hmac.compare_digest(str(row["payload_hash"]), payload_hash):
+                    raise ValueError("O identificador da solicitação já pertence a outro comando.")
+                response_raw = str(row["response_json"] or "")
+                if response_raw:
+                    try:
+                        response = json.loads(response_raw)
+                    except (ValueError, TypeError, json.JSONDecodeError):
+                        response = {}
+                    if isinstance(response, dict):
+                        response["duplicate"] = True
+                        response["request_id"] = request_id
+                        db.commit()
+                        return None, response
+                if str(row["status"]) == "running" and now - float(row["updated_at"] or 0) < 150:
+                    db.commit()
+                    return None, {
+                        "ok": True,
+                        "accepted": True,
+                        "confirmation_pending": True,
+                        "duplicate": True,
+                        "request_id": request_id,
+                        "message": "O Gateway já recebeu este comando e ainda está processando a confirmação.",
+                        "connector_version": connector.CONNECTOR_VERSION,
+                    }
+                db.execute(
+                    "UPDATE command_requests SET status='running',response_json=NULL,updated_at=?,expires_at=? WHERE request_hash=?",
+                    (now, now + 900, request_hash),
+                )
+            else:
+                db.execute(
+                    "INSERT INTO command_requests(request_hash,payload_hash,status,response_json,created_at,updated_at,expires_at) VALUES(?,?, 'running',NULL,?,?,?)",
+                    (request_hash, payload_hash, now, now, now + 900),
+                )
+            db.commit()
+        return request_hash, None
+    except (OSError, sqlite3.Error) as exc:
+        LOG.warning("Diário de comandos indisponível; usando a proteção do Leap Hub: %s", exc)
+        return None, None
+
+
+def command_journal_finish(request_hash: str | None, request_id: str, response: dict[str, Any]) -> None:
+    if not request_hash:
+        return
+    safe = dict(response)
+    safe["request_id"] = request_id
+    raw = json.dumps(safe, ensure_ascii=False, separators=(",", ":"), default=connector.json_default)
+    try:
+        with command_db() as db:
+            db.execute(
+                "UPDATE command_requests SET status='accepted',response_json=?,updated_at=?,expires_at=? WHERE request_hash=?",
+                (raw[:16000], time.time(), time.time() + 900, request_hash),
+            )
+            db.commit()
+    except (OSError, sqlite3.Error) as exc:
+        LOG.warning("Não foi possível concluir o diário de comandos: %s", exc)
+
+
+def command_journal_abort(request_hash: str | None) -> None:
+    if not request_hash:
+        return
+    try:
+        with command_db() as db:
+            db.execute("DELETE FROM command_requests WHERE request_hash=?", (request_hash,))
+            db.commit()
+    except (OSError, sqlite3.Error):
+        pass
 
 
 def cleanup_nonces(now: float) -> None:
@@ -178,10 +300,21 @@ def manual_operation_leave(key: str) -> None:
             MANUAL_PENDING.pop(key, None)
 
 
+def manual_operation_defer(key: str, seconds: int = 12) -> None:
+    if not key:
+        return
+    with MANUAL_PENDING_GUARD:
+        MANUAL_DEFER_UNTIL[key] = max(MANUAL_DEFER_UNTIL.get(key, 0.0), time.time() + max(2, min(45, int(seconds))))
+
+
 def manual_operation_pending(environment: str, payload: dict[str, Any]) -> bool:
     key = account_operation_key(environment, payload)
+    now = time.time()
     with MANUAL_PENDING_GUARD:
-        return MANUAL_PENDING.get(key, 0) > 0
+        expired = [item for item, until in MANUAL_DEFER_UNTIL.items() if until <= now]
+        for item in expired:
+            MANUAL_DEFER_UNTIL.pop(item, None)
+        return MANUAL_PENDING.get(key, 0) > 0 or MANUAL_DEFER_UNTIL.get(key, 0.0) > now
 
 
 # A telemetria e as operações manuais usam o mesmo lock por conta. Isso impede
@@ -231,9 +364,13 @@ class Handler(BaseHTTPRequestHandler):
 
     def log_message(self, fmt: str, *args: Any) -> None:
         line = fmt % args
-        if self.client_address[0] in {"127.0.0.1", "::1"} and 'GET /health ' in line and line.endswith(' 200 -'):
-            LOG.debug("local healthcheck")
-            return
+        if self.client_address[0] in {"127.0.0.1", "::1"}:
+            if 'GET /health ' in line and line.endswith(' 200 -'):
+                LOG.debug("local healthcheck")
+                return
+            if 'POST /v1/telemetry/subscriptions/boost ' in line and line.endswith(' 200 -'):
+                LOG.debug("local telemetry boost")
+                return
         LOG.info("%s - %s", self.address_string(), line)
 
     def send_json(self, status: int, payload: dict[str, Any]) -> None:
@@ -245,6 +382,9 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("X-Robots-Tag", "noindex, nofollow, noarchive")
         self.send_header("Referrer-Policy", "no-referrer")
+        retry_after = int(payload.get("retry_after_seconds") or 0) if isinstance(payload, dict) else 0
+        if retry_after > 0:
+            self.send_header("Retry-After", str(min(86400, retry_after)))
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -294,6 +434,9 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
             self.send_json(400, {"ok": False, "message": "Payload inválido."})
             return
+
+        request_id = request_identifier(payload)
+        command_journal_key: str | None = None
 
         try:
             if self.path in {"/v1/telemetry/subscriptions/boost", "/v1/telemetry/subscriptions/release"}:
@@ -346,8 +489,24 @@ class Handler(BaseHTTPRequestHandler):
                     # Feche a sessão automática antes do login manual. Fazer isso
                     # depois mantinha dois tokens sobrepostos e a nuvem podia
                     # responder "Information verification failed".
+                    command_journal_key, replay = command_journal_begin(environment, payload)
+                    if replay is not None:
+                        self.send_json(200, replay)
+                        return
                     TELEMETRY.invalidate_account_session(environment, payload)
-                    result = connector.handle_command(payload)
+                    try:
+                        result = connector.handle_command(payload)
+                        if request_id:
+                            result["request_id"] = request_id
+                        command_journal_finish(command_journal_key, request_id, result)
+                    except Exception:
+                        command_journal_abort(command_journal_key)
+                        raise
+                    finally:
+                        # A nuvem frequentemente invalida o token de leitura logo
+                        # após uma operação remota. Aguarde a estabilização antes
+                        # de criar a próxima sessão automática.
+                        manual_operation_defer(pending_key, 12)
                 self.send_json(200, result)
             finally:
                 if account_acquired and account_lock is not None:

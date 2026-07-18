@@ -11,6 +11,7 @@ import base64
 import hashlib
 import io
 import json
+import logging
 import os
 import re
 import shutil
@@ -26,8 +27,9 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-CONNECTOR_VERSION = "1.11.79"
+CONNECTOR_VERSION = "1.11.80"
 MAX_INPUT_BYTES = 1024 * 1024
+logging.getLogger("leapmotor_api").setLevel(logging.WARNING)
 
 COMMAND_METHODS: dict[str, str] = {
     "lock": "lock_vehicle",
@@ -74,7 +76,11 @@ def clean_message(message: str) -> str:
     for marker in ("-----BEGIN", "-----END"):
         if marker in text:
             return "Falha de autenticação ou certificado inválido."
-    # Nunca exponha VIN completo nos logs ou respostas do conector.
+    # Nunca exponha VIN, tokens ou valores criptográficos de comando.
+    text = re.sub(r"(?i)(operatePassword|operation_password|password|token|authorization)=([^&\s]+)", r"\1=[protegido]", text)
+    text = re.sub(r'(?i)("(?:operatePassword|operation_password|password|token|authorization)"\s*:\s*")[^"]+("?)', r'\1[protegido]\2', text)
+    text = re.sub(r"(?i)(vin)=([^&\s]+)", r"\1=[VIN protegido]", text)
+    text = re.sub(r'(?i)("vin"\s*:\s*")[^"]+("?)', r'\1[VIN protegido]\2', text)
     text = re.sub(r"\b[A-HJ-NPR-Z0-9]{17}\b", "[VIN protegido]", text, flags=re.IGNORECASE)
     return text[:900] or "Falha desconhecida no conector."
 
@@ -2065,7 +2071,7 @@ def serialize_vehicle(
     return result
 
 
-def create_client(credentials: dict[str, Any], temp_dir: Path, operation_password: str | None = None) -> Any:
+def create_client(credentials: dict[str, Any], temp_dir: Path, operation_password: str | None = None, request_timeout_seconds: int = 35) -> Any:
     try:
         from leapmotor_api import LeapmotorApiClient
     except ImportError as exc:
@@ -2104,7 +2110,7 @@ def create_client(credentials: dict[str, Any], temp_dir: Path, operation_passwor
         app_cert_path=cert_path,
         app_key_path=key_path,
         operation_password=operation_password,
-        timeout=35,
+        timeout=max(12, min(45, int(request_timeout_seconds))),
         verify_ssl=strict_tls,
         language="en-GB",
     )
@@ -2214,6 +2220,21 @@ def is_remote_command_confirmation_timeout(value: Any) -> bool:
     """
     message = clean_message(str(value)).lower()
     return "timed out waiting for remote control result" in message
+
+
+def is_remote_command_result_session_error(value: Any) -> bool:
+    """The write endpoint accepted the command, but result polling lost its token.
+
+    This is not a safe reason to resend the command because the cloud already
+    returned a remoteCtlId. The telemetry window must confirm the final state.
+    """
+    message = clean_message(str(value)).lower()
+    return any(marker in message for marker in (
+        "remote control result failed: token is invalid",
+        "remote control result failed: invalid token",
+        "remote control result failed: token expired",
+        "remote control result failed: session expired",
+    ))
 
 
 def try_wake_vehicle(client: Any, vehicle_id: str) -> dict[str, Any]:
@@ -2356,6 +2377,7 @@ def handle_command(payload: dict[str, Any]) -> dict[str, Any]:
         attempts = 0
         last_error: Exception | None = None
         confirmation_pending = False
+        confirmation_reason: str | None = None
         for attempt in range(1, 4):
             attempts = attempt
             try:
@@ -2364,16 +2386,25 @@ def handle_command(payload: dict[str, Any]) -> dict[str, Any]:
                 break
             except Exception as exc:  # noqa: BLE001
                 last_error = exc
-                if is_authentication_error(exc):
-                    raise ConnectorAuthenticationError(clean_message(str(exc))) from exc
-                # leapmotor-api only emits this timeout after the write endpoint
-                # accepted the command and returned a remoteCtlId. The final cloud
-                # confirmation can arrive later, so never send the command twice.
-                if is_remote_command_confirmation_timeout(exc):
+                # O endpoint de escrita já aceitou o comando e devolveu remoteCtlId.
+                # Timeout ou perda do token somente na consulta do resultado não
+                # autorizam reenviar a ação, pois isso poderia executá-la duas vezes.
+                if is_remote_command_confirmation_timeout(exc) or is_remote_command_result_session_error(exc):
                     confirmation_pending = True
-                    result = {"accepted": True, "confirmation_pending": True}
+                    confirmation_reason = (
+                        "result_session_refresh"
+                        if is_remote_command_result_session_error(exc)
+                        else "result_timeout"
+                    )
+                    result = {
+                        "accepted": True,
+                        "confirmation_pending": True,
+                        "confirmation_reason": confirmation_reason,
+                    }
                     last_error = None
                     break
+                if is_authentication_error(exc):
+                    raise ConnectorAuthenticationError(clean_message(str(exc))) from exc
                 # Retry only when the cloud explicitly reports sleep/offline/not-ready.
                 # This avoids duplicating a command after an ambiguous generic timeout.
                 if attempt >= 3 or not is_vehicle_sleep_error(exc):
@@ -2402,6 +2433,7 @@ def handle_command(payload: dict[str, Any]) -> dict[str, Any]:
             "attempts": attempts,
             "verification_requested": verification_requested,
             "confirmation_pending": confirmation_pending,
+            "confirmation_reason": confirmation_reason,
             "identifier_source": identifier_source,
         }
     finally:
