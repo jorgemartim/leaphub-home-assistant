@@ -1,3 +1,11 @@
+## 1.11.81
+
+- Comandos remotos entram em fila prioritária e retornam imediatamente ao Leap Hub.
+- Execução continua em segundo plano com trava por conta, idempotência e diário persistente.
+- Novo endpoint protegido permite acompanhar processamento, sucesso ou falha sem reenviar a ação.
+- Telemetria cede a conta enquanto houver comando pendente e retoma após estabilização.
+- Reinício do App não autoriza repetição automática de um comando ainda indefinido.
+
 ## 1.11.80
 
 - Trata perda de token somente na consulta do resultado como comando já aceito, sem reenviar a ação.

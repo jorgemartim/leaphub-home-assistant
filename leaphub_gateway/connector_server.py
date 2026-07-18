@@ -31,7 +31,7 @@ except ModuleNotFoundError as exc:
         "Módulo interno leaphub_connector ausente na imagem. Atualize o Leap Hub Gateway."
     ) from exc
 
-VERSION = "1.11.80"
+VERSION = "1.11.81"
 SERVICE = "Leap Hub Leapmotor Connector"
 MAX_BODY = 1024 * 1024
 WINDOW_SECONDS = 180
@@ -46,6 +46,8 @@ ACCOUNT_LOCKS_GUARD = threading.Lock()
 MANUAL_PENDING: dict[str, int] = {}
 MANUAL_DEFER_UNTIL: dict[str, float] = {}
 MANUAL_PENDING_GUARD = threading.Lock()
+COMMAND_WORKERS: dict[str, threading.Thread] = {}
+COMMAND_WORKERS_GUARD = threading.Lock()
 OPTIONS_PATH = Path(os.getenv("LEAPHUB_OPTIONS_PATH", "/data/options.json"))
 
 
@@ -140,7 +142,7 @@ def command_journal_begin(environment: str, payload: dict[str, Any]) -> tuple[st
                         response["request_id"] = request_id
                         db.commit()
                         return None, response
-                if str(row["status"]) == "running" and now - float(row["updated_at"] or 0) < 150:
+                if str(row["status"]) == "running" and now - float(row["updated_at"] or 0) < 900:
                     db.commit()
                     return None, {
                         "ok": True,
@@ -182,6 +184,141 @@ def command_journal_finish(request_hash: str | None, request_id: str, response: 
             db.commit()
     except (OSError, sqlite3.Error) as exc:
         LOG.warning("Não foi possível concluir o diário de comandos: %s", exc)
+
+
+def command_journal_fail(request_hash: str | None, request_id: str, exc: BaseException) -> None:
+    if not request_hash:
+        return
+    message = connector.clean_message(str(exc))
+    temporary = isinstance(exc, connector.ConnectorTemporaryError) or connector.is_transient_cloud_error(exc)
+    response = {
+        "ok": False,
+        "status": "failed",
+        "temporary": bool(temporary),
+        "retry_after_seconds": 20 if temporary else 0,
+        "request_id": request_id,
+        "message": message or "Não foi possível executar o comando remoto.",
+        "connector_version": connector.CONNECTOR_VERSION,
+    }
+    raw = json.dumps(response, ensure_ascii=False, separators=(",", ":"), default=connector.json_default)
+    try:
+        with command_db() as db:
+            db.execute(
+                "UPDATE command_requests SET status='failed',response_json=?,updated_at=?,expires_at=? WHERE request_hash=?",
+                (raw[:16000], time.time(), time.time() + 900, request_hash),
+            )
+            db.commit()
+    except (OSError, sqlite3.Error) as db_exc:
+        LOG.warning("Não foi possível registrar a falha do comando: %s", db_exc)
+
+
+def command_journal_status(environment: str, payload: dict[str, Any]) -> dict[str, Any]:
+    request_id = request_identifier(payload)
+    if not request_id:
+        raise ValueError("Identificador do comando ausente.")
+    request_hash = hashlib.sha256(f"{environment}|{request_id}".encode("utf-8")).hexdigest()
+    try:
+        with command_db() as db:
+            row = db.execute(
+                "SELECT status,response_json,updated_at,expires_at FROM command_requests WHERE request_hash=?",
+                (request_hash,),
+            ).fetchone()
+    except (OSError, sqlite3.Error) as exc:
+        raise RuntimeError("O diário de comandos está temporariamente indisponível.") from exc
+    if row is None:
+        return {
+            "ok": False,
+            "status": "unknown",
+            "request_id": request_id,
+            "message": "O Gateway ainda não localizou este comando.",
+        }
+    response: dict[str, Any] = {}
+    raw = str(row["response_json"] or "")
+    if raw:
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                response = parsed
+        except (ValueError, TypeError, json.JSONDecodeError):
+            response = {}
+    status = str(row["status"] or "running")
+    response.setdefault("ok", status != "failed")
+    response["status"] = status
+    response["request_id"] = request_id
+    response["updated_at"] = float(row["updated_at"] or 0)
+    if status == "running":
+        response.setdefault("accepted", True)
+        response.setdefault("queued", True)
+        response.setdefault("confirmation_pending", True)
+        response.setdefault("message", "Comando recebido. O Gateway está priorizando a execução.")
+    return response
+
+
+def command_worker_key(environment: str, request_id: str) -> str:
+    return hashlib.sha256(f"{environment}|{request_id}".encode("utf-8")).hexdigest()
+
+
+def run_command_job(
+    environment: str,
+    payload: dict[str, Any],
+    request_hash: str | None,
+    request_id: str,
+    pending_key: str,
+) -> None:
+    acquired = False
+    account_acquired = False
+    account_lock: threading.Lock | None = None
+    worker_key = command_worker_key(environment, request_id)
+    try:
+        acquired = SEMAPHORE.acquire(timeout=max(60, MANUAL_WAIT_SECONDS))
+        if not acquired:
+            raise connector.ConnectorTemporaryError("Conector ocupado. O comando permaneceu protegido e não foi repetido.")
+        account_lock = account_operation_lock(environment, payload)
+        account_acquired = account_lock.acquire(timeout=max(60, MANUAL_WAIT_SECONDS))
+        if not account_acquired:
+            raise connector.ConnectorTemporaryError("A conta ainda finalizava uma leitura anterior. Tente novamente em instantes.")
+        TELEMETRY.invalidate_account_session(environment, payload)
+        result = connector.handle_command(payload)
+        if request_id:
+            result["request_id"] = request_id
+        result["queued"] = False
+        result["status"] = "accepted"
+        command_journal_finish(request_hash, request_id, result)
+        LOG.info("Comando remoto processado em segundo plano para %s.", environment)
+    except BaseException as exc:  # noqa: BLE001
+        command_journal_fail(request_hash, request_id, exc)
+        LOG.warning("Comando remoto em segundo plano falhou (%s): %s", type(exc).__name__, connector.clean_message(str(exc)))
+    finally:
+        manual_operation_defer(pending_key, 15)
+        if account_acquired and account_lock is not None:
+            account_lock.release()
+        if acquired:
+            SEMAPHORE.release()
+        manual_operation_leave(pending_key)
+        with COMMAND_WORKERS_GUARD:
+            COMMAND_WORKERS.pop(worker_key, None)
+
+
+def start_command_job(
+    environment: str, payload: dict[str, Any], request_hash: str | None, request_id: str
+) -> bool:
+    if not request_hash or not request_id:
+        return False
+    worker_key = command_worker_key(environment, request_id)
+    with COMMAND_WORKERS_GUARD:
+        existing = COMMAND_WORKERS.get(worker_key)
+        if existing is not None and existing.is_alive():
+            return True
+        pending_key = manual_operation_enter(environment, payload)
+        worker = threading.Thread(
+            target=run_command_job,
+            args=(environment, dict(payload), request_hash, request_id, pending_key),
+            name=f"leaphub-command-{request_id[:8]}",
+            daemon=True,
+        )
+        COMMAND_WORKERS[worker_key] = worker
+        worker.start()
+    return True
 
 
 def command_journal_abort(request_hash: str | None) -> None:
@@ -411,7 +548,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json(404, {"ok": False, "message": "Página não encontrada."})
 
     def do_POST(self) -> None:
-        if self.path not in {"/v1/accounts/test", "/v1/vehicles/sync", "/v1/vehicles/command", "/v1/telemetry/subscriptions/upsert", "/v1/telemetry/subscriptions/remove", "/v1/telemetry/subscriptions/boost", "/v1/telemetry/subscriptions/release"}:
+        if self.path not in {"/v1/accounts/test", "/v1/vehicles/sync", "/v1/vehicles/command", "/v1/vehicles/command/status", "/v1/telemetry/subscriptions/upsert", "/v1/telemetry/subscriptions/remove", "/v1/telemetry/subscriptions/boost", "/v1/telemetry/subscriptions/release"}:
             self.send_json(404, {"ok": False, "message": "Página não encontrada."})
             return
         try:
@@ -462,6 +599,28 @@ class Handler(BaseHTTPRequestHandler):
                     str(payload.get("subscription_id") or ""),
                 ))
                 return
+            if self.path == "/v1/vehicles/command/status":
+                self.send_json(200, command_journal_status(environment, payload))
+                return
+            if self.path == "/v1/vehicles/command":
+                command_journal_key, replay = command_journal_begin(environment, payload)
+                if replay is not None:
+                    self.send_json(200, replay)
+                    return
+                if command_journal_key is not None and request_id and start_command_job(
+                    environment, payload, command_journal_key, request_id
+                ):
+                    self.send_json(200, {
+                        "ok": True,
+                        "accepted": True,
+                        "queued": True,
+                        "status": "running",
+                        "confirmation_pending": True,
+                        "request_id": request_id,
+                        "message": "Comando recebido. O Gateway está priorizando a execução sem bloquear a tela.",
+                        "connector_version": connector.CONNECTOR_VERSION,
+                    })
+                    return
             pending_key = manual_operation_enter(environment, payload)
             acquired = False
             account_acquired = False
@@ -486,13 +645,13 @@ class Handler(BaseHTTPRequestHandler):
                 elif self.path == "/v1/vehicles/sync":
                     result = connector.handle_account(payload, sync=True)
                 else:
-                    # Feche a sessão automática antes do login manual. Fazer isso
-                    # depois mantinha dois tokens sobrepostos e a nuvem podia
-                    # responder "Information verification failed".
-                    command_journal_key, replay = command_journal_begin(environment, payload)
-                    if replay is not None:
-                        self.send_json(200, replay)
-                        return
+                    # Fallback síncrono para clientes antigos sem request_id.
+                    # Clientes atuais entram na fila protegida e recebem resposta imediata.
+                    if command_journal_key is None:
+                        command_journal_key, replay = command_journal_begin(environment, payload)
+                        if replay is not None:
+                            self.send_json(200, replay)
+                            return
                     TELEMETRY.invalidate_account_session(environment, payload)
                     try:
                         result = connector.handle_command(payload)
