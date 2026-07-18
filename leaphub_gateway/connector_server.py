@@ -31,7 +31,7 @@ except ModuleNotFoundError as exc:
         "Módulo interno leaphub_connector ausente na imagem. Atualize o Leap Hub Gateway."
     ) from exc
 
-VERSION = "1.11.81"
+VERSION = "1.11.82"
 SERVICE = "Leap Hub Leapmotor Connector"
 MAX_BODY = 1024 * 1024
 WINDOW_SECONDS = 180
@@ -142,24 +142,27 @@ def command_journal_begin(environment: str, payload: dict[str, Any]) -> tuple[st
                         response["request_id"] = request_id
                         db.commit()
                         return None, response
-                if str(row["status"]) == "running" and now - float(row["updated_at"] or 0) < 900:
+                active_states = {"queued", "preparing", "waking", "reconnecting", "executing", "running", "confirming"}
+                if str(row["status"] or "") in active_states and now - float(row["updated_at"] or 0) < 900:
                     db.commit()
                     return None, {
                         "ok": True,
                         "accepted": True,
+                        "queued": True,
                         "confirmation_pending": True,
                         "duplicate": True,
                         "request_id": request_id,
-                        "message": "O Gateway já recebeu este comando e ainda está processando a confirmação.",
+                        "status": str(row["status"] or "queued"),
+                        "message": "O Gateway já recebeu este comando. A ação não será enviada novamente.",
                         "connector_version": connector.CONNECTOR_VERSION,
                     }
                 db.execute(
-                    "UPDATE command_requests SET status='running',response_json=NULL,updated_at=?,expires_at=? WHERE request_hash=?",
+                    "UPDATE command_requests SET status='queued',response_json=NULL,updated_at=?,expires_at=? WHERE request_hash=?",
                     (now, now + 900, request_hash),
                 )
             else:
                 db.execute(
-                    "INSERT INTO command_requests(request_hash,payload_hash,status,response_json,created_at,updated_at,expires_at) VALUES(?,?, 'running',NULL,?,?,?)",
+                    "INSERT INTO command_requests(request_hash,payload_hash,status,response_json,created_at,updated_at,expires_at) VALUES(?,?, 'queued',NULL,?,?,?)",
                     (request_hash, payload_hash, now, now, now + 900),
                 )
             db.commit()
@@ -169,17 +172,57 @@ def command_journal_begin(environment: str, payload: dict[str, Any]) -> tuple[st
         return None, None
 
 
+def command_journal_progress(
+    request_hash: str | None,
+    request_id: str,
+    status: str,
+    message: str,
+    extra: dict[str, Any] | None = None,
+) -> None:
+    if not request_hash:
+        return
+    allowed = {"queued", "preparing", "waking", "reconnecting", "executing", "confirming"}
+    status = status if status in allowed else "executing"
+    response: dict[str, Any] = {
+        "ok": True,
+        "accepted": True,
+        "queued": status in {"queued", "preparing"},
+        "confirmation_pending": True,
+        "status": status,
+        "request_id": request_id,
+        "message": connector.clean_message(message),
+        "connector_version": connector.CONNECTOR_VERSION,
+    }
+    if isinstance(extra, dict):
+        for key in ("attempt", "confirmation_pending"):
+            if key in extra:
+                response[key] = extra[key]
+    raw = json.dumps(response, ensure_ascii=False, separators=(",", ":"), default=connector.json_default)
+    try:
+        with command_db() as db:
+            db.execute(
+                "UPDATE command_requests SET status=?,response_json=?,updated_at=?,expires_at=? WHERE request_hash=?",
+                (status, raw[:16000], time.time(), time.time() + 900, request_hash),
+            )
+            db.commit()
+    except (OSError, sqlite3.Error) as exc:
+        LOG.warning("Não foi possível atualizar o andamento do comando: %s", exc)
+
+
 def command_journal_finish(request_hash: str | None, request_id: str, response: dict[str, Any]) -> None:
     if not request_hash:
         return
     safe = dict(response)
     safe["request_id"] = request_id
+    final_status = "confirming" if bool(safe.get("confirmation_pending")) else "accepted"
+    safe["status"] = final_status
+    safe["queued"] = False
     raw = json.dumps(safe, ensure_ascii=False, separators=(",", ":"), default=connector.json_default)
     try:
         with command_db() as db:
             db.execute(
-                "UPDATE command_requests SET status='accepted',response_json=?,updated_at=?,expires_at=? WHERE request_hash=?",
-                (raw[:16000], time.time(), time.time() + 900, request_hash),
+                "UPDATE command_requests SET status=?,response_json=?,updated_at=?,expires_at=? WHERE request_hash=?",
+                (final_status, raw[:16000], time.time(), time.time() + 900, request_hash),
             )
             db.commit()
     except (OSError, sqlite3.Error) as exc:
@@ -195,7 +238,7 @@ def command_journal_fail(request_hash: str | None, request_id: str, exc: BaseExc
         "ok": False,
         "status": "failed",
         "temporary": bool(temporary),
-        "retry_after_seconds": 20 if temporary else 0,
+        "retry_after_seconds": 12 if temporary else 0,
         "request_id": request_id,
         "message": message or "Não foi possível executar o comando remoto.",
         "connector_version": connector.CONNECTOR_VERSION,
@@ -241,16 +284,51 @@ def command_journal_status(environment: str, payload: dict[str, Any]) -> dict[st
                 response = parsed
         except (ValueError, TypeError, json.JSONDecodeError):
             response = {}
-    status = str(row["status"] or "running")
+    status = str(row["status"] or "queued")
+    active_states = {"queued", "preparing", "waking", "reconnecting", "executing", "running"}
+    if status in active_states and time.time() - float(row["updated_at"] or 0) > 120:
+        stale_message = "O Gateway reiniciou ou perdeu o worker antes de concluir este comando. A ação não será repetida automaticamente."
+        stale_response = {
+            "ok": False,
+            "status": "failed",
+            "temporary": True,
+            "retry_after_seconds": 3,
+            "request_id": request_id,
+            "message": stale_message,
+            "connector_version": connector.CONNECTOR_VERSION,
+        }
+        try:
+            with command_db() as db:
+                db.execute(
+                    "UPDATE command_requests SET status='failed',response_json=?,updated_at=?,expires_at=? WHERE request_hash=?",
+                    (json.dumps(stale_response, ensure_ascii=False, separators=(",", ":")), time.time(), time.time() + 900, request_hash),
+                )
+                db.commit()
+        except (OSError, sqlite3.Error):
+            pass
+        return stale_response
     response.setdefault("ok", status != "failed")
     response["status"] = status
     response["request_id"] = request_id
     response["updated_at"] = float(row["updated_at"] or 0)
-    if status == "running":
+    if status in {"queued", "preparing", "waking", "reconnecting", "executing", "running"}:
         response.setdefault("accepted", True)
-        response.setdefault("queued", True)
+        response.setdefault("queued", status in {"queued", "preparing"})
         response.setdefault("confirmation_pending", True)
-        response.setdefault("message", "Comando recebido. O Gateway está priorizando a execução.")
+        messages = {
+            "queued": "Comando recebido e protegido contra repetição.",
+            "preparing": "Preparando uma conexão exclusiva para a ação.",
+            "waking": "Veículo em repouso. Solicitando despertar.",
+            "reconnecting": "Veículo acordando. Refazendo a conexão antes da ação.",
+            "executing": "Enviando a ação ao veículo.",
+            "running": "Executando o comando remoto.",
+        }
+        response.setdefault("message", messages.get(status, "Acompanhando a execução do comando."))
+    elif status in {"accepted", "confirming"}:
+        response.setdefault("accepted", True)
+        response.setdefault("queued", False)
+        response.setdefault("confirmation_pending", True)
+        response.setdefault("message", "Ação enviada. Aguardando a telemetria confirmar o novo estado.")
     return response
 
 
@@ -269,7 +347,9 @@ def run_command_job(
     account_acquired = False
     account_lock: threading.Lock | None = None
     worker_key = command_worker_key(environment, request_id)
+    defer_seconds = 4
     try:
+        command_journal_progress(request_hash, request_id, "preparing", "Aguardando uma vaga exclusiva para o comando.")
         acquired = SEMAPHORE.acquire(timeout=max(60, MANUAL_WAIT_SECONDS))
         if not acquired:
             raise connector.ConnectorTemporaryError("Conector ocupado. O comando permaneceu protegido e não foi repetido.")
@@ -278,23 +358,38 @@ def run_command_job(
         if not account_acquired:
             raise connector.ConnectorTemporaryError("A conta ainda finalizava uma leitura anterior. Tente novamente em instantes.")
         TELEMETRY.invalidate_account_session(environment, payload)
-        result = connector.handle_command(payload)
+
+        def progress(stage: str, message: str, extra: dict[str, Any] | None = None) -> None:
+            command_journal_progress(request_hash, request_id, stage, message, extra)
+
+        result = connector.handle_command(payload, progress=progress)
         if request_id:
             result["request_id"] = request_id
         result["queued"] = False
-        result["status"] = "accepted"
         command_journal_finish(request_hash, request_id, result)
-        LOG.info("Comando remoto processado em segundo plano para %s.", environment)
+        defer_seconds = 5 if bool(result.get("wake_attempted")) else 3
+        LOG.info(
+            "Comando remoto %s enviado em segundo plano para %s; confirmação pela telemetria=%s.",
+            str(payload.get("command") or "desconhecido")[:40],
+            environment,
+            bool(result.get("confirmation_pending") or result.get("verification_requested")),
+        )
     except BaseException as exc:  # noqa: BLE001
         command_journal_fail(request_hash, request_id, exc)
+        defer_seconds = 3
         LOG.warning("Comando remoto em segundo plano falhou (%s): %s", type(exc).__name__, connector.clean_message(str(exc)))
     finally:
-        manual_operation_defer(pending_key, 15)
+        manual_operation_defer(pending_key, defer_seconds)
         if account_acquired and account_lock is not None:
             account_lock.release()
         if acquired:
             SEMAPHORE.release()
         manual_operation_leave(pending_key)
+        # A janela de telemetria já foi criada pelo Leap Hub. Despertar o worker
+        # logo após o pequeno intervalo evita esperar o ciclo normal do carro.
+        timer = threading.Timer(float(defer_seconds) + 0.2, TELEMETRY.wake_event.set)
+        timer.daemon = True
+        timer.start()
         with COMMAND_WORKERS_GUARD:
             COMMAND_WORKERS.pop(worker_key, None)
 
@@ -614,10 +709,10 @@ class Handler(BaseHTTPRequestHandler):
                         "ok": True,
                         "accepted": True,
                         "queued": True,
-                        "status": "running",
+                        "status": "queued",
                         "confirmation_pending": True,
                         "request_id": request_id,
-                        "message": "Comando recebido. O Gateway está priorizando a execução sem bloquear a tela.",
+                        "message": "Comando recebido e protegido. Preparando a execução sem bloquear a tela.",
                         "connector_version": connector.CONNECTOR_VERSION,
                     })
                     return

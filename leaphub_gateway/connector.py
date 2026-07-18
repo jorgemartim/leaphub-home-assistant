@@ -25,9 +25,9 @@ from enum import Enum
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Callable
 
-CONNECTOR_VERSION = "1.11.81"
+CONNECTOR_VERSION = "1.11.82"
 MAX_INPUT_BYTES = 1024 * 1024
 logging.getLogger("leapmotor_api").setLevel(logging.WARNING)
 
@@ -2328,7 +2328,28 @@ def execute_vehicle_command(method: Any, command: str, vehicle_id: str, paramete
         return method(vehicle_id, name=name, address=address, latitude=latitude, longitude=longitude)
     return method(vehicle_id)
 
-def handle_command(payload: dict[str, Any]) -> dict[str, Any]:
+def handle_command(
+    payload: dict[str, Any],
+    progress: Callable[[str, str, dict[str, Any] | None], None] | None = None,
+) -> dict[str, Any]:
+    """Execute one remote action without sending an unsafe duplicate.
+
+    The official cloud endpoint normally wakes the car as part of the command.
+    Therefore the first attempt is always the real command. An explicit wake is
+    used only when the cloud clearly says the vehicle is asleep/offline before
+    accepting the action. After a wake, a fresh session is created before the
+    single safe retry so a wake token cannot interfere with the command token.
+    """
+
+    def report(stage: str, message: str, extra: dict[str, Any] | None = None) -> None:
+        if progress is None:
+            return
+        try:
+            progress(stage, message, extra)
+        except Exception:
+            # Progress reporting must never make a vehicle command fail.
+            pass
+
     credentials = payload.get("credentials")
     if not isinstance(credentials, dict):
         raise ValueError("Credenciais do comando ausentes.")
@@ -2341,7 +2362,7 @@ def handle_command(payload: dict[str, Any]) -> dict[str, Any]:
     if command not in COMMAND_METHODS:
         raise ValueError("Comando remoto não suportado pelo conector.")
     operation_password = require_text(credentials, "operation_password", "o PIN do veículo", 20)
-    wake_before = bool(payload.get("wake_before", True))
+    wake_on_sleep = bool(payload.get("wake_before", True))
     verify_after = bool(payload.get("verify_after", True))
     try:
         wake_timeout = max(10, min(90, int(payload.get("wake_timeout_seconds") or 45)))
@@ -2350,98 +2371,152 @@ def handle_command(payload: dict[str, Any]) -> dict[str, Any]:
 
     temp_dir = secure_temp_directory()
     client = None
-    try:
-        client = create_client(credentials, temp_dir, operation_password)
+    result: Any = None
+    identifier_source = ""
+    wake_info: dict[str, Any] = {"attempted": False, "method": None}
+    confirmation_pending = False
+    confirmation_reason: str | None = None
+    command_attempts = 0
+    session_attempts = 0
+
+    def close_client() -> None:
+        nonlocal client
+        if client is None:
+            return
+        try:
+            client.close()
+        except Exception:
+            pass
+        client = None
+
+    def open_client(attempt: int) -> tuple[Any, str, list[Any] | None, Any, str]:
+        nonlocal client, session_attempts
+        session_attempts += 1
+        attempt_dir = temp_dir / f"command-{attempt}"
+        attempt_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        client = create_client(credentials, attempt_dir, operation_password, request_timeout_seconds=32)
         client.login()
-        resolved_vehicle_id, resolved_vehicle_list, identifier_source = resolve_command_vehicle(
-            client, vehicle_id, vehicle_vin
-        )
+        resolved_id, resolved_list, source = resolve_command_vehicle(client, vehicle_id, vehicle_vin)
         method_name = COMMAND_METHODS[command]
         method = getattr(client, method_name, None)
         if not callable(method):
             raise RuntimeError("A versão instalada da biblioteca não possui este comando.")
+        if resolved_list is not None and callable(getattr(client, "get_vehicle_list", None)):
+            client.get_vehicle_list = lambda: resolved_list
+        return client, resolved_id, resolved_list, method, source
 
-        wake_info = {"attempted": False, "method": None}
-        if wake_before:
-            wake_info = try_wake_vehicle(client, resolved_vehicle_id)
-            # Give the telematics unit a short opportunity to leave deep sleep.
-            # We never wait the full timeout before the first command because the
-            # official endpoint often wakes and executes in one request.
-            if wake_info.get("attempted") and not wake_info.get("already_awake"):
-                time.sleep(min(2.0, max(0.5, wake_timeout / 30)))
+    def classify_accepted_ambiguity(exc: Exception) -> bool:
+        nonlocal result, confirmation_pending, confirmation_reason
+        if not (is_remote_command_confirmation_timeout(exc) or is_remote_command_result_session_error(exc)):
+            return False
+        confirmation_pending = True
+        confirmation_reason = (
+            "result_session_refresh"
+            if is_remote_command_result_session_error(exc)
+            else "result_timeout"
+        )
+        result = {
+            "accepted": True,
+            "confirmation_pending": True,
+            "confirmation_reason": confirmation_reason,
+        }
+        return True
 
-        original_get_vehicle_list = getattr(client, "get_vehicle_list", None)
-        if resolved_vehicle_list is not None and callable(original_get_vehicle_list):
-            client.get_vehicle_list = lambda: resolved_vehicle_list
+    try:
+        report("preparing", "Preparando uma sessão exclusiva para o comando.")
+        try:
+            _, resolved_vehicle_id, _, method, identifier_source = open_client(1)
+        except Exception as exc:  # noqa: BLE001
+            if is_transient_cloud_error(exc):
+                raise ConnectorTemporaryError(reconnect_message(exc)) from exc
+            if is_authentication_error(exc):
+                raise ConnectorAuthenticationError(clean_message(str(exc))) from exc
+            raise RuntimeError(clean_message(str(exc))) from exc
 
-        attempts = 0
-        last_error: Exception | None = None
-        confirmation_pending = False
-        confirmation_reason: str | None = None
-        for attempt in range(1, 4):
-            attempts = attempt
-            try:
-                result = execute_vehicle_command(method, command, resolved_vehicle_id, parameters)
-                last_error = None
-                break
-            except Exception as exc:  # noqa: BLE001
-                last_error = exc
-                # O endpoint de escrita já aceitou o comando e devolveu remoteCtlId.
-                # Timeout ou perda do token somente na consulta do resultado não
-                # autorizam reenviar a ação, pois isso poderia executá-la duas vezes.
-                if is_remote_command_confirmation_timeout(exc) or is_remote_command_result_session_error(exc):
-                    confirmation_pending = True
-                    confirmation_reason = (
-                        "result_session_refresh"
-                        if is_remote_command_result_session_error(exc)
-                        else "result_timeout"
-                    )
-                    result = {
-                        "accepted": True,
-                        "confirmation_pending": True,
-                        "confirmation_reason": confirmation_reason,
-                    }
-                    last_error = None
-                    break
-                if is_authentication_error(exc):
-                    raise ConnectorAuthenticationError(clean_message(str(exc))) from exc
-                # Retry only when the cloud explicitly reports sleep/offline/not-ready.
-                # This avoids duplicating a command after an ambiguous generic timeout.
-                if attempt >= 3 or not is_vehicle_sleep_error(exc):
+        # Direct-first: the remote command itself is the authoritative wake-up.
+        # This mirrors the official app and avoids consuming a token in a
+        # separate wake request before the actual action is sent.
+        report("executing", "Enviando a ação diretamente ao veículo.", {"attempt": 1})
+        command_attempts = 1
+        try:
+            result = execute_vehicle_command(method, command, resolved_vehicle_id, parameters)
+        except Exception as first_error:  # noqa: BLE001
+            if classify_accepted_ambiguity(first_error):
+                report("confirming", "A nuvem recebeu a ação. Aguardando confirmação do veículo.")
+            elif is_authentication_error(first_error):
+                raise ConnectorAuthenticationError(clean_message(str(first_error))) from first_error
+            elif wake_on_sleep and is_vehicle_sleep_error(first_error):
+                report("waking", "Veículo em repouso. Solicitando despertar antes da ação.")
+                wake_info = try_wake_vehicle(client, resolved_vehicle_id)
+                if not wake_info.get("attempted"):
+                    raise ConnectorTemporaryError(
+                        "O veículo está em repouso e a biblioteca instalada não oferece uma operação de despertar separada."
+                    ) from first_error
+                if wake_info.get("failed") and not wake_info.get("temporary"):
+                    raise ConnectorTemporaryError(
+                        str(wake_info.get("message") or "Não foi possível acordar o veículo agora.")
+                    ) from first_error
+
+                # A wake request may rotate the cloud token. Never reuse that
+                # session for the real command. Wait briefly and authenticate a
+                # clean command-only session before one safe retry.
+                close_client()
+                wait_seconds = min(6.0, max(3.0, wake_timeout / 12))
+                time.sleep(wait_seconds)
+                report("reconnecting", "Veículo acordando. Criando uma conexão limpa para executar a ação.")
+                try:
+                    _, resolved_vehicle_id, _, method, identifier_source = open_client(2)
+                except Exception as exc:  # noqa: BLE001
                     if is_transient_cloud_error(exc):
                         raise ConnectorTemporaryError(reconnect_message(exc)) from exc
+                    if is_authentication_error(exc):
+                        raise ConnectorAuthenticationError(clean_message(str(exc))) from exc
                     raise RuntimeError(clean_message(str(exc))) from exc
-                retry_wake = try_wake_vehicle(client, resolved_vehicle_id)
-                if retry_wake.get("attempted"):
-                    wake_info = retry_wake
-                time.sleep(min(6.0, 1.5 * attempt))
-        if last_error is not None:
-            raise RuntimeError(clean_message(str(last_error))) from last_error
 
-        # Verification is intentionally best-effort. The Gateway performs the
-        # authoritative 3-second command window and persists the new snapshot.
+                report("executing", "Veículo acordado. Enviando a ação agora.", {"attempt": 2})
+                command_attempts = 2
+                try:
+                    result = execute_vehicle_command(method, command, resolved_vehicle_id, parameters)
+                except Exception as second_error:  # noqa: BLE001
+                    if classify_accepted_ambiguity(second_error):
+                        report("confirming", "A nuvem recebeu a ação. Aguardando confirmação do veículo.")
+                    elif is_authentication_error(second_error):
+                        raise ConnectorAuthenticationError(clean_message(str(second_error))) from second_error
+                    elif is_transient_cloud_error(second_error):
+                        raise ConnectorTemporaryError(reconnect_message(second_error)) from second_error
+                    else:
+                        raise RuntimeError(clean_message(str(second_error))) from second_error
+            elif is_transient_cloud_error(first_error):
+                raise ConnectorTemporaryError(reconnect_message(first_error)) from first_error
+            else:
+                raise RuntimeError(clean_message(str(first_error))) from first_error
+
         verification_requested = bool(verify_after)
+        if confirmation_pending:
+            message = "A ação foi aceita pela nuvem. O estado será confirmado pela telemetria sem reenviar o comando."
+        else:
+            message = "A ação foi enviada ao veículo. Atualizando o estado automaticamente."
+        report("accepted", message, {"confirmation_pending": confirmation_pending})
         return {
             "ok": True,
-            "message": "Comando aceito pela nuvem Leapmotor. O estado será confirmado automaticamente.",
+            "message": message,
             "command": command,
             "result_type": type(result).__name__,
             "connector_version": CONNECTOR_VERSION,
             "library_version": package_version(),
             "wake_attempted": bool(wake_info.get("attempted")),
             "wake_method": wake_info.get("method"),
-            "attempts": attempts,
+            "wake_strategy": "fallback_after_explicit_sleep" if wake_info.get("attempted") else "command_direct",
+            "attempts": command_attempts,
+            "session_attempts": session_attempts,
             "verification_requested": verification_requested,
             "confirmation_pending": confirmation_pending,
             "confirmation_reason": confirmation_reason,
-            "identifier_source": identifier_source,
+            "identifier_source": identifier_source or ("vin_hint" if vehicle_vin else "resolved"),
+            "command_dispatched": True,
         }
     finally:
-        if client is not None:
-            try:
-                client.close()
-            except Exception:
-                pass
+        close_client()
         shutil.rmtree(temp_dir, ignore_errors=True)
 
 

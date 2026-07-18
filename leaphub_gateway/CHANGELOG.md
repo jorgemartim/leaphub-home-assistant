@@ -1,3 +1,12 @@
+## 1.11.82
+
+- Comando direto primeiro: o próprio endpoint remoto tenta acordar e executar, como no aplicativo oficial.
+- Despertar separado somente após resposta explícita de veículo dormindo ou offline.
+- Sessão limpa entre o despertar e a ação para evitar que o token de wake invalide o comando.
+- Estados persistentes de fila, preparação, despertar, reconexão, execução e confirmação.
+- Telemetria pós-comando liberada poucos segundos após a ação, sem esperar o ciclo normal.
+- Nenhum comando ambíguo é reenviado automaticamente.
+
 ## 1.11.81
 
 - Comandos remotos entram em fila prioritária e retornam imediatamente ao Leap Hub.
