@@ -1,3 +1,11 @@
+## 1.11.78
+
+- Confirmação de comandos com cadência adaptativa em 3, 6, 10 e 15 segundos.
+- Encerra a janela rápida quando o estado esperado é confirmado ou quando o orçamento seguro é atingido.
+- Comandos manuais recebem prioridade sobre telemetria automática.
+- Consultas de confirmação ficam limitadas ao veículo afetado e não carregam mensagens da conta.
+- A sessão automática é renovada de forma controlada após um login manual, evitando conflito de token.
+
 ## 1.11.77
 
 - Comandos remotos tentam acordar o veículo antes da execução quando a biblioteca instalada oferece essa função.

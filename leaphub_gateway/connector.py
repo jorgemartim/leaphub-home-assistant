@@ -26,7 +26,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-CONNECTOR_VERSION = "1.11.77"
+CONNECTOR_VERSION = "1.11.78"
 MAX_INPUT_BYTES = 1024 * 1024
 
 COMMAND_METHODS: dict[str, str] = {

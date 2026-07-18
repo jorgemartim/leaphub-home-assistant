@@ -31,7 +31,7 @@ except ModuleNotFoundError as exc:
         "Módulo interno leaphub_connector ausente na imagem. Atualize o Leap Hub Gateway."
     ) from exc
 
-VERSION = "1.11.77"
+VERSION = "1.11.78"
 SERVICE = "Leap Hub Leapmotor Connector"
 MAX_BODY = 1024 * 1024
 WINDOW_SECONDS = 180
@@ -42,6 +42,8 @@ NONCE_DB_PATH = Path(os.getenv("LEAPHUB_NONCE_DB_PATH", "/data/security/connecto
 ACCOUNT_LOCKS: dict[str, threading.Lock] = {}
 ACCOUNT_LOCK_LAST_USED: dict[str, float] = {}
 ACCOUNT_LOCKS_GUARD = threading.Lock()
+MANUAL_PENDING: dict[str, int] = {}
+MANUAL_PENDING_GUARD = threading.Lock()
 OPTIONS_PATH = Path(os.getenv("LEAPHUB_OPTIONS_PATH", "/data/options.json"))
 
 
@@ -160,6 +162,28 @@ def account_operation_lock(environment: str, payload: dict[str, Any]) -> threadi
         return lock
 
 
+def manual_operation_enter(environment: str, payload: dict[str, Any]) -> str:
+    key = account_operation_key(environment, payload)
+    with MANUAL_PENDING_GUARD:
+        MANUAL_PENDING[key] = MANUAL_PENDING.get(key, 0) + 1
+    return key
+
+
+def manual_operation_leave(key: str) -> None:
+    with MANUAL_PENDING_GUARD:
+        remaining = MANUAL_PENDING.get(key, 0) - 1
+        if remaining > 0:
+            MANUAL_PENDING[key] = remaining
+        else:
+            MANUAL_PENDING.pop(key, None)
+
+
+def manual_operation_pending(environment: str, payload: dict[str, Any]) -> bool:
+    key = account_operation_key(environment, payload)
+    with MANUAL_PENDING_GUARD:
+        return MANUAL_PENDING.get(key, 0) > 0
+
+
 # A telemetria e as operações manuais usam o mesmo lock por conta. Isso impede
 # que uma leitura automática e uma sincronização manual façam login em paralelo.
 TELEMETRY = TelemetryEngine(
@@ -168,6 +192,7 @@ TELEMETRY = TelemetryEngine(
     SEMAPHORE,
     account_lock_provider=account_operation_lock,
     account_wait_seconds=MANUAL_WAIT_SECONDS,
+    manual_pending_provider=manual_operation_pending,
 )
 
 
@@ -286,6 +311,7 @@ class Handler(BaseHTTPRequestHandler):
                     str(payload.get("subscription_id") or ""),
                     int(payload.get("seconds") or 900),
                     str(payload.get("profile") or "background"),
+                    payload.get("context") if isinstance(payload.get("context"), dict) else {},
                 ))
                 return
             if self.path == "/v1/telemetry/subscriptions/release":
@@ -293,22 +319,25 @@ class Handler(BaseHTTPRequestHandler):
                     str(payload.get("subscription_id") or ""),
                 ))
                 return
-            acquired = SEMAPHORE.acquire(timeout=MANUAL_WAIT_SECONDS)
-            if not acquired:
-                self.send_json(503, {"ok": False, "message": "Conector ocupado. A solicitação não perdeu dados; tente novamente em instantes."})
-                return
-            account_lock = account_operation_lock(environment, payload)
-            account_acquired = account_lock.acquire(timeout=MANUAL_WAIT_SECONDS)
-            if not account_acquired:
-                SEMAPHORE.release()
-                self.send_json(503, {
-                    "ok": False,
-                    "temporary": True,
-                    "retry_after_seconds": 5,
-                    "message": "Esta conta já está sendo consultada. A atualização automática continuará em instantes.",
-                })
-                return
+            pending_key = manual_operation_enter(environment, payload)
+            acquired = False
+            account_acquired = False
+            account_lock: threading.Lock | None = None
             try:
+                acquired = SEMAPHORE.acquire(timeout=MANUAL_WAIT_SECONDS)
+                if not acquired:
+                    self.send_json(503, {"ok": False, "temporary": True, "retry_after_seconds": 3, "message": "Conector ocupado. A telemetria automática cedeu prioridade; tente novamente em instantes."})
+                    return
+                account_lock = account_operation_lock(environment, payload)
+                account_acquired = account_lock.acquire(timeout=MANUAL_WAIT_SECONDS)
+                if not account_acquired:
+                    self.send_json(503, {
+                        "ok": False,
+                        "temporary": True,
+                        "retry_after_seconds": 3,
+                        "message": "Finalizando uma leitura já iniciada desta conta. O comando continua com prioridade.",
+                    })
+                    return
                 if self.path == "/v1/accounts/test":
                     result = connector.handle_account(payload, sync=False)
                 elif self.path == "/v1/vehicles/sync":
@@ -317,8 +346,13 @@ class Handler(BaseHTTPRequestHandler):
                     result = connector.handle_command(payload)
                 self.send_json(200, result)
             finally:
-                account_lock.release()
-                SEMAPHORE.release()
+                if self.path == "/v1/vehicles/command":
+                    TELEMETRY.invalidate_account_session(environment, payload)
+                if account_acquired and account_lock is not None:
+                    account_lock.release()
+                if acquired:
+                    SEMAPHORE.release()
+                manual_operation_leave(pending_key)
         except connector.ConnectorTemporaryError as exc:
             LOG.warning("Reconexão automática adiada: %s", connector.clean_message(str(exc)))
             self.send_json(503, {
