@@ -23,7 +23,7 @@ from cryptography.fernet import Fernet, InvalidToken
 import leaphub_connector as connector
 
 LOG = logging.getLogger("leaphub.telemetry")
-ENGINE_VERSION = "1.11.78"
+ENGINE_VERSION = "1.11.79"
 
 
 def utc_iso() -> str:
@@ -268,11 +268,10 @@ class TelemetryEngine:
             )
 
     def invalidate_account_session(self, environment: str, payload: dict[str, Any]) -> int:
-        """Discard a telemetry login after a manual cloud login for the same account.
+        """Feche a sessão automática antes de uma operação manual da conta.
 
-        Some cloud implementations invalidate the previous token when another
-        client logs in. Proactively closing the cached telemetry client avoids
-        a misleading authentication error on the next automatic poll.
+        A nuvem pode rejeitar dois tokens simultâneos. O servidor chama este
+        método somente depois de adquirir a trava exclusiva da conta.
         """
         try:
             account_id = int(payload.get("account_id") or 0)
@@ -288,7 +287,7 @@ class TelemetryEngine:
         for row in rows:
             self._close_session(str(row["subscription_id"]))
         if rows:
-            LOG.info("Sessão automática de %s conta(s) invalidada após operação manual para evitar conflito de token.", len(rows))
+            LOG.info("Sessão automática de %s conta(s) encerrada antes da operação manual para evitar conflito de token.", len(rows))
         return len(rows)
 
     def start(self) -> None:

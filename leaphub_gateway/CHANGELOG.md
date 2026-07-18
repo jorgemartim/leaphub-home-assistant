@@ -1,3 +1,11 @@
+## 1.11.79
+
+- Corrige comandos remotos que recebiam `car_id` no lugar do VIN e terminavam em HTTP 422.
+- Aceita VIN protegido enviado pelo Leap Hub e mantém compatibilidade com instalações antigas resolvendo `car_id` internamente.
+- Encerra a sessão automática antes do login manual, evitando dois tokens sobrepostos e respostas `Information verification failed`.
+- Registra a causa sanitizada de erros 422 sem expor VIN, PIN, senha, certificados ou chaves.
+- Mantém confirmação adaptativa e proteção contra comandos duplicados.
+
 ## 1.11.78
 
 - Confirmação de comandos com cadência adaptativa em 3, 6, 10 e 15 segundos.

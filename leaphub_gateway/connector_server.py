@@ -31,7 +31,7 @@ except ModuleNotFoundError as exc:
         "Módulo interno leaphub_connector ausente na imagem. Atualize o Leap Hub Gateway."
     ) from exc
 
-VERSION = "1.11.78"
+VERSION = "1.11.79"
 SERVICE = "Leap Hub Leapmotor Connector"
 MAX_BODY = 1024 * 1024
 WINDOW_SECONDS = 180
@@ -343,11 +343,13 @@ class Handler(BaseHTTPRequestHandler):
                 elif self.path == "/v1/vehicles/sync":
                     result = connector.handle_account(payload, sync=True)
                 else:
+                    # Feche a sessão automática antes do login manual. Fazer isso
+                    # depois mantinha dois tokens sobrepostos e a nuvem podia
+                    # responder "Information verification failed".
+                    TELEMETRY.invalidate_account_session(environment, payload)
                     result = connector.handle_command(payload)
                 self.send_json(200, result)
             finally:
-                if self.path == "/v1/vehicles/command":
-                    TELEMETRY.invalidate_account_session(environment, payload)
                 if account_acquired and account_lock is not None:
                     account_lock.release()
                 if acquired:
@@ -372,7 +374,10 @@ class Handler(BaseHTTPRequestHandler):
                 "connector_version": connector.CONNECTOR_VERSION,
             })
         except (ValueError, RuntimeError) as exc:
-            self.send_json(422, {"ok": False, "message": connector.clean_message(str(exc)), "connector_version": connector.CONNECTOR_VERSION})
+            safe_message = connector.clean_message(str(exc))
+            command_name = str(payload.get("command") or "")[:80] if isinstance(payload, dict) else ""
+            LOG.warning("Comando remoto %s recusado (%s): %s", command_name or "desconhecido", type(exc).__name__, safe_message)
+            self.send_json(422, {"ok": False, "message": safe_message, "connector_version": connector.CONNECTOR_VERSION})
         except Exception as exc:  # noqa: BLE001
             if connector.is_transient_cloud_error(exc):
                 LOG.warning("Falha temporária recuperável não classificada: %s", connector.clean_message(str(exc)))

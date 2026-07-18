@@ -26,7 +26,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-CONNECTOR_VERSION = "1.11.78"
+CONNECTOR_VERSION = "1.11.79"
 MAX_INPUT_BYTES = 1024 * 1024
 
 COMMAND_METHODS: dict[str, str] = {
@@ -74,6 +74,8 @@ def clean_message(message: str) -> str:
     for marker in ("-----BEGIN", "-----END"):
         if marker in text:
             return "Falha de autenticação ou certificado inválido."
+    # Nunca exponha VIN completo nos logs ou respostas do conector.
+    text = re.sub(r"\b[A-HJ-NPR-Z0-9]{17}\b", "[VIN protegido]", text, flags=re.IGNORECASE)
     return text[:900] or "Falha desconhecida no conector."
 
 
@@ -2248,6 +2250,47 @@ def try_wake_vehicle(client: Any, vehicle_id: str) -> dict[str, Any]:
     return {"attempted": False, "method": None}
 
 
+def resolve_command_vehicle(
+    client: Any,
+    supplied_identifier: str,
+    vin_hint: str = "",
+) -> tuple[str, list[Any] | None, str]:
+    """Resolve o identificador salvo pelo Leap Hub para o VIN exigido pela biblioteca.
+
+    A telemetria usa ``car_id`` como remote_id, enquanto leapmotor-api executa
+    comandos exclusivamente pelo VIN. Versões anteriores repassavam car_id como
+    se fosse VIN e todos os comandos terminavam em HTTP 422.
+    """
+    vin_hint = str(vin_hint or "").strip()[:40]
+    if vin_hint:
+        return vin_hint, None, "vin_hint"
+
+    supplied_identifier = str(supplied_identifier or "").strip()[:190]
+    vehicles = list(client.get_vehicle_list() or [])
+    selected = None
+    source = ""
+    for vehicle in vehicles:
+        vin = str(attribute(vehicle, "vin", "") or "").strip()
+        car_id = str(attribute(vehicle, "car_id", "") or "").strip()
+        if supplied_identifier and supplied_identifier == vin:
+            selected = vehicle
+            source = "vin"
+            break
+        if supplied_identifier and supplied_identifier == car_id:
+            selected = vehicle
+            source = "car_id"
+            break
+    if selected is None and len(vehicles) == 1:
+        selected = vehicles[0]
+        source = "single_vehicle"
+    if selected is None:
+        raise RuntimeError("Não foi possível associar o veículo salvo ao VIN da conta Leapmotor. Sincronize a conta e tente novamente.")
+    resolved_vin = str(attribute(selected, "vin", "") or "").strip()
+    if not resolved_vin:
+        raise RuntimeError("A nuvem Leapmotor não retornou o VIN necessário para executar o comando.")
+    return resolved_vin, vehicles, source
+
+
 def execute_vehicle_command(method: Any, command: str, vehicle_id: str, parameters: dict[str, Any]) -> Any:
     if command == "set_charge_limit":
         value = int(parameters.get("charge_limit_percent", 80))
@@ -2269,6 +2312,7 @@ def handle_command(payload: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(credentials, dict):
         raise ValueError("Credenciais do comando ausentes.")
     vehicle_id = require_text(payload, "vehicle_id", "o identificador do veículo", 190)
+    vehicle_vin = str(payload.get("vehicle_vin") or "").strip()[:40]
     command = require_text(payload, "command", "o comando remoto", 80)
     parameters = payload.get("parameters")
     if not isinstance(parameters, dict):
@@ -2288,6 +2332,9 @@ def handle_command(payload: dict[str, Any]) -> dict[str, Any]:
     try:
         client = create_client(credentials, temp_dir, operation_password)
         client.login()
+        resolved_vehicle_id, resolved_vehicle_list, identifier_source = resolve_command_vehicle(
+            client, vehicle_id, vehicle_vin
+        )
         method_name = COMMAND_METHODS[command]
         method = getattr(client, method_name, None)
         if not callable(method):
@@ -2295,12 +2342,16 @@ def handle_command(payload: dict[str, Any]) -> dict[str, Any]:
 
         wake_info = {"attempted": False, "method": None}
         if wake_before:
-            wake_info = try_wake_vehicle(client, vehicle_id)
+            wake_info = try_wake_vehicle(client, resolved_vehicle_id)
             # Give the telematics unit a short opportunity to leave deep sleep.
             # We never wait the full timeout before the first command because the
             # official endpoint often wakes and executes in one request.
             if wake_info.get("attempted") and not wake_info.get("already_awake"):
                 time.sleep(min(2.0, max(0.5, wake_timeout / 30)))
+
+        original_get_vehicle_list = getattr(client, "get_vehicle_list", None)
+        if resolved_vehicle_list is not None and callable(original_get_vehicle_list):
+            client.get_vehicle_list = lambda: resolved_vehicle_list
 
         attempts = 0
         last_error: Exception | None = None
@@ -2308,7 +2359,7 @@ def handle_command(payload: dict[str, Any]) -> dict[str, Any]:
         for attempt in range(1, 4):
             attempts = attempt
             try:
-                result = execute_vehicle_command(method, command, vehicle_id, parameters)
+                result = execute_vehicle_command(method, command, resolved_vehicle_id, parameters)
                 last_error = None
                 break
             except Exception as exc:  # noqa: BLE001
@@ -2329,7 +2380,7 @@ def handle_command(payload: dict[str, Any]) -> dict[str, Any]:
                     if is_transient_cloud_error(exc):
                         raise ConnectorTemporaryError(reconnect_message(exc)) from exc
                     raise RuntimeError(clean_message(str(exc))) from exc
-                retry_wake = try_wake_vehicle(client, vehicle_id)
+                retry_wake = try_wake_vehicle(client, resolved_vehicle_id)
                 if retry_wake.get("attempted"):
                     wake_info = retry_wake
                 time.sleep(min(6.0, 1.5 * attempt))
@@ -2351,6 +2402,7 @@ def handle_command(payload: dict[str, Any]) -> dict[str, Any]:
             "attempts": attempts,
             "verification_requested": verification_requested,
             "confirmation_pending": confirmation_pending,
+            "identifier_source": identifier_source,
         }
     finally:
         if client is not None:
