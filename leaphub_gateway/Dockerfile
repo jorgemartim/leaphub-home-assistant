@@ -71,6 +71,17 @@ assert Path('/app/telemetry_engine.py').is_file()
 assert leaphub_connector.CONNECTOR_VERSION
 assert leaphub_telemetry_engine.ENGINE_VERSION
 assert TelemetryEngine is not None
+import os
+import sqlite3
+import tempfile
+import threading
+with tempfile.TemporaryDirectory() as temp_dir:
+    os.environ['LEAPHUB_TELEMETRY_DIR'] = temp_dir
+    engine = TelemetryEngine({}, {'staging': 'x' * 32, 'production': ''}, threading.BoundedSemaphore(1))
+    with sqlite3.connect(engine.db_path) as db:
+        journal = str(db.execute('PRAGMA journal_mode').fetchone()[0]).lower()
+    assert journal == 'delete', journal
+    assert engine.storage_status()['healthy'] is True
 for module in ('connector_server', 'ocpp_gateway', 'gateway_manager'):
     spec = importlib.util.find_spec(module)
     if spec is None:
@@ -79,7 +90,8 @@ print('Autoteste de importação de Connector e telemetria concluído com sucess
 PY
 
 RUN python3 -m compileall -q /app \
-    && mkdir -p /data/runtime /data/logs
+    && mkdir -p /data/runtime /data/logs /data/telemetry /data/security \
+    && chmod 0700 /data/runtime /data/logs /data/telemetry /data/security
 
 LABEL \
   io.hass.version="${BUILD_VERSION}" \

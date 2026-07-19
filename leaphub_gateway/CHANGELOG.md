@@ -1,3 +1,12 @@
+## 1.11.83
+
+- Corrige `sqlite3.OperationalError: unable to open database file` na fila persistente.
+- Migra o SQLite de WAL para journal tradicional, adequado ao acesso serializado do Gateway.
+- Valida escrita e permissões em `/data/telemetry` antes de iniciar.
+- Adiciona recuperação automática e recuo progressivo, eliminando tempestade de logs.
+- Expõe saúde do armazenamento no diagnóstico do Connector.
+- Repassa `telemetry_command_max_polls` e corrige o padrão estacionado para 300 segundos.
+
 ## 1.11.82
 
 - Comando direto primeiro: o próprio endpoint remoto tenta acordar e executar, como no aplicativo oficial.

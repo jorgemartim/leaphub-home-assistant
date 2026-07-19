@@ -23,7 +23,7 @@ from cryptography.fernet import Fernet, InvalidToken
 import leaphub_connector as connector
 
 LOG = logging.getLogger("leaphub.telemetry")
-ENGINE_VERSION = "1.11.82"
+ENGINE_VERSION = "1.11.83"
 
 
 def utc_iso() -> str:
@@ -87,9 +87,17 @@ class TelemetryEngine:
         self.account_wait_seconds = max(2, min(60, int(account_wait_seconds)))
         self.manual_pending_provider = manual_pending_provider
         self.data_dir = Path(os.getenv("LEAPHUB_TELEMETRY_DIR", "/data/telemetry"))
-        self.data_dir.mkdir(parents=True, exist_ok=True)
         self.db_path = self.data_dir / "telemetry.sqlite"
         self.key_path = self.data_dir / "telemetry.key"
+        self.storage_lock = threading.RLock()
+        self.storage_healthy = False
+        self.storage_failures = 0
+        self.storage_last_error = ""
+        self.storage_last_error_at = ""
+        self.storage_next_retry_at = 0.0
+        self.storage_next_log_at = 0.0
+        self.storage_journal_mode = "unknown"
+        self._prepare_storage(probe=True)
         self.fernet = Fernet(self._load_key())
         self.stop_event = threading.Event()
         self.wake_event = threading.Event()
@@ -130,6 +138,7 @@ class TelemetryEngine:
         self.session_max_age_seconds = 2700
         self.session_idle_seconds = 900
         self._init_db()
+        self.storage_healthy = True
 
     def _bounded(self, key: str, default: int, minimum: int, maximum: int) -> int:
         try:
@@ -137,6 +146,45 @@ class TelemetryEngine:
         except (TypeError, ValueError):
             value = default
         return max(minimum, min(maximum, value))
+
+    def _prepare_storage(self, probe: bool = False) -> None:
+        """Garante que a fila persistente continue gravável após atualização/reinício."""
+        with self.storage_lock:
+            if self.data_dir.exists() and not self.data_dir.is_dir():
+                raise OSError(f"O caminho de telemetria não é um diretório: {self.data_dir}")
+            self.data_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+            try:
+                self.data_dir.chmod(0o700)
+            except OSError:
+                pass
+            for candidate in (
+                self.db_path,
+                self.key_path,
+                Path(str(self.db_path) + "-wal"),
+                Path(str(self.db_path) + "-shm"),
+                Path(str(self.db_path) + "-journal"),
+            ):
+                if candidate.exists():
+                    if not candidate.is_file():
+                        raise OSError(f"Armazenamento inválido em {candidate}")
+                    try:
+                        candidate.chmod(0o600)
+                    except OSError:
+                        pass
+            if not probe:
+                return
+            probe_path = self.data_dir / f".write-probe-{os.getpid()}-{threading.get_ident()}"
+            descriptor = os.open(probe_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            try:
+                with os.fdopen(descriptor, "wb", closefd=True) as handle:
+                    handle.write(b"ok\n")
+                    handle.flush()
+                    os.fsync(handle.fileno())
+            finally:
+                try:
+                    probe_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
     def _load_key(self) -> bytes:
         if self.key_path.is_file():
@@ -150,18 +198,47 @@ class TelemetryEngine:
         descriptor = os.open(self.key_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(descriptor, "wb") as handle:
             handle.write(key + b"\n")
+            handle.flush()
+            os.fsync(handle.fileno())
         return key
 
     def _db(self) -> sqlite3.Connection:
-        db = sqlite3.connect(self.db_path, timeout=15, isolation_level=None)
-        db.row_factory = sqlite3.Row
-        db.execute("PRAGMA journal_mode=WAL")
-        db.execute("PRAGMA busy_timeout=15000")
-        db.execute("PRAGMA foreign_keys=ON")
-        return db
+        self._prepare_storage(probe=False)
+        db: sqlite3.Connection | None = None
+        try:
+            db = sqlite3.connect(self.db_path, timeout=15, isolation_level=None)
+            db.row_factory = sqlite3.Row
+            db.execute("PRAGMA busy_timeout=15000")
+            db.execute("PRAGMA foreign_keys=ON")
+            # Evita depender de /tmp ou de arquivos temporários externos ao /data.
+            db.execute("PRAGMA temp_store=MEMORY")
+            return db
+        except Exception:
+            if db is not None:
+                db.close()
+            raise
+
+    def _configure_journal(self, db: sqlite3.Connection) -> None:
+        """Usa journal tradicional: o acesso é serializado e não precisa de -wal/-shm."""
+        current_row = db.execute("PRAGMA journal_mode").fetchone()
+        current = str(current_row[0] if current_row else "unknown").lower()
+        if current == "wal":
+            try:
+                db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            except sqlite3.DatabaseError:
+                # A mudança de modo abaixo ainda pode concluir a recuperação.
+                pass
+        mode_row = db.execute("PRAGMA journal_mode=DELETE").fetchone()
+        mode = str(mode_row[0] if mode_row else current).lower()
+        self.storage_journal_mode = mode
+        if mode != "delete":
+            raise sqlite3.OperationalError(f"journal SQLite incompatível: {mode}")
+        db.execute("PRAGMA synchronous=FULL")
 
     def _init_db(self) -> None:
+        self._prepare_storage(probe=True)
         with self._db() as db:
+            self._configure_journal(db)
             db.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS subscriptions (
@@ -617,32 +694,58 @@ class TelemetryEngine:
             "max_command_polls": self.command_max_polls if profile == "command" else None,
         }
 
+    def storage_status(self) -> dict[str, Any]:
+        now = time.time()
+        return {
+            "healthy": bool(self.storage_healthy),
+            "path": str(self.db_path),
+            "journal_mode": self.storage_journal_mode,
+            "consecutive_failures": int(self.storage_failures),
+            "last_error": self.storage_last_error or None,
+            "last_error_at": self.storage_last_error_at or None,
+            "retry_in_seconds": max(0, int(self.storage_next_retry_at - now)),
+        }
+
     def status(self) -> dict[str, Any]:
-        with self.lock, self._db() as db:
-            totals = db.execute(
-                "SELECT COUNT(*) subscriptions, SUM(CASE WHEN enabled=1 THEN 1 ELSE 0 END) enabled, "
-                "SUM(CASE WHEN status IN ('error','auth_required') THEN 1 ELSE 0 END) errors, "
-                "SUM(CASE WHEN enabled=1 AND active_until>? THEN 1 ELSE 0 END) active_windows, "
-                "SUM(CASE WHEN enabled=1 AND interactive_until>? THEN 1 ELSE 0 END) interactive_windows, "
-                "SUM(CASE WHEN enabled=1 AND command_until>? THEN 1 ELSE 0 END) command_windows FROM subscriptions",
-                (time.time(), time.time(), time.time()),
-            ).fetchone()
-            queue = db.execute(
-                "SELECT COALESCE(SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END),0) pending, "
-                "COALESCE(SUM(CASE WHEN status='delivered' THEN 1 ELSE 0 END),0) delivered, "
-                "MIN(CASE WHEN status='pending' THEN created_at END) oldest_pending FROM events"
-            ).fetchone()
-            recent = [dict(row) for row in db.execute(
-                "SELECT subscription_id, environment, account_id, status, last_run_at, last_success_at, last_delivery_at, "
-                "last_error, last_state, next_run_at, active_until, interactive_until, command_until, command_key, command_vehicle_id, command_poll_count, command_started_at, last_presence_at, auth_required, cooldown_until "
-                "FROM subscriptions ORDER BY updated_at DESC LIMIT 20"
-            ).fetchall()]
-            dedupe = db.execute(
-                "SELECT COALESCE(SUM(skipped_unchanged),0) skipped, COUNT(*) vehicles, MAX(updated_at) last_state_update FROM vehicle_state_cache"
-            ).fetchone()
-            recent_states = [dict(row) for row in db.execute(
-                "SELECT subscription_id, remote_id, sequence, skipped_unchanged, last_source_at, updated_at FROM vehicle_state_cache ORDER BY updated_at DESC LIMIT 20"
-            ).fetchall()]
+        try:
+            with self.lock, self._db() as db:
+                totals = db.execute(
+                    "SELECT COUNT(*) subscriptions, SUM(CASE WHEN enabled=1 THEN 1 ELSE 0 END) enabled, "
+                    "SUM(CASE WHEN status IN ('error','auth_required') THEN 1 ELSE 0 END) errors, "
+                    "SUM(CASE WHEN enabled=1 AND active_until>? THEN 1 ELSE 0 END) active_windows, "
+                    "SUM(CASE WHEN enabled=1 AND interactive_until>? THEN 1 ELSE 0 END) interactive_windows, "
+                    "SUM(CASE WHEN enabled=1 AND command_until>? THEN 1 ELSE 0 END) command_windows FROM subscriptions",
+                    (time.time(), time.time(), time.time()),
+                ).fetchone()
+                queue = db.execute(
+                    "SELECT COALESCE(SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END),0) pending, "
+                    "COALESCE(SUM(CASE WHEN status='delivered' THEN 1 ELSE 0 END),0) delivered, "
+                    "MIN(CASE WHEN status='pending' THEN created_at END) oldest_pending FROM events"
+                ).fetchone()
+                recent = [dict(row) for row in db.execute(
+                    "SELECT subscription_id, environment, account_id, status, last_run_at, last_success_at, last_delivery_at, "
+                    "last_error, last_state, next_run_at, active_until, interactive_until, command_until, command_key, command_vehicle_id, command_poll_count, command_started_at, last_presence_at, auth_required, cooldown_until "
+                    "FROM subscriptions ORDER BY updated_at DESC LIMIT 20"
+                ).fetchall()]
+                dedupe = db.execute(
+                    "SELECT COALESCE(SUM(skipped_unchanged),0) skipped, COUNT(*) vehicles, MAX(updated_at) last_state_update FROM vehicle_state_cache"
+                ).fetchone()
+                recent_states = [dict(row) for row in db.execute(
+                    "SELECT subscription_id, remote_id, sequence, skipped_unchanged, last_source_at, updated_at FROM vehicle_state_cache ORDER BY updated_at DESC LIMIT 20"
+                ).fetchall()]
+        except (OSError, sqlite3.Error) as exc:
+            self._record_storage_failure(exc)
+            return {
+                "ok": False,
+                "message": "Fila persistente temporariamente indisponível.",
+                "storage": self.storage_status(),
+                "subscriptions": 0,
+                "enabled_subscriptions": 0,
+                "pending_events": 0,
+                "recent_vehicle_states": [],
+                "recent": [],
+            }
+        self._record_storage_success()
         now_epoch = time.time()
         for item in recent:
             item["next_run_in_seconds"] = max(0, int(float(item.pop("next_run_at") or 0) - now_epoch))
@@ -656,6 +759,7 @@ class TelemetryEngine:
                 item["last_error"] = str(item["last_error"])[:240]
         return {
             "ok": True,
+            "storage": self.storage_status(),
             "subscriptions": int(totals["subscriptions"] or 0),
             "enabled_subscriptions": int(totals["enabled"] or 0),
             "active_windows": int(totals["active_windows"] or 0),
@@ -688,9 +792,44 @@ class TelemetryEngine:
             "recent": recent,
         }
 
+    def _record_storage_failure(self, exc: BaseException) -> float:
+        self.storage_healthy = False
+        self.storage_failures += 1
+        message = str(exc).strip() or type(exc).__name__
+        self.storage_last_error = message[:240]
+        self.storage_last_error_at = utc_iso()
+        steps = (2, 5, 10, 20, 30, 60, 120, 300)
+        delay = float(steps[min(self.storage_failures - 1, len(steps) - 1)])
+        now = time.time()
+        self.storage_next_retry_at = now + delay
+        if self.storage_failures == 1 or now >= self.storage_next_log_at:
+            LOG.error(
+                "Fila SQLite indisponível (%s). Nova tentativa em %ss. Caminho: %s",
+                self.storage_last_error,
+                int(delay),
+                self.db_path,
+            )
+            self.storage_next_log_at = now + max(30.0, delay)
+        try:
+            self._prepare_storage(probe=True)
+        except OSError:
+            pass
+        return delay
+
+    def _record_storage_success(self) -> None:
+        if self.storage_failures > 0:
+            LOG.info("Acesso à fila SQLite recuperado em %s.", self.db_path)
+        self.storage_healthy = True
+        self.storage_failures = 0
+        self.storage_last_error = ""
+        self.storage_last_error_at = ""
+        self.storage_next_retry_at = 0.0
+        self.storage_next_log_at = 0.0
+
     def _run(self) -> None:
         while not self.stop_event.is_set():
             did_work = False
+            storage_wait: float | None = None
             try:
                 did_work = self._deliver_due() or did_work
                 subscription = self._next_due_subscription()
@@ -698,9 +837,18 @@ class TelemetryEngine:
                     self._poll_subscription(subscription)
                     did_work = True
                 self._maintenance()
+                self._record_storage_success()
+            except (OSError, sqlite3.Error) as exc:
+                storage_wait = self._record_storage_failure(exc)
             except Exception:  # noqa: BLE001
                 LOG.exception("Falha no ciclo de telemetria")
-            wait = 0.5 if did_work else min(5.0, self._seconds_until_next())
+            if storage_wait is not None:
+                wait = storage_wait
+            else:
+                try:
+                    wait = 0.5 if did_work else min(5.0, self._seconds_until_next())
+                except (OSError, sqlite3.Error) as exc:
+                    wait = self._record_storage_failure(exc)
             self.wake_event.wait(max(0.25, wait))
             self.wake_event.clear()
 

@@ -92,6 +92,18 @@ for critical in ("connector.py", "telemetry_engine.py"):
     if (APP / critical).stat().st_size < 1000:
         fail(f"{critical} parece vazio ou incompleto.")
 
+telemetry_source = (APP / "telemetry_engine.py").read_text(encoding="utf-8")
+for marker in (
+    "_prepare_storage(probe=True)",
+    "PRAGMA journal_mode=DELETE",
+    "PRAGMA temp_store=MEMORY",
+    "_record_storage_failure",
+):
+    if marker not in telemetry_source:
+        fail(f"telemetry_engine.py não contém a proteção SQLite obrigatória: {marker}")
+if "PRAGMA journal_mode=WAL" in telemetry_source:
+    fail("telemetry_engine.py voltou a forçar WAL, incompatível com o armazenamento protegido do App.")
+
 for required_file in (
     "README.md",
     "DOCS.md",

@@ -31,7 +31,7 @@ except ModuleNotFoundError as exc:
         "Módulo interno leaphub_connector ausente na imagem. Atualize o Leap Hub Gateway."
     ) from exc
 
-VERSION = "1.11.82"
+VERSION = "1.11.83"
 SERVICE = "Leap Hub Leapmotor Connector"
 MAX_BODY = 1024 * 1024
 WINDOW_SECONDS = 180
@@ -582,6 +582,7 @@ def detailed_health_payload(environment: str) -> dict[str, Any]:
         "python_version": sys.version.split()[0],
         "environment": environment,
         "configured_environments": configured,
+        "telemetry_storage": TELEMETRY.storage_status(),
         "uptime_seconds": int(time.time() - STARTED_AT),
     }
 
