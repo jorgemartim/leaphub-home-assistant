@@ -24,7 +24,7 @@ from cryptography.fernet import Fernet, InvalidToken
 import leaphub_connector as connector
 
 LOG = logging.getLogger("leaphub.telemetry")
-ENGINE_VERSION = "1.11.89"
+ENGINE_VERSION = "1.11.90"
 
 
 def utc_iso() -> str:
@@ -491,6 +491,29 @@ class TelemetryEngine:
                 return result
             except Exception as exc:
                 session["last_used_at"] = time.time()
+                if connector.is_command_certificate_session_error(exc):
+                    # cert/sync recusou o token antes da ação chegar ao veículo.
+                    # A sessão compartilhada é descartada e o mesmo comando é
+                    # tentado uma única vez em uma autenticação limpa. Outros
+                    # erros de token, especialmente após aceite, nunca entram aqui.
+                    LOG.warning(
+                        "Sessão de %s expirou durante cert/sync; recriando uma única vez antes do envio.",
+                        subscription_id,
+                    )
+                    self._close_session_locked(subscription_id)
+                    if progress is not None:
+                        try:
+                            progress(
+                                "reconnecting",
+                                "A sessão expirou antes do envio. Criando uma conexão limpa e protegida.",
+                                {"session_recovery": True},
+                            )
+                        except Exception:
+                            pass
+                    recovered = connector.handle_command(payload, progress=progress)
+                    recovered["session_recovered"] = True
+                    recovered["session_reused"] = False
+                    return recovered
                 if connector.is_authentication_error(exc):
                     self._close_session_locked(subscription_id)
                 raise

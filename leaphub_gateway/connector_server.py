@@ -32,7 +32,7 @@ except ModuleNotFoundError as exc:
         "Módulo interno leaphub_connector ausente na imagem. Atualize o Leap Hub Gateway."
     ) from exc
 
-VERSION = "1.11.89"
+VERSION = "1.11.90"
 SERVICE = "Leap Hub Leapmotor Connector"
 MAX_BODY = 1024 * 1024
 WINDOW_SECONDS = 180
@@ -311,7 +311,7 @@ def command_journal_progress(
         "connector_version": connector.CONNECTOR_VERSION,
     }
     if isinstance(extra, dict):
-        for key in ("attempt", "confirmation_pending", "verified_by_gateway", "safe_retry", "queue_wait_seconds", "waiting_for"):
+        for key in ("attempt", "confirmation_pending", "verified_by_gateway", "safe_retry", "queue_wait_seconds", "waiting_for", "session_recovery"):
             if key in extra:
                 response[key] = extra[key]
     raw = json.dumps(response, ensure_ascii=False, separators=(",", ":"), default=connector.json_default)
@@ -563,6 +563,8 @@ def run_command_job(
             bool(result.get("verified_by_gateway")),
             bool(result.get("confirmation_pending") or result.get("verification_requested")),
         )
+        if bool(result.get("session_recovered")):
+            LOG.info("Comando %s exigiu uma nova sessão após cert/sync recusar o token anterior.", request_id[:12])
     except BaseException as exc:  # noqa: BLE001
         command_journal_fail(request_hash, request_id, exc)
         defer_seconds = 3

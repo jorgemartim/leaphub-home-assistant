@@ -1,3 +1,11 @@
+## 1.11.90
+
+- Detecta expiração da sessão especificamente durante `cert/sync`, antes do envio da ação.
+- Descarta a sessão compartilhada inválida e faz uma única autenticação limpa para repetir o comando com segurança.
+- Não repete comandos quando o erro acontece depois do possível aceite pela nuvem.
+- Mantém fila prioritária e trava exclusiva por conta.
+- Expõe diagnóstico seguro de recuperação de sessão sem tokens, PIN, VIN ou credenciais.
+
 ## 1.11.89
 
 - Comandos manuais entram em fila prioritária por conta antes de aguardar a telemetria.

@@ -27,7 +27,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable
 
-CONNECTOR_VERSION = "1.11.89"
+CONNECTOR_VERSION = "1.11.90"
 MAX_INPUT_BYTES = 1024 * 1024
 logging.getLogger("leapmotor_api").setLevel(logging.WARNING)
 LOGGER = logging.getLogger("leaphub.connector")
@@ -158,6 +158,24 @@ def is_transient_cloud_error(value: Any) -> bool:
 def is_authentication_error(value: Any) -> bool:
     message = clean_message(str(value)).lower()
     return not is_transient_cloud_error(message) and any(marker in message for marker in AUTHENTICATION_MARKERS)
+
+
+def is_command_certificate_session_error(value: Any) -> bool:
+    """True only when certificate preparation failed before command dispatch.
+
+    This narrow classifier is intentionally stricter than the generic token
+    markers: retrying is safe here because the cloud rejected cert/sync before
+    the vehicle action was submitted.
+    """
+    message = clean_message(str(value)).lower()
+    certificate_stage = any(marker in message for marker in (
+        'cert sync failed', 'certificate sync failed', 'failed to issue certificate',
+        'could not issue certificate', 'certificate issuance failed',
+    ))
+    invalid_session = any(marker in message for marker in (
+        'token is invalid', 'invalid token', 'token expired', 'session expired', 'login expired',
+    ))
+    return certificate_stage and invalid_session
 
 
 def reconnect_message(value: Any) -> str:
