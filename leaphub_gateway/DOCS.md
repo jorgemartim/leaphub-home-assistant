@@ -18,7 +18,7 @@ Enquanto uma aba autenticada do Leap Hub permanece visível, o site renova uma j
 - Cada operação cria no máximo uma tentativa de login e falhas usam espera progressiva de 5 min até 6 h.
 - Falha de autenticação pausa a assinatura até nova confirmação das credenciais.
 - Reenvios com as mesmas credenciais não removem a proteção de autenticação ou cooldown.
-- Limite de requisições ativa cooldown padrão de 6 horas.
+- Limite geral de requisições usa Retry-After; sem prazo, reavalia em 15 minutos.
 - Intervalos seguros: 30 s dirigindo/carregando, 5 min estacionado e 15 min em repouso.
 - Quando a janela de presença termina, a sessão é encerrada e nenhuma consulta à nuvem continua.
 

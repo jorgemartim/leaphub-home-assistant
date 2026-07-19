@@ -24,7 +24,7 @@ from cryptography.fernet import Fernet, InvalidToken
 import leaphub_connector as connector
 
 LOG = logging.getLogger("leaphub.telemetry")
-ENGINE_VERSION = "1.11.94"
+ENGINE_VERSION = "1.11.95"
 
 
 def utc_iso() -> str:
@@ -120,7 +120,7 @@ class TelemetryEngine:
         self.parked_seconds = self._bounded("telemetry_parked_seconds", 300, 60, 3600)
         self.sleep_seconds = self._bounded("telemetry_sleep_seconds", 900, 300, 14400)
         self.presence_window_seconds = self._bounded("telemetry_presence_window_seconds", 420, 300, 1800)
-        self.rate_limit_cooldown_seconds = self._bounded("telemetry_rate_limit_cooldown_seconds", 21600, 1800, 86400)
+        self.rate_limit_cooldown_seconds = self._bounded("telemetry_rate_limit_cooldown_seconds", 900, 300, 3600)
         self.login_cooldown_max_seconds = 300
         self.charge_watch_seconds = max(5, min(15, self.charging_seconds * 2))
         self.batch_size = self._bounded("telemetry_batch_size", 25, 1, 50)
@@ -440,6 +440,19 @@ class TelemetryEngine:
                 ).rowcount
                 if repaired:
                     LOG.warning("Corrigidos %s cooldown(s) de login com prazo inválido da versão anterior.", repaired)
+                # Versões anteriores também podiam manter um limite geral sem
+                # Retry-After por seis horas. Ele não é removido imediatamente:
+                # é reduzido para uma reavaliação única e segura em cinco minutos.
+                repaired_general = db.execute(
+                    "UPDATE subscriptions SET cooldown_until=?,next_run_at=?,updated_at=? "
+                    "WHERE status='cooldown' AND cooldown_until>? "
+                    "AND LOWER(COALESCE(last_error,'')) NOT LIKE '%password error limit%' "
+                    "AND LOWER(COALESCE(last_error,'')) NOT LIKE '%try again in%' "
+                    "AND LOWER(COALESCE(last_error,'')) NOT LIKE '%login attempt limit%'",
+                    (now_epoch + 300, now_epoch + 300, utc_iso(), now_epoch + 3600),
+                ).rowcount
+                if repaired_general:
+                    LOG.warning("Reduzidos %s cooldown(s) gerais antigos para reavaliação segura em 300s.", repaired_general)
 
     def _set_account_login_cooldown(self, environment: str, account_id: int, retry_after_seconds: int, message: str) -> None:
         delay = max(30, min(self.login_cooldown_max_seconds, int(retry_after_seconds or 135)))
@@ -1263,7 +1276,9 @@ class TelemetryEngine:
                 LOG.warning("Autenticação de %s aguardará %ss antes da próxima tentativa; credenciais permanecem protegidas.", sid, delay)
             elif self._looks_rate_limited(message):
                 self._close_session(sid)
-                delay = self.rate_limit_cooldown_seconds
+                delay = connector.rate_limit_cooldown_seconds(message, self.rate_limit_cooldown_seconds)
+                if delay <= 0:
+                    delay = self.rate_limit_cooldown_seconds
                 now = utc_iso()
                 with self.lock, self._db() as db:
                     db.execute(

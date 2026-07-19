@@ -1,3 +1,10 @@
+## 1.11.95
+
+- Reduz cooldown geral sem `Retry-After` de seis horas para quinze minutos, com limite máximo de uma hora.
+- Reavalia cooldowns antigos excessivos em cinco minutos após a atualização.
+- Mantém o bloqueio de login de dois minutos separado do limite geral da API.
+- Não repete autenticação ou comando durante a pausa.
+
 ## 1.11.94
 
 - Climatização pós-despertar com verificação fresca e uma única repetição idempotente.

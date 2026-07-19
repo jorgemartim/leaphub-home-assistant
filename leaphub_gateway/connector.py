@@ -27,7 +27,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable
 
-CONNECTOR_VERSION = "1.11.94"
+CONNECTOR_VERSION = "1.11.95"
 MAX_INPUT_BYTES = 1024 * 1024
 logging.getLogger("leapmotor_api").setLevel(logging.WARNING)
 LOGGER = logging.getLogger("leaphub.connector")
@@ -143,6 +143,40 @@ def login_cooldown_seconds(value: Any) -> int:
 
 def is_login_cooldown_error(value: Any) -> bool:
     return login_cooldown_seconds(value) > 0
+
+
+GENERAL_RATE_LIMIT_MARKERS = (
+    "too many requests",
+    "request limit",
+    "rate limit",
+    "rate-limit",
+    "throttle",
+    "temporarily blocked",
+    "muitas solicitações",
+    "limite de requisições",
+)
+
+
+def rate_limit_cooldown_seconds(value: Any, default_seconds: int = 900) -> int:
+    message = clean_message(str(value)).lower()
+    if login_cooldown_seconds(message) > 0:
+        return 0
+    if not any(marker in message for marker in GENERAL_RATE_LIMIT_MARKERS) and not re.search(r"(?:^|\D)429(?:\D|$)", message):
+        return 0
+    match = re.search(
+        r"(?:retry[- ]?after|try again in|retry in)\s*[:=]?\s*(\d+)\s*(second|seconds|minute|minutes|hour|hours)?",
+        message,
+    )
+    if match:
+        amount = max(1, int(match.group(1)))
+        unit = str(match.group(2) or "seconds")
+        multiplier = 1 if unit.startswith("second") else (60 if unit.startswith("minute") else 3600)
+        delay = amount * multiplier + 15
+    else:
+        delay = int(default_seconds or 900)
+    # Um bloqueio geral é reavaliado de forma moderada. Não deixe uma resposta
+    # sem Retry-After congelar a conta por seis horas.
+    return max(300, min(3600, delay))
 
 
 TRANSIENT_CLOUD_MARKERS = (
