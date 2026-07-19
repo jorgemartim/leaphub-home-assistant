@@ -1,3 +1,12 @@
+## 1.11.89
+
+- Comandos manuais entram em fila prioritária por conta antes de aguardar a telemetria.
+- Uma leitura já iniciada pode terminar, mas nenhuma nova leitura da mesma conta começa enquanto houver comando pendente.
+- O comando não falha mais após 60 segundos: aguarda a conta por uma janela protegida de até 180 segundos.
+- A vaga global do Connector só é ocupada depois que a conta fica livre, evitando bloquear outras contas.
+- Logs registram tempo de fila e tipo seguro do ocupante da conta, sem e-mail, VIN, PIN ou credenciais.
+- Novos estados `waiting_account` e `waiting_slot` distinguem fila da conta e fila global.
+
 ## 1.11.88
 
 - Corrigido logger indefinido no caminho de verificação do comando remoto.

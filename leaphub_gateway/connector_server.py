@@ -32,7 +32,7 @@ except ModuleNotFoundError as exc:
         "Módulo interno leaphub_connector ausente na imagem. Atualize o Leap Hub Gateway."
     ) from exc
 
-VERSION = "1.11.88"
+VERSION = "1.11.89"
 SERVICE = "Leap Hub Leapmotor Connector"
 MAX_BODY = 1024 * 1024
 WINDOW_SECONDS = 180
@@ -47,7 +47,47 @@ COMMAND_DB_PATH = Path(os.getenv("LEAPHUB_COMMAND_DB_PATH", "/data/security/conn
 COMMAND_CACHE: dict[str, dict[str, Any]] = {}
 COMMAND_CACHE_LOCK = threading.RLock()
 COMMAND_CACHE_MAX = 2000
-ACCOUNT_LOCKS: dict[str, threading.Lock] = {}
+class AccountOperationLock:
+    """Lock por conta com diagnóstico seguro do ocupante atual.
+
+    A trava não armazena e-mail, VIN, PIN ou qualquer credencial. O metadado é
+    usado apenas para distinguir telemetria, comando e manutenção nos logs.
+    """
+
+    def __init__(self, key: str) -> None:
+        self.key = key
+        self._lock = threading.Lock()
+        self._meta_lock = threading.Lock()
+        self._owner = ""
+        self._acquired_at = 0.0
+
+    def acquire(self, blocking: bool = True, timeout: float = -1) -> bool:
+        if timeout is None or timeout < 0:
+            acquired = self._lock.acquire(blocking)
+        else:
+            acquired = self._lock.acquire(blocking, timeout)
+        if acquired:
+            with self._meta_lock:
+                self._owner = threading.current_thread().name[:80]
+                self._acquired_at = time.monotonic()
+        return acquired
+
+    def release(self) -> None:
+        with self._meta_lock:
+            self._owner = ""
+            self._acquired_at = 0.0
+        self._lock.release()
+
+    def locked(self) -> bool:
+        return self._lock.locked()
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._meta_lock:
+            held_for = max(0.0, time.monotonic() - self._acquired_at) if self._acquired_at else 0.0
+            return {"owner": self._owner, "held_for_seconds": round(held_for, 1)}
+
+
+ACCOUNT_LOCKS: dict[str, AccountOperationLock] = {}
 ACCOUNT_LOCK_LAST_USED: dict[str, float] = {}
 ACCOUNT_LOCKS_GUARD = threading.Lock()
 MANUAL_PENDING: dict[str, int] = {}
@@ -74,6 +114,7 @@ SECRETS = {
 MAX_PARALLEL = max(1, min(8, int(OPTIONS.get("connector_max_parallel") or OPTIONS.get("max_parallel_requests") or 2)))
 SEMAPHORE = threading.BoundedSemaphore(MAX_PARALLEL)
 MANUAL_WAIT_SECONDS = max(2, min(60, int(OPTIONS.get("connector_manual_wait_seconds") or OPTIONS.get("manual_wait_seconds") or 35)))
+MANUAL_QUEUE_SECONDS = max(120, min(300, int(OPTIONS.get("connector_manual_queue_seconds") or 180)))
 LOG_LEVEL = str(OPTIONS.get("log_level") or "INFO").upper()
 logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO), format="%(asctime)s %(levelname)s %(message)s")
 LOG = logging.getLogger("leaphub.connector")
@@ -257,12 +298,12 @@ def command_journal_progress(
 ) -> None:
     if not request_hash:
         return
-    allowed = {"queued", "preparing", "waking", "reconnecting", "executing", "confirming"}
+    allowed = {"queued", "waiting_account", "waiting_slot", "preparing", "waking", "reconnecting", "executing", "confirming"}
     status = status if status in allowed else "executing"
     response: dict[str, Any] = {
         "ok": True,
         "accepted": True,
-        "queued": status in {"queued", "preparing"},
+        "queued": status in {"queued", "waiting_account", "waiting_slot", "preparing"},
         "confirmation_pending": True,
         "status": status,
         "request_id": request_id,
@@ -270,7 +311,7 @@ def command_journal_progress(
         "connector_version": connector.CONNECTOR_VERSION,
     }
     if isinstance(extra, dict):
-        for key in ("attempt", "confirmation_pending", "verified_by_gateway", "safe_retry"):
+        for key in ("attempt", "confirmation_pending", "verified_by_gateway", "safe_retry", "queue_wait_seconds", "waiting_for"):
             if key in extra:
                 response[key] = extra[key]
     raw = json.dumps(response, ensure_ascii=False, separators=(",", ":"), default=connector.json_default)
@@ -379,7 +420,7 @@ def command_journal_status(environment: str, payload: dict[str, Any]) -> dict[st
         except (ValueError, TypeError, json.JSONDecodeError):
             response = {}
     status = str(row.get("status") or "queued")
-    active_states = {"queued", "preparing", "waking", "reconnecting", "executing", "running"}
+    active_states = {"queued", "waiting_account", "waiting_slot", "preparing", "waking", "reconnecting", "executing", "running"}
     if status in active_states and time.time() - float(row.get("updated_at") or 0) > 120:
         stale_message = "O Gateway reiniciou ou perdeu o worker antes de concluir este comando. A ação não será repetida automaticamente."
         stale_response = {
@@ -410,10 +451,12 @@ def command_journal_status(environment: str, payload: dict[str, Any]) -> dict[st
     response["updated_at"] = float(row.get("updated_at") or 0)
     if status in active_states:
         response.setdefault("accepted", True)
-        response.setdefault("queued", status in {"queued", "preparing"})
+        response.setdefault("queued", status in {"queued", "waiting_account", "waiting_slot", "preparing"})
         response.setdefault("confirmation_pending", True)
         messages = {
             "queued": "Comando recebido e protegido contra repetição.",
+            "waiting_account": "Aguardando a leitura atual da conta terminar. O comando está na fila prioritária.",
+            "waiting_slot": "Conta liberada. Aguardando uma vaga no Connector.",
             "preparing": "Preparando uma conexão exclusiva para a ação.",
             "waking": "Veículo em repouso. Solicitando despertar.",
             "reconnecting": "Veículo acordando. Refazendo a conexão antes da ação.",
@@ -442,31 +485,79 @@ def run_command_job(
 ) -> None:
     acquired = False
     account_acquired = False
-    account_lock: threading.Lock | None = None
+    account_lock: AccountOperationLock | None = None
     worker_key = command_worker_key(environment, request_id)
     defer_seconds = 4
+    queue_started = time.monotonic()
     try:
-        command_journal_progress(request_hash, request_id, "preparing", "Aguardando uma vaga exclusiva para o comando.")
-        acquired = SEMAPHORE.acquire(timeout=max(60, MANUAL_WAIT_SECONDS))
-        if not acquired:
-            raise connector.ConnectorTemporaryError("Conector ocupado. O comando permaneceu protegido e não foi repetido.")
-        account_lock = account_operation_lock(environment, payload)
-        account_acquired = account_lock.acquire(timeout=max(60, MANUAL_WAIT_SECONDS))
-        if not account_acquired:
-            raise connector.ConnectorTemporaryError("A conta ainda finalizava uma leitura anterior. Tente novamente em instantes.")
         def progress(stage: str, message: str, extra: dict[str, Any] | None = None) -> None:
             command_journal_progress(request_hash, request_id, stage, message, extra)
 
+        # A operação manual entra em estado pendente antes do worker iniciar.
+        # Isso impede novas leituras automáticas desta conta. Uma leitura já em
+        # andamento termina no próximo ponto seguro e libera a mesma sessão.
+        account_lock = account_operation_lock(environment, payload)
+        next_progress_at = 0.0
+        next_log_at = 15.0
+        progress(
+            "waiting_account",
+            "Aguardando a leitura atual terminar. O comando está na fila prioritária.",
+            {"queue_wait_seconds": 0, "waiting_for": "telemetry_or_account_operation"},
+        )
+        TELEMETRY.wake_event.set()
+        while not account_lock.acquire(timeout=1.0):
+            elapsed = time.monotonic() - queue_started
+            TELEMETRY.wake_event.set()
+            if elapsed >= next_progress_at:
+                holder = account_lock.snapshot()
+                owner = str(holder.get("owner") or "").lower()
+                waiting_for = "telemetry" if "telemetry" in owner else "account_operation"
+                progress(
+                    "waiting_account",
+                    "Aguardando a leitura atual terminar. O comando está na fila prioritária.",
+                    {"queue_wait_seconds": int(elapsed), "waiting_for": waiting_for},
+                )
+                next_progress_at = elapsed + 4.0
+            if elapsed >= next_log_at:
+                holder = account_lock.snapshot()
+                LOG.info(
+                    "Comando %s aguardando conta há %ss; ocupante=%s, ocupado_há=%ss.",
+                    request_id[:12],
+                    int(elapsed),
+                    str(holder.get("owner") or "desconhecido")[:80],
+                    int(float(holder.get("held_for_seconds") or 0)),
+                )
+                next_log_at = elapsed + 15.0
+            if elapsed >= MANUAL_QUEUE_SECONDS:
+                raise connector.ConnectorTemporaryError(
+                    "A leitura anterior excedeu a janela segura. O comando não foi enviado e pode ser tentado novamente."
+                )
+        account_acquired = True
+
+        progress(
+            "waiting_slot",
+            "Conta liberada. Aguardando uma vaga no Connector.",
+            {"queue_wait_seconds": int(time.monotonic() - queue_started), "waiting_for": "connector_slot"},
+        )
+        acquired = SEMAPHORE.acquire(timeout=max(30, MANUAL_WAIT_SECONDS))
+        if not acquired:
+            raise connector.ConnectorTemporaryError(
+                "A conta foi liberada, mas o Connector permaneceu ocupado. O comando não foi enviado."
+            )
+
+        progress("preparing", "Preparando a sessão autenticada para a ação.")
         result = TELEMETRY.execute_command(environment, payload, progress=progress)
         if request_id:
             result["request_id"] = request_id
         result["queued"] = False
+        result["queue_wait_seconds"] = int(time.monotonic() - queue_started)
         command_journal_finish(request_hash, request_id, result)
         defer_seconds = 5 if bool(result.get("wake_attempted")) else 3
         LOG.info(
-            "Comando remoto %s enviado em segundo plano para %s; tentativas=%s, retry_idempotente=%s, confirmado_direto=%s, confirmação_telemetria=%s.",
+            "Comando remoto %s enviado em segundo plano para %s; espera_fila=%ss, tentativas=%s, retry_idempotente=%s, confirmado_direto=%s, confirmação_telemetria=%s.",
             str(payload.get("command") or "desconhecido")[:40],
             environment,
+            int(result.get("queue_wait_seconds") or 0),
             int(result.get("attempts") or 1),
             bool(result.get("safe_retry_performed")),
             bool(result.get("verified_by_gateway")),
@@ -478,19 +569,16 @@ def run_command_job(
         LOG.warning("Comando remoto em segundo plano falhou (%s): %s", type(exc).__name__, connector.clean_message(str(exc)))
     finally:
         manual_operation_defer(pending_key, defer_seconds)
-        if account_acquired and account_lock is not None:
-            account_lock.release()
         if acquired:
             SEMAPHORE.release()
+        if account_acquired and account_lock is not None:
+            account_lock.release()
         manual_operation_leave(pending_key)
-        # A janela de telemetria já foi criada pelo Leap Hub. Despertar o worker
-        # logo após o pequeno intervalo evita esperar o ciclo normal do carro.
         timer = threading.Timer(float(defer_seconds) + 0.2, TELEMETRY.wake_event.set)
         timer.daemon = True
         timer.start()
         with COMMAND_WORKERS_GUARD:
             COMMAND_WORKERS.pop(worker_key, None)
-
 
 def start_command_job(
     environment: str, payload: dict[str, Any], request_hash: str | None, request_id: str
@@ -503,6 +591,7 @@ def start_command_job(
         if existing is not None and existing.is_alive():
             return True
         pending_key = manual_operation_enter(environment, payload)
+        TELEMETRY.wake_event.set()
         worker = threading.Thread(
             target=run_command_job,
             args=(environment, dict(payload), request_hash, request_id, pending_key),
@@ -621,21 +710,22 @@ def account_operation_key(environment: str, payload: dict[str, Any]) -> str:
     return hashlib.sha256(f"{environment}|{stable}".encode("utf-8")).hexdigest()
 
 
-def account_operation_lock(environment: str, payload: dict[str, Any]) -> threading.Lock:
+def account_operation_lock(environment: str, payload: dict[str, Any]) -> AccountOperationLock:
     key = account_operation_key(environment, payload)
     now = time.time()
     with ACCOUNT_LOCKS_GUARD:
         if len(ACCOUNT_LOCKS) > 1024:
-            stale = [
-                item_key for item_key, used_at in ACCOUNT_LOCK_LAST_USED.items()
-                if used_at < now - 3600 and not ACCOUNT_LOCKS.get(item_key, threading.Lock()).locked()
-            ]
+            stale: list[str] = []
+            for item_key, used_at in ACCOUNT_LOCK_LAST_USED.items():
+                lock_item = ACCOUNT_LOCKS.get(item_key)
+                if used_at < now - 3600 and lock_item is not None and not lock_item.locked():
+                    stale.append(item_key)
             for item_key in stale[:256]:
                 ACCOUNT_LOCKS.pop(item_key, None)
                 ACCOUNT_LOCK_LAST_USED.pop(item_key, None)
         lock = ACCOUNT_LOCKS.get(key)
         if lock is None:
-            lock = threading.Lock()
+            lock = AccountOperationLock(key)
             ACCOUNT_LOCKS[key] = lock
         ACCOUNT_LOCK_LAST_USED[key] = now
         return lock
@@ -859,7 +949,7 @@ class Handler(BaseHTTPRequestHandler):
             pending_key = manual_operation_enter(environment, payload)
             acquired = False
             account_acquired = False
-            account_lock: threading.Lock | None = None
+            account_lock: AccountOperationLock | None = None
             try:
                 acquired = SEMAPHORE.acquire(timeout=MANUAL_WAIT_SECONDS)
                 if not acquired:

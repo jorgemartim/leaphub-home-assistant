@@ -24,7 +24,7 @@ from cryptography.fernet import Fernet, InvalidToken
 import leaphub_connector as connector
 
 LOG = logging.getLogger("leaphub.telemetry")
-ENGINE_VERSION = "1.11.88"
+ENGINE_VERSION = "1.11.89"
 
 
 def utc_iso() -> str:
@@ -77,7 +77,7 @@ class TelemetryEngine:
         options: dict[str, Any],
         secrets: dict[str, str],
         operation_semaphore: threading.BoundedSemaphore,
-        account_lock_provider: Callable[[str, dict[str, Any]], threading.Lock] | None = None,
+        account_lock_provider: Callable[[str, dict[str, Any]], Any] | None = None,
         account_wait_seconds: int = 20,
         manual_pending_provider: Callable[[str, dict[str, Any]], bool] | None = None,
     ) -> None:
@@ -1375,6 +1375,8 @@ class TelemetryEngine:
 
         client = session["client"]
         try:
+            if manual_should_yield is not None and manual_should_yield():
+                raise TelemetryYieldForManual("Operação manual aguardando a conta.")
             vehicles_value = client.get_vehicle_list()
             vehicles = vehicles_value if isinstance(vehicles_value, list) else list(vehicles_value or [])
             if manual_should_yield is not None and manual_should_yield():
