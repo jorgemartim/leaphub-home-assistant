@@ -1,3 +1,12 @@
+## 1.11.91
+
+- Introduz o estado `sent`: a entrega termina quando a nuvem aceita a ação, enquanto a confirmação física continua separadamente.
+- Evita que a tela permaneça carregando até o carro travar novamente sozinho.
+- Mantém o diário idempotente: consultar `sent` nunca repete o comando.
+- Climatização faz uma última leitura depois da única repetição idempotente protegida.
+- Quando a nuvem aceita, mas o ar continua desligado, retorna o diagnóstico seguro `climate_not_applied_after_retry`.
+- Logs distinguem envio, confirmação e estado não aplicado sem expor conta, token, VIN ou PIN.
+
 ## 1.11.90
 
 - Detecta expiração da sessão especificamente durante `cert/sync`, antes do envio da ação.

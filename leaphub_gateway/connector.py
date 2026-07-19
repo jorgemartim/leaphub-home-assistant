@@ -27,7 +27,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable
 
-CONNECTOR_VERSION = "1.11.90"
+CONNECTOR_VERSION = "1.11.91"
 MAX_INPUT_BYTES = 1024 * 1024
 logging.getLogger("leapmotor_api").setLevel(logging.WARNING)
 LOGGER = logging.getLogger("leaphub.connector")
@@ -2459,6 +2459,7 @@ def handle_command(
     verified_by_gateway = False
     safe_retry_performed = False
     verification_state = "not_checked"
+    execution_warning: str | None = None
 
     def close_client(force: bool = False) -> None:
         nonlocal client, client_is_borrowed
@@ -2670,8 +2671,43 @@ def handle_command(
                                 clean_message(str(retry_error)),
                             )
 
+        # Depois da única repetição idempotente da climatização, fazemos uma
+        # última leitura. Ela não dispara outra ação: serve apenas para distinguir
+        # "enviado e aplicado" de "a nuvem aceitou, mas o estado continuou igual".
+        if safe_retry_performed and command in SAFE_STATE_RETRY_COMMANDS and not verified_by_gateway:
+            report("confirming", "Ação reenviada uma única vez. Fazendo a última leitura de confirmação.")
+            time.sleep(8.0)
+            try:
+                matched_after_retry, evaluable_after_retry, retry_state = verify_command_state(
+                    client, resolved_vehicle_id, command, parameters, None
+                )
+                verification_state = f"after_retry:{retry_state}"
+                if matched_after_retry:
+                    verified_by_gateway = True
+                    confirmation_pending = False
+                    confirmation_reason = None
+                    report("confirming", "Estado confirmado depois da repetição protegida.", {"verified_by_gateway": True})
+                elif evaluable_after_retry:
+                    confirmation_pending = True
+                    confirmation_reason = "state_not_applied_after_retry"
+                    execution_warning = "climate_not_applied_after_retry"
+                else:
+                    confirmation_pending = True
+                    confirmation_reason = confirmation_reason or "retry_state_unknown"
+            except Exception as final_verification_error:  # noqa: BLE001
+                confirmation_pending = True
+                confirmation_reason = confirmation_reason or "final_verification_unavailable"
+                verification_state = "after_retry:verification_unavailable"
+                connector_log(
+                    logging.WARNING,
+                    "Leitura final da climatização indisponível após a repetição protegida: %s",
+                    clean_message(str(final_verification_error)),
+                )
+
         if verified_by_gateway:
             message = "A ação foi executada e confirmada por uma leitura nova do veículo."
+        elif execution_warning == "climate_not_applied_after_retry":
+            message = "A nuvem aceitou a climatização, mas uma leitura nova ainda mostrou o sistema desligado após a repetição protegida. Confira o veículo antes de tentar novamente."
         elif safe_retry_performed:
             message = "O veículo acordou e a ação foi reenviada uma única vez com proteção idempotente. A telemetria confirmará o estado."
         elif confirmation_pending:
@@ -2701,6 +2737,7 @@ def handle_command(
             "verified_by_gateway": verified_by_gateway,
             "safe_retry_performed": safe_retry_performed,
             "verification_state": verification_state,
+            "execution_warning": execution_warning,
         }
     finally:
         if borrowed_client is not None:

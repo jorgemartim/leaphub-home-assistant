@@ -32,7 +32,7 @@ except ModuleNotFoundError as exc:
         "Módulo interno leaphub_connector ausente na imagem. Atualize o Leap Hub Gateway."
     ) from exc
 
-VERSION = "1.11.90"
+VERSION = "1.11.91"
 SERVICE = "Leap Hub Leapmotor Connector"
 MAX_BODY = 1024 * 1024
 WINDOW_SECONDS = 180
@@ -334,7 +334,10 @@ def command_journal_finish(request_hash: str | None, request_id: str, response: 
         return
     safe = dict(response)
     safe["request_id"] = request_id
-    final_status = "completed" if bool(safe.get("verified_by_gateway")) else ("confirming" if bool(safe.get("confirmation_pending")) else "accepted")
+    # "sent" encerra a entrega ao cloud sem fingir confirmação física.
+    # A telemetria pode confirmar depois, mas o navegador não precisa manter o
+    # botão carregando durante toda essa janela.
+    final_status = "completed" if bool(safe.get("verified_by_gateway")) else "sent"
     safe["status"] = final_status
     safe["queued"] = False
     raw = json.dumps(safe, ensure_ascii=False, separators=(",", ":"), default=connector.json_default)
@@ -464,11 +467,13 @@ def command_journal_status(environment: str, payload: dict[str, Any]) -> dict[st
             "running": "Executando o comando remoto.",
         }
         response.setdefault("message", messages.get(status, "Acompanhando a execução do comando."))
-    elif status in {"accepted", "confirming"}:
+    elif status in {"accepted", "sent", "confirming"}:
         response.setdefault("accepted", True)
         response.setdefault("queued", False)
-        response.setdefault("confirmation_pending", True)
-        response.setdefault("message", "Ação enviada. Aguardando a telemetria confirmar o novo estado.")
+        response.setdefault("command_dispatched", True)
+        response.setdefault("cloud_accepted", True)
+        response.setdefault("confirmation_pending", status != "completed")
+        response.setdefault("message", "Comando enviado ao veículo. A confirmação do estado continuará em segundo plano.")
     return response
 
 
@@ -565,6 +570,13 @@ def run_command_job(
         )
         if bool(result.get("session_recovered")):
             LOG.info("Comando %s exigiu uma nova sessão após cert/sync recusar o token anterior.", request_id[:12])
+        if result.get("execution_warning"):
+            LOG.warning(
+                "Comando %s foi enviado, mas terminou com diagnóstico %s (estado=%s).",
+                request_id[:12],
+                str(result.get("execution_warning") or "warning")[:80],
+                str(result.get("verification_state") or "unknown")[:80],
+            )
     except BaseException as exc:  # noqa: BLE001
         command_journal_fail(request_hash, request_id, exc)
         defer_seconds = 3
