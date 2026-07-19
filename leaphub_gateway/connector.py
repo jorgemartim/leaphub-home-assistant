@@ -27,9 +27,11 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable
 
-CONNECTOR_VERSION = "1.11.85"
+CONNECTOR_VERSION = "1.11.86"
 MAX_INPUT_BYTES = 1024 * 1024
 logging.getLogger("leapmotor_api").setLevel(logging.WARNING)
+
+SAFE_STATE_RETRY_COMMANDS = {"climate_on", "climate_off"}
 
 COMMAND_METHODS: dict[str, str] = {
     "lock": "lock_vehicle",
@@ -2328,6 +2330,39 @@ def execute_vehicle_command(method: Any, command: str, vehicle_id: str, paramete
         return method(vehicle_id, name=name, address=address, latitude=latitude, longitude=longitude)
     return method(vehicle_id)
 
+
+def verify_command_state(
+    client: Any,
+    resolved_vehicle_id: str,
+    command: str,
+    parameters: dict[str, Any],
+    vehicles: list[Any] | None = None,
+) -> tuple[bool, bool, str]:
+    """Read one fresh state without interpreting a transport acknowledgement as success."""
+    if command not in SAFE_STATE_RETRY_COMMANDS:
+        return False, False, "unsupported"
+    available = list(vehicles or client.get_vehicle_list() or [])
+    selected = None
+    for vehicle in available:
+        vin = str(attribute(vehicle, "vin", "") or "").strip()
+        car_id = str(attribute(vehicle, "car_id", "") or "").strip()
+        if resolved_vehicle_id in {vin, car_id}:
+            selected = vehicle
+            break
+    if selected is None and len(available) == 1:
+        selected = available[0]
+    if selected is None:
+        return False, False, "vehicle_not_found"
+    status = client.get_vehicle_status(selected)
+    if command in {"climate_on", "climate_off"}:
+        climate = attribute(status, "climate")
+        state = bool_or_none(attribute(climate, "ac_switch"))
+        if state is None:
+            return False, False, "climate_unknown"
+        expected = command == "climate_on"
+        return state is expected, True, "climate_on" if state else "climate_off"
+    return False, False, "unsupported"
+
 def handle_command(
     payload: dict[str, Any],
     progress: Callable[[str, str, dict[str, Any] | None], None] | None = None,
@@ -2378,6 +2413,9 @@ def handle_command(
     confirmation_reason: str | None = None
     command_attempts = 0
     session_attempts = 0
+    verified_by_gateway = False
+    safe_retry_performed = False
+    verification_state = "not_checked"
 
     def close_client() -> None:
         nonlocal client
@@ -2492,8 +2530,54 @@ def handle_command(
                 raise RuntimeError(clean_message(str(first_error))) from first_error
 
         verification_requested = bool(verify_after)
-        if confirmation_pending:
-            message = "A ação foi aceita pela nuvem. O estado será confirmado pela telemetria sem reenviar o comando."
+        # Algumas versões da nuvem aceitam climate_on enquanto o veículo ainda
+        # está despertando, mas não aplicam o estado. Para climatização, que é
+        # idempotente, fazemos uma leitura fresca e no máximo uma segunda entrega
+        # protegida. Outros comandos jamais são repetidos automaticamente.
+        if verify_after and command in SAFE_STATE_RETRY_COMMANDS:
+            report("confirming", "Ação aceita. Verificando o estado real do veículo.")
+            close_client()
+            time.sleep(6.0)
+            try:
+                _, resolved_vehicle_id, resolved_list, method, identifier_source = open_client(3)
+                matched, evaluable, verification_state = verify_command_state(
+                    client, resolved_vehicle_id, command, parameters, resolved_list
+                )
+                if matched:
+                    verified_by_gateway = True
+                    confirmation_pending = False
+                    confirmation_reason = None
+                    report("confirming", "Estado confirmado diretamente no veículo.", {"verified_by_gateway": True})
+                elif evaluable and command_attempts < 2:
+                    report(
+                        "executing",
+                        "O veículo acordou, mas o estado ainda não mudou. Repetindo uma única vez a ação idempotente.",
+                        {"safe_retry": True},
+                    )
+                    command_attempts += 1
+                    result = execute_vehicle_command(method, command, resolved_vehicle_id, parameters)
+                    safe_retry_performed = True
+                    confirmation_pending = True
+                    confirmation_reason = "state_retry"
+                else:
+                    confirmation_pending = True
+                    confirmation_reason = confirmation_reason or "telemetry_pending"
+            except Exception as verification_error:  # noqa: BLE001
+                verification_state = "verification_unavailable"
+                confirmation_pending = True
+                confirmation_reason = confirmation_reason or "verification_unavailable"
+                LOG.info(
+                    "Verificação direta do comando %s adiada: %s",
+                    command,
+                    clean_message(str(verification_error)),
+                )
+
+        if verified_by_gateway:
+            message = "A ação foi executada e confirmada por uma leitura nova do veículo."
+        elif safe_retry_performed:
+            message = "O veículo acordou e a ação foi reenviada uma única vez com proteção idempotente. A telemetria confirmará o estado."
+        elif confirmation_pending:
+            message = "A ação foi aceita pela nuvem. O estado será confirmado pela telemetria sem reenviar comandos não idempotentes."
         else:
             message = "A ação foi enviada ao veículo. Atualizando o estado automaticamente."
         report("accepted", message, {"confirmation_pending": confirmation_pending})
@@ -2514,6 +2598,9 @@ def handle_command(
             "confirmation_reason": confirmation_reason,
             "identifier_source": identifier_source or ("vin_hint" if vehicle_vin else "resolved"),
             "command_dispatched": True,
+            "verified_by_gateway": verified_by_gateway,
+            "safe_retry_performed": safe_retry_performed,
+            "verification_state": verification_state,
         }
     finally:
         close_client()

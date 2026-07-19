@@ -1,3 +1,11 @@
+## 1.11.86
+
+- climatização verifica uma leitura fresca e pode repetir uma única vez somente `climate_on`/`climate_off`;
+- comandos confirmados diretamente passam a `completed`;
+- janela de telemetria de comando ampliada para 180 segundos;
+- logs distinguem envio, retry idempotente, confirmação direta e confirmação por telemetria;
+- telemetria registra quando o veículo-alvo não aparece na assinatura.
+
 ## 1.11.85
 
 - elimina a disputa de SQLite causada por `PRAGMA journal_mode` e criação de tabelas em cada consulta de comando;

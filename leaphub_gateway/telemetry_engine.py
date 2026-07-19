@@ -24,7 +24,7 @@ from cryptography.fernet import Fernet, InvalidToken
 import leaphub_connector as connector
 
 LOG = logging.getLogger("leaphub.telemetry")
-ENGINE_VERSION = "1.11.85"
+ENGINE_VERSION = "1.11.86"
 
 
 def utc_iso() -> str:
@@ -676,11 +676,12 @@ class TelemetryEngine:
         safe_context = {
             "command_id": int(context.get("command_id") or 0),
             "parameters": context.get("parameters") if isinstance(context.get("parameters"), dict) else {},
+            "request_id": str(context.get("request_id") or "")[:96],
         }
         command_context_json = json.dumps(safe_context, ensure_ascii=False, separators=(",", ":"))[:4000]
         profile = requested_profile if requested_profile in {"background", "interactive", "command"} else "background"
         if profile == "command":
-            seconds = max(30, min(90, int(seconds)))
+            seconds = max(30, min(180, int(seconds)))
         elif profile == "interactive":
             seconds = max(60, min(3600, int(seconds)))
         else:
@@ -1169,10 +1170,12 @@ class TelemetryEngine:
         except (TypeError, ValueError, json.JSONDecodeError):
             command_context = {}
 
+        command_target_seen = False
         if command_mode and command_key:
             for vehicle in vehicles:
                 if command_vehicle_id and str(vehicle.get("remote_id") or "") != command_vehicle_id:
                     continue
+                command_target_seen = True
                 telemetry = vehicle.get("telemetry") if isinstance(vehicle.get("telemetry"), dict) else {}
                 if not self._command_sample_is_fresh(telemetry, float(subscription["command_started_at"] or 0)):
                     continue
@@ -1211,6 +1214,8 @@ class TelemetryEngine:
         if command_confirmed:
             LOG.info("Comando %s confirmado pela telemetria de %s após %s leitura(s); janela rápida encerrada.", command_key, sid, next_command_poll)
         elif command_budget_exhausted:
+            if command_vehicle_id and not command_target_seen:
+                LOG.warning("Janela rápida de %s não encontrou o veículo-alvo do comando entre os dados retornados; assinatura será reconciliada pelo site.", sid)
             LOG.warning("Janela rápida de %s encerrada após %s leitura(s) sem confirmação conclusiva; telemetria voltou ao modo adaptativo.", sid, next_command_poll)
         elif previous_state != aggregate_state:
             LOG.info("Telemetria %s mudou de %s para %s; próxima consulta em %ss.", sid, previous_state or "inicial", aggregate_state, int(interval + jitter))

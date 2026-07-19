@@ -32,7 +32,7 @@ except ModuleNotFoundError as exc:
         "Módulo interno leaphub_connector ausente na imagem. Atualize o Leap Hub Gateway."
     ) from exc
 
-VERSION = "1.11.85"
+VERSION = "1.11.86"
 SERVICE = "Leap Hub Leapmotor Connector"
 MAX_BODY = 1024 * 1024
 WINDOW_SECONDS = 180
@@ -270,7 +270,7 @@ def command_journal_progress(
         "connector_version": connector.CONNECTOR_VERSION,
     }
     if isinstance(extra, dict):
-        for key in ("attempt", "confirmation_pending"):
+        for key in ("attempt", "confirmation_pending", "verified_by_gateway", "safe_retry"):
             if key in extra:
                 response[key] = extra[key]
     raw = json.dumps(response, ensure_ascii=False, separators=(",", ":"), default=connector.json_default)
@@ -293,7 +293,7 @@ def command_journal_finish(request_hash: str | None, request_id: str, response: 
         return
     safe = dict(response)
     safe["request_id"] = request_id
-    final_status = "confirming" if bool(safe.get("confirmation_pending")) else "accepted"
+    final_status = "completed" if bool(safe.get("verified_by_gateway")) else ("confirming" if bool(safe.get("confirmation_pending")) else "accepted")
     safe["status"] = final_status
     safe["queued"] = False
     raw = json.dumps(safe, ensure_ascii=False, separators=(",", ":"), default=connector.json_default)
@@ -466,9 +466,12 @@ def run_command_job(
         command_journal_finish(request_hash, request_id, result)
         defer_seconds = 5 if bool(result.get("wake_attempted")) else 3
         LOG.info(
-            "Comando remoto %s enviado em segundo plano para %s; confirmação pela telemetria=%s.",
+            "Comando remoto %s enviado em segundo plano para %s; tentativas=%s, retry_idempotente=%s, confirmado_direto=%s, confirmação_telemetria=%s.",
             str(payload.get("command") or "desconhecido")[:40],
             environment,
+            int(result.get("attempts") or 1),
+            bool(result.get("safe_retry_performed")),
+            bool(result.get("verified_by_gateway")),
             bool(result.get("confirmation_pending") or result.get("verification_requested")),
         )
     except BaseException as exc:  # noqa: BLE001
