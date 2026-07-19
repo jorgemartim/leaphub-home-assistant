@@ -1,3 +1,9 @@
+## 1.11.94
+
+- Climatização pós-despertar com verificação fresca e uma única repetição idempotente.
+- Estados de progresso não finalizam o comando antes do worker.
+- Timeout temporário é verificado antes de qualquer repetição.
+
 ## 1.11.93
 
 - Corrige `try again in 2 minutes` para cerca de 135 segundos, nunca 30 minutos ou 6 horas.

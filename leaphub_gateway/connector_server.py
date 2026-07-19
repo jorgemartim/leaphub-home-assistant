@@ -32,7 +32,7 @@ except ModuleNotFoundError as exc:
         "Módulo interno leaphub_connector ausente na imagem. Atualize o Leap Hub Gateway."
     ) from exc
 
-VERSION = "1.11.93"
+VERSION = "1.11.94"
 SERVICE = "Leap Hub Leapmotor Connector"
 MAX_BODY = 1024 * 1024
 WINDOW_SECONDS = 180
@@ -225,7 +225,7 @@ def command_journal_begin(environment: str, payload: dict[str, Any]) -> tuple[st
     now = time.time()
     request_hash = hashlib.sha256(f"{environment}|{request_id}".encode("utf-8")).hexdigest()
     payload_hash = command_payload_hash(payload)
-    active_states = {"queued", "waiting_auth", "preparing", "waking", "reconnecting", "executing", "running", "confirming"}
+    active_states = {"queued", "waiting_auth", "waiting_account", "waiting_slot", "preparing", "waking", "vehicle_waking", "vehicle_awake", "reconnecting", "retry_wait", "climate_dispatching", "climate_verifying", "verifying", "executing", "running"}
 
     row = cached_command(request_hash)
     if row is None:
@@ -311,7 +311,7 @@ def command_journal_progress(
 ) -> None:
     if not request_hash:
         return
-    allowed = {"queued", "waiting_auth", "waiting_account", "waiting_slot", "preparing", "waking", "reconnecting", "executing", "confirming"}
+    allowed = {"queued", "waiting_auth", "waiting_account", "waiting_slot", "preparing", "waking", "vehicle_waking", "vehicle_awake", "reconnecting", "retry_wait", "climate_dispatching", "climate_verifying", "verifying", "executing"}
     status = status if status in allowed else "executing"
     response: dict[str, Any] = {
         "ok": True,
@@ -324,7 +324,7 @@ def command_journal_progress(
         "connector_version": connector.CONNECTOR_VERSION,
     }
     if isinstance(extra, dict):
-        for key in ("attempt", "confirmation_pending", "verified_by_gateway", "safe_retry", "queue_wait_seconds", "waiting_for", "session_recovery", "retry_after_seconds", "retry_at"):
+        for key in ("attempt", "confirmation_pending", "verified_by_gateway", "safe_retry", "queue_wait_seconds", "waiting_for", "session_recovery", "retry_after_seconds", "retry_at", "cloud_accepted", "verification_sample", "state_fresh", "state_evaluable"):
             if key in extra:
                 response[key] = extra[key]
     raw = json.dumps(response, ensure_ascii=False, separators=(",", ":"), default=connector.json_default)
@@ -470,7 +470,7 @@ def command_journal_status(environment: str, payload: dict[str, Any]) -> dict[st
         except (ValueError, TypeError, json.JSONDecodeError):
             response = {}
     status = str(row.get("status") or "queued")
-    active_states = {"queued", "waiting_auth", "waiting_account", "waiting_slot", "preparing", "waking", "reconnecting", "executing", "running"}
+    active_states = {"queued", "waiting_auth", "waiting_account", "waiting_slot", "preparing", "waking", "vehicle_waking", "vehicle_awake", "reconnecting", "retry_wait", "climate_dispatching", "climate_verifying", "verifying", "executing", "running"}
     retry_at = float(response.get("retry_at") or 0)
     retry_after_recorded = int(response.get("retry_after_seconds") or 0)
     impossible_waiting_auth = status == "waiting_auth" and (
@@ -537,7 +537,13 @@ def command_journal_status(environment: str, payload: dict[str, Any]) -> dict[st
             "waiting_slot": "Conta liberada. Aguardando uma vaga no Connector.",
             "preparing": "Preparando uma conexão exclusiva para a ação.",
             "waking": "Veículo em repouso. Solicitando despertar.",
+            "vehicle_waking": "Acordando o veículo e aguardando uma leitura nova.",
+            "vehicle_awake": "Veículo disponível para a próxima etapa.",
             "reconnecting": "Veículo acordando. Refazendo a conexão antes da ação.",
+            "retry_wait": "A nuvem demorou a responder. Verificando o estado antes da repetição protegida.",
+            "climate_dispatching": "Veículo disponível. Enviando a climatização.",
+            "climate_verifying": "Climatização enviada. Verificando o estado real do veículo.",
+            "verifying": "Ação recebida pela nuvem. Finalizando a verificação segura.",
             "executing": "Enviando a ação ao veículo.",
             "running": "Executando o comando remoto.",
         }
@@ -662,7 +668,7 @@ def run_command_job(
         command_journal_finish(request_hash, request_id, result)
         defer_seconds = 5 if bool(result.get("wake_attempted")) else 3
         LOG.info(
-            "Comando remoto %s enviado em segundo plano para %s; espera_fila=%ss, tentativas=%s, retry_idempotente=%s, confirmado_direto=%s, confirmação_telemetria=%s.",
+            "Comando remoto %s finalizado no worker para %s; espera_fila=%ss, tentativas=%s, etapa_pós_despertar=%s, confirmado_direto=%s, confirmação_telemetria=%s.",
             str(payload.get("command") or "desconhecido")[:40],
             environment,
             int(result.get("queue_wait_seconds") or 0),

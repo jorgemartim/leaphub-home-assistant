@@ -27,7 +27,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable
 
-CONNECTOR_VERSION = "1.11.93"
+CONNECTOR_VERSION = "1.11.94"
 MAX_INPUT_BYTES = 1024 * 1024
 logging.getLogger("leapmotor_api").setLevel(logging.WARNING)
 LOGGER = logging.getLogger("leaphub.connector")
@@ -2412,16 +2412,11 @@ def execute_vehicle_command(method: Any, command: str, vehicle_id: str, paramete
     return method(vehicle_id)
 
 
-def verify_command_state(
+def _select_command_vehicle(
     client: Any,
     resolved_vehicle_id: str,
-    command: str,
-    parameters: dict[str, Any],
     vehicles: list[Any] | None = None,
-) -> tuple[bool, bool, str]:
-    """Read one fresh state without interpreting a transport acknowledgement as success."""
-    if command not in SAFE_STATE_RETRY_COMMANDS:
-        return False, False, "unsupported"
+) -> tuple[Any | None, list[Any]]:
     available = list(vehicles or client.get_vehicle_list() or [])
     selected = None
     for vehicle in available:
@@ -2432,17 +2427,172 @@ def verify_command_state(
             break
     if selected is None and len(available) == 1:
         selected = available[0]
+    return selected, available
+
+
+def _status_capture_epoch(status: Any) -> float:
+    for name in ("collect_time", "create_time"):
+        value = attribute(status, name)
+        if isinstance(value, datetime):
+            try:
+                return float(value.timestamp())
+            except (OverflowError, OSError, ValueError):
+                continue
+        if isinstance(value, str) and value.strip():
+            raw = value.strip().replace("Z", "+00:00")
+            try:
+                return float(datetime.fromisoformat(raw).timestamp())
+            except (TypeError, ValueError, OverflowError, OSError):
+                continue
+    return 0.0
+
+
+def read_command_state(
+    client: Any,
+    resolved_vehicle_id: str,
+    command: str,
+    parameters: dict[str, Any],
+    vehicles: list[Any] | None = None,
+) -> dict[str, Any]:
+    """Read one state sample and keep freshness separate from command acceptance."""
+    if command not in SAFE_STATE_RETRY_COMMANDS:
+        return {
+            "matched": False,
+            "evaluable": False,
+            "state": "unsupported",
+            "captured_epoch": 0.0,
+            "vehicles": list(vehicles or []),
+        }
+    selected, available = _select_command_vehicle(client, resolved_vehicle_id, vehicles)
     if selected is None:
-        return False, False, "vehicle_not_found"
+        return {
+            "matched": False,
+            "evaluable": False,
+            "state": "vehicle_not_found",
+            "captured_epoch": 0.0,
+            "vehicles": available,
+        }
     status = client.get_vehicle_status(selected)
-    if command in {"climate_on", "climate_off"}:
-        climate = attribute(status, "climate")
-        state = bool_or_none(attribute(climate, "ac_switch"))
-        if state is None:
-            return False, False, "climate_unknown"
-        expected = command == "climate_on"
-        return state is expected, True, "climate_on" if state else "climate_off"
-    return False, False, "unsupported"
+    captured_epoch = _status_capture_epoch(status)
+    climate = attribute(status, "climate")
+    state = bool_or_none(attribute(climate, "ac_switch"))
+    if state is None:
+        return {
+            "matched": False,
+            "evaluable": False,
+            "state": "climate_unknown",
+            "captured_epoch": captured_epoch,
+            "vehicles": available,
+        }
+    expected = command == "climate_on"
+    return {
+        "matched": state is expected,
+        "evaluable": True,
+        "state": "climate_on" if state else "climate_off",
+        "captured_epoch": captured_epoch,
+        "vehicles": available,
+    }
+
+
+def verify_command_state(
+    client: Any,
+    resolved_vehicle_id: str,
+    command: str,
+    parameters: dict[str, Any],
+    vehicles: list[Any] | None = None,
+) -> tuple[bool, bool, str]:
+    sample = read_command_state(client, resolved_vehicle_id, command, parameters, vehicles)
+    return bool(sample.get("matched")), bool(sample.get("evaluable")), str(sample.get("state") or "unknown")
+
+
+def wait_for_command_state(
+    client: Any,
+    resolved_vehicle_id: str,
+    command: str,
+    parameters: dict[str, Any],
+    command_started_at: float,
+    timeout_seconds: int,
+    report: Callable[[str, str, dict[str, Any] | None], None],
+    stage: str,
+    vehicles: list[Any] | None = None,
+) -> dict[str, Any]:
+    """Wait for a fresh sample without issuing another remote command."""
+    timeout_seconds = max(4, min(40, int(timeout_seconds or 20)))
+    deadline = time.monotonic() + timeout_seconds
+    samples = 0
+    last: dict[str, Any] = {
+        "matched": False,
+        "evaluable": False,
+        "fresh": False,
+        "state": "not_checked",
+        "captured_epoch": 0.0,
+        "samples": 0,
+        "last_error": "",
+    }
+    current_vehicles = vehicles
+    while True:
+        samples += 1
+        try:
+            sample = read_command_state(
+                client,
+                resolved_vehicle_id,
+                command,
+                parameters,
+                current_vehicles,
+            )
+            if isinstance(sample.get("vehicles"), list):
+                current_vehicles = sample.get("vehicles")
+            captured_epoch = float(sample.get("captured_epoch") or 0)
+            fresh = captured_epoch <= 0 or captured_epoch >= command_started_at - 5
+            sample["fresh"] = fresh
+            sample["samples"] = samples
+            sample["last_error"] = ""
+            last = sample
+            report(
+                stage,
+                "Veículo respondeu. Verificando se o estado novo já foi aplicado."
+                if fresh else
+                "O veículo respondeu com uma leitura antiga. Aguardando uma atualização nova.",
+                {
+                    "verification_sample": samples,
+                    "state_fresh": fresh,
+                    "state_evaluable": bool(sample.get("evaluable")),
+                },
+            )
+            if bool(sample.get("matched")):
+                return sample
+            # A fresh evaluable sample is enough to prove that the vehicle is
+            # awake and available for the second idempotent climate delivery.
+            if fresh and bool(sample.get("evaluable")):
+                return sample
+        except Exception as exc:  # noqa: BLE001
+            cooldown = login_cooldown_seconds(exc)
+            if cooldown > 0:
+                raise ConnectorLoginCooldownError(
+                    "A Leapmotor limitou temporariamente novas autenticações. O comando continuará na fila e será retomado automaticamente.",
+                    cooldown,
+                ) from exc
+            if is_authentication_error(exc):
+                raise ConnectorAuthenticationError(clean_message(str(exc))) from exc
+            last = {
+                "matched": False,
+                "evaluable": False,
+                "fresh": False,
+                "state": "verification_unavailable",
+                "captured_epoch": 0.0,
+                "samples": samples,
+                "last_error": clean_message(str(exc)),
+            }
+            report(
+                stage,
+                "A leitura do veículo oscilou. A ação não será repetida até a etapa segura.",
+                {"verification_sample": samples, "state_fresh": False, "state_evaluable": False},
+            )
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return last
+        time.sleep(min(4.0, max(0.5, remaining)))
+
 
 def handle_command(
     payload: dict[str, Any],
@@ -2450,13 +2600,12 @@ def handle_command(
     borrowed_client: Any | None = None,
     borrowed_vehicles: list[Any] | None = None,
 ) -> dict[str, Any]:
-    """Execute one remote action without sending an unsafe duplicate.
+    """Execute one remote action with a wake-aware climate sequence.
 
-    The official cloud endpoint normally wakes the car as part of the command.
-    Therefore the first attempt is always the real command. An explicit wake is
-    used only when the cloud clearly says the vehicle is asleep/offline before
-    accepting the action. After a wake, a fresh session is created before the
-    single safe retry so a wake token cannot interfere with the command token.
+    Locking and access commands are never repeated automatically. Climate on/off
+    are state-idempotent and may receive one protected second delivery, but only
+    after the connector has checked whether the first delivery merely woke the
+    vehicle or already changed the HVAC state.
     """
 
     def report(stage: str, message: str, extra: dict[str, Any] | None = None) -> None:
@@ -2465,7 +2614,6 @@ def handle_command(
         try:
             progress(stage, message, extra)
         except Exception:
-            # Progress reporting must never make a vehicle command fail.
             pass
 
     credentials = payload.get("credentials")
@@ -2482,24 +2630,27 @@ def handle_command(
     operation_password = require_text(credentials, "operation_password", "o PIN do veículo", 20)
     wake_on_sleep = bool(payload.get("wake_before", True))
     verify_after = bool(payload.get("verify_after", True))
+    stale_snapshot = bool(payload.get("stale_snapshot", False))
     try:
-        wake_timeout = max(10, min(90, int(payload.get("wake_timeout_seconds") or 45)))
+        wake_timeout = max(12, min(45, int(payload.get("wake_timeout_seconds") or 30)))
     except (TypeError, ValueError):
-        wake_timeout = 45
+        wake_timeout = 30
 
     temp_dir = secure_temp_directory()
     client = borrowed_client
     client_is_borrowed = borrowed_client is not None
     borrowed_original_operation_password = getattr(borrowed_client, "operation_password", None) if borrowed_client is not None else None
     if borrowed_client is not None:
-        # leapmotor-api mantém o PIN como atributo simples. Ele é aplicado apenas
-        # durante a operação e restaurado no finally, sem criar um segundo login.
         try:
             borrowed_client.operation_password = operation_password
         except Exception as exc:  # noqa: BLE001
             raise RuntimeError("A sessão ativa não permite preparar o PIN do veículo.") from exc
+
     result: Any = None
     identifier_source = ""
+    resolved_vehicle_id = ""
+    resolved_list: list[Any] | None = borrowed_vehicles
+    method: Any = None
     wake_info: dict[str, Any] = {"attempted": False, "method": None}
     confirmation_pending = False
     confirmation_reason: str | None = None
@@ -2508,7 +2659,11 @@ def handle_command(
     verified_by_gateway = False
     safe_retry_performed = False
     verification_state = "not_checked"
+    verification_samples = 0
     execution_warning: str | None = None
+    command_dispatched = False
+    cloud_accepted = False
+    command_started_at = time.time()
 
     def close_client(force: bool = False) -> None:
         nonlocal client, client_is_borrowed
@@ -2529,7 +2684,7 @@ def handle_command(
         if attempt == 1 and borrowed_client is not None:
             client = borrowed_client
             client_is_borrowed = True
-            resolved_id, resolved_list, source = resolve_command_vehicle(
+            resolved_id, vehicles, source = resolve_command_vehicle(
                 client, vehicle_id, vehicle_vin, borrowed_vehicles
             )
         else:
@@ -2538,17 +2693,17 @@ def handle_command(
             client = create_client(credentials, attempt_dir, operation_password, request_timeout_seconds=32)
             client_is_borrowed = False
             client.login()
-            resolved_id, resolved_list, source = resolve_command_vehicle(client, vehicle_id, vehicle_vin)
+            resolved_id, vehicles, source = resolve_command_vehicle(client, vehicle_id, vehicle_vin)
         method_name = COMMAND_METHODS[command]
-        method = getattr(client, method_name, None)
-        if not callable(method):
+        selected_method = getattr(client, method_name, None)
+        if not callable(selected_method):
             raise RuntimeError("A versão instalada da biblioteca não possui este comando.")
-        if resolved_list is not None and callable(getattr(client, "get_vehicle_list", None)):
-            client.get_vehicle_list = lambda: resolved_list
-        return client, resolved_id, resolved_list, method, source
+        if vehicles is not None and callable(getattr(client, "get_vehicle_list", None)):
+            client.get_vehicle_list = lambda: vehicles
+        return client, resolved_id, vehicles, selected_method, source
 
     def classify_accepted_ambiguity(exc: Exception) -> bool:
-        nonlocal result, confirmation_pending, confirmation_reason
+        nonlocal result, confirmation_pending, confirmation_reason, command_dispatched, cloud_accepted
         if not (is_remote_command_confirmation_timeout(exc) or is_remote_command_result_session_error(exc)):
             return False
         confirmation_pending = True
@@ -2562,7 +2717,41 @@ def handle_command(
             "confirmation_pending": True,
             "confirmation_reason": confirmation_reason,
         }
+        command_dispatched = True
+        cloud_accepted = True
         return True
+
+    def raise_classified(exc: Exception) -> None:
+        cooldown = login_cooldown_seconds(exc)
+        if cooldown > 0:
+            raise ConnectorLoginCooldownError(
+                "A Leapmotor limitou temporariamente novas autenticações. O comando continuará na fila e será retomado automaticamente.",
+                cooldown,
+            ) from exc
+        if is_authentication_error(exc):
+            raise ConnectorAuthenticationError(clean_message(str(exc))) from exc
+        if is_transient_cloud_error(exc):
+            raise ConnectorTemporaryError(reconnect_message(exc)) from exc
+        raise RuntimeError(clean_message(str(exc))) from exc
+
+    def dispatch_once(stage: str, message: str, attempt: int) -> Exception | None:
+        nonlocal result, command_attempts, command_dispatched, cloud_accepted
+        report(stage, message, {"attempt": attempt})
+        command_attempts = max(command_attempts, attempt)
+        try:
+            result = execute_vehicle_command(method, command, resolved_vehicle_id, parameters)
+            command_dispatched = True
+            cloud_accepted = True
+            return None
+        except Exception as exc:  # noqa: BLE001
+            if classify_accepted_ambiguity(exc):
+                report(
+                    "verifying",
+                    "A nuvem recebeu a ação, mas ainda não devolveu a confirmação final do veículo.",
+                    {"attempt": attempt, "cloud_accepted": True},
+                )
+                return None
+            return exc
 
     try:
         report(
@@ -2572,228 +2761,172 @@ def handle_command(
             {"session_reused": borrowed_client is not None},
         )
         try:
-            _, resolved_vehicle_id, _, method, identifier_source = open_client(1)
+            _, resolved_vehicle_id, resolved_list, method, identifier_source = open_client(1)
         except Exception as exc:  # noqa: BLE001
-            cooldown = login_cooldown_seconds(exc)
-            if cooldown > 0:
-                raise ConnectorLoginCooldownError(
-                    "A Leapmotor limitou temporariamente novas autenticações. O comando continuará na fila e será retomado automaticamente.",
-                    cooldown,
-                ) from exc
-            if is_transient_cloud_error(exc):
-                raise ConnectorTemporaryError(reconnect_message(exc)) from exc
-            if is_authentication_error(exc):
-                raise ConnectorAuthenticationError(clean_message(str(exc))) from exc
-            raise RuntimeError(clean_message(str(exc))) from exc
+            raise_classified(exc)
 
-        # Direct-first: the remote command itself is the authoritative wake-up.
-        # This mirrors the official app and avoids consuming a token in a
-        # separate wake request before the actual action is sent.
-        report("executing", "Enviando a ação diretamente ao veículo.", {"attempt": 1})
-        command_attempts = 1
-        try:
-            result = execute_vehicle_command(method, command, resolved_vehicle_id, parameters)
-        except Exception as first_error:  # noqa: BLE001
-            if classify_accepted_ambiguity(first_error):
-                report("confirming", "A nuvem recebeu a ação. Aguardando confirmação do veículo.")
-            cooldown = login_cooldown_seconds(first_error)
-            if cooldown > 0:
-                raise ConnectorLoginCooldownError(
-                    "A Leapmotor limitou temporariamente novas autenticações. O comando continuará na fila e será retomado automaticamente.",
-                    cooldown,
+        is_climate_state_command = command in SAFE_STATE_RETRY_COMMANDS
+        first_error = dispatch_once(
+            "executing",
+            "Enviando a ação diretamente ao veículo.",
+            1,
+        )
+
+        if first_error is not None and wake_on_sleep and is_vehicle_sleep_error(first_error):
+            report("vehicle_waking", "Veículo em repouso. Solicitando despertar antes da ação.")
+            wake_info = try_wake_vehicle(client, resolved_vehicle_id)
+            if not wake_info.get("attempted"):
+                raise ConnectorTemporaryError(
+                    "O veículo está em repouso e a biblioteca instalada não oferece uma operação de despertar separada."
                 ) from first_error
-            elif is_authentication_error(first_error):
-                raise ConnectorAuthenticationError(clean_message(str(first_error))) from first_error
-            elif wake_on_sleep and is_vehicle_sleep_error(first_error):
-                report("waking", "Veículo em repouso. Solicitando despertar antes da ação.")
-                wake_info = try_wake_vehicle(client, resolved_vehicle_id)
-                if not wake_info.get("attempted"):
-                    raise ConnectorTemporaryError(
-                        "O veículo está em repouso e a biblioteca instalada não oferece uma operação de despertar separada."
-                    ) from first_error
-                if wake_info.get("failed") and not wake_info.get("temporary"):
-                    raise ConnectorTemporaryError(
-                        str(wake_info.get("message") or "Não foi possível acordar o veículo agora.")
-                    ) from first_error
+            if wake_info.get("failed") and not wake_info.get("temporary"):
+                raise ConnectorTemporaryError(
+                    str(wake_info.get("message") or "Não foi possível acordar o veículo agora.")
+                ) from first_error
+            wait_sample = wait_for_command_state(
+                client,
+                resolved_vehicle_id,
+                command,
+                parameters,
+                command_started_at,
+                min(wake_timeout, 24),
+                report,
+                "vehicle_waking",
+                resolved_list,
+            ) if is_climate_state_command else {"matched": False, "fresh": True, "evaluable": False, "samples": 0}
+            verification_samples += int(wait_sample.get("samples") or 0)
+            report("vehicle_awake", "Veículo disponível. Preparando a ação solicitada.")
+            first_error = dispatch_once(
+                "climate_dispatching" if is_climate_state_command else "executing",
+                "Veículo disponível. Enviando a climatização agora."
+                if is_climate_state_command else
+                "Veículo disponível. Enviando a ação agora.",
+                2,
+            )
+            if is_climate_state_command:
+                safe_retry_performed = True
 
-                wait_seconds = min(6.0, max(3.0, wake_timeout / 12))
-                time.sleep(wait_seconds)
-                if borrowed_client is not None:
-                    # A mesma sessão autenticada continua sob trava exclusiva da
-                    # conta. A biblioteca renova o token internamente se preciso.
-                    report("reconnecting", "Veículo acordando. Mantendo a sessão autenticada para executar a ação.")
-                else:
-                    close_client()
-                    report("reconnecting", "Veículo acordando. Criando uma conexão limpa para executar a ação.")
-                    try:
-                        _, resolved_vehicle_id, _, method, identifier_source = open_client(2)
-                    except Exception as exc:  # noqa: BLE001
-                        cooldown = login_cooldown_seconds(exc)
-                        if cooldown > 0:
-                            raise ConnectorLoginCooldownError(
-                                "A Leapmotor limitou temporariamente novas autenticações. O comando continuará na fila e será retomado automaticamente.",
-                                cooldown,
-                            ) from exc
-                        if is_transient_cloud_error(exc):
-                            raise ConnectorTemporaryError(reconnect_message(exc)) from exc
-                        if is_authentication_error(exc):
-                            raise ConnectorAuthenticationError(clean_message(str(exc))) from exc
-                        raise RuntimeError(clean_message(str(exc))) from exc
+        if first_error is not None:
+            if is_climate_state_command and is_transient_cloud_error(first_error):
+                # A timeout may have happened before or immediately after the
+                # write. Climate state is idempotent, so verify first and use the
+                # single protected second delivery only when still necessary.
+                report(
+                    "retry_wait",
+                    "A nuvem demorou a responder. Verificando o veículo antes de repetir a climatização.",
+                    {"retry_after_seconds": 8},
+                )
+            else:
+                raise_classified(first_error)
 
-                report("executing", "Veículo acordado. Enviando a ação agora.", {"attempt": 2})
+        if is_climate_state_command and verify_after:
+            stage = "vehicle_waking" if stale_snapshot or confirmation_reason == "result_timeout" else "climate_verifying"
+            initial_sample = wait_for_command_state(
+                client,
+                resolved_vehicle_id,
+                command,
+                parameters,
+                command_started_at,
+                min(wake_timeout, 30),
+                report,
+                stage,
+                resolved_list,
+            )
+            verification_samples += int(initial_sample.get("samples") or 0)
+            verification_state = str(initial_sample.get("state") or "unknown")
+            if bool(initial_sample.get("matched")):
+                verified_by_gateway = True
+                confirmation_pending = False
+                confirmation_reason = None
+                report("verifying", "Climatização confirmada por uma leitura nova do veículo.", {"verified_by_gateway": True})
+            elif command_attempts < 2:
+                report(
+                    "vehicle_awake",
+                    "O veículo já está disponível, mas a climatização ainda não mudou.",
+                    {
+                        "state_fresh": bool(initial_sample.get("fresh")),
+                        "state_evaluable": bool(initial_sample.get("evaluable")),
+                    },
+                )
+                report(
+                    "climate_dispatching",
+                    "Enviando a climatização uma segunda e última vez após o despertar.",
+                    {"safe_retry": True, "attempt": 2},
+                )
                 command_attempts = 2
+                safe_retry_performed = True
+                retry_error: Exception | None = None
                 try:
                     result = execute_vehicle_command(method, command, resolved_vehicle_id, parameters)
-                except Exception as second_error:  # noqa: BLE001
-                    if classify_accepted_ambiguity(second_error):
-                        report("confirming", "A nuvem recebeu a ação. Aguardando confirmação do veículo.")
-                    cooldown = login_cooldown_seconds(second_error)
-                    if cooldown > 0:
-                        raise ConnectorLoginCooldownError(
-                            "A Leapmotor limitou temporariamente novas autenticações. O comando continuará na fila e será retomado automaticamente.",
-                            cooldown,
-                        ) from second_error
-                    elif is_authentication_error(second_error):
-                        raise ConnectorAuthenticationError(clean_message(str(second_error))) from second_error
-                    elif is_transient_cloud_error(second_error):
-                        raise ConnectorTemporaryError(reconnect_message(second_error)) from second_error
-                    else:
-                        raise RuntimeError(clean_message(str(second_error))) from second_error
-            elif is_transient_cloud_error(first_error):
-                raise ConnectorTemporaryError(reconnect_message(first_error)) from first_error
-            else:
-                raise RuntimeError(clean_message(str(first_error))) from first_error
+                    command_dispatched = True
+                    cloud_accepted = True
+                except Exception as exc:  # noqa: BLE001
+                    if not classify_accepted_ambiguity(exc):
+                        retry_error = exc
 
-        verification_requested = bool(verify_after)
-        # Algumas versões da nuvem aceitam climate_on enquanto o veículo ainda
-        # está despertando, mas não aplicam o estado. Para climatização, que é
-        # idempotente, fazemos uma leitura fresca e no máximo uma segunda entrega
-        # protegida. Outros comandos jamais são repetidos automaticamente.
-        if verify_after and command in SAFE_STATE_RETRY_COMMANDS:
-            report("confirming", "Ação enviada. Verificando o estado real do veículo.")
-            if borrowed_client is None:
-                close_client()
-            time.sleep(6.0)
-            try:
-                if borrowed_client is not None:
-                    resolved_list = borrowed_vehicles
-                else:
-                    _, resolved_vehicle_id, resolved_list, method, identifier_source = open_client(3)
-                matched, evaluable, verification_state = verify_command_state(
-                    client, resolved_vehicle_id, command, parameters, resolved_list
+                final_sample = wait_for_command_state(
+                    client,
+                    resolved_vehicle_id,
+                    command,
+                    parameters,
+                    time.time() - 1,
+                    18,
+                    report,
+                    "climate_verifying",
+                    resolved_list,
                 )
-                if matched:
+                verification_samples += int(final_sample.get("samples") or 0)
+                verification_state = f"after_wake_retry:{str(final_sample.get('state') or 'unknown')}"
+                if bool(final_sample.get("matched")):
                     verified_by_gateway = True
                     confirmation_pending = False
                     confirmation_reason = None
-                    report("confirming", "Estado confirmado diretamente no veículo.", {"verified_by_gateway": True})
-                elif evaluable and command_attempts < 2:
-                    report(
-                        "executing",
-                        "O veículo acordou, mas o estado ainda não mudou. Repetindo uma única vez a ação idempotente.",
-                        {"safe_retry": True},
-                    )
-                    command_attempts += 1
-                    result = execute_vehicle_command(method, command, resolved_vehicle_id, parameters)
-                    safe_retry_performed = True
+                    report("verifying", "Climatização confirmada depois da etapa pós-despertar.", {"verified_by_gateway": True})
+                elif bool(final_sample.get("evaluable")) and bool(final_sample.get("fresh")):
                     confirmation_pending = True
-                    confirmation_reason = "state_retry"
+                    confirmation_reason = "state_not_applied_after_wake_retry"
+                    execution_warning = "climate_not_applied_after_wake_retry"
+                elif retry_error is not None:
+                    raise_classified(retry_error)
                 else:
                     confirmation_pending = True
                     confirmation_reason = confirmation_reason or "telemetry_pending"
-            except Exception as verification_error:  # noqa: BLE001
-                verification_state = "verification_unavailable"
+            else:
                 confirmation_pending = True
-                confirmation_reason = confirmation_reason or "verification_unavailable"
-                connector_log(
-                    logging.WARNING,
-                    "Verificação direta do comando %s indisponível: %s",
-                    command,
-                    clean_message(str(verification_error)),
-                )
-
-                # climate_on/climate_off são comandos de estado idempotentes. Se
-                # a leitura de confirmação falhar depois que o veículo acordou,
-                # fazemos no máximo uma segunda entrega protegida. Isso evita que
-                # uma falha de leitura deixe o carro acordado sem aplicar o estado.
-                if command_attempts < 2:
-                    report(
-                        "executing",
-                        "O veículo acordou, mas a leitura de confirmação falhou. Repetindo uma única vez a ação idempotente.",
-                        {"safe_retry": True, "verification_unavailable": True},
-                    )
-                    command_attempts += 1
-                    try:
-                        result = execute_vehicle_command(method, command, resolved_vehicle_id, parameters)
-                        safe_retry_performed = True
-                        confirmation_pending = True
-                        confirmation_reason = "verification_retry"
-                    except Exception as retry_error:  # noqa: BLE001
-                        if classify_accepted_ambiguity(retry_error):
-                            safe_retry_performed = True
-                            confirmation_pending = True
-                        cooldown = login_cooldown_seconds(retry_error)
-                        if cooldown > 0:
-                            raise ConnectorLoginCooldownError(
-                                "A Leapmotor limitou temporariamente novas autenticações. O comando continuará na fila e será retomado automaticamente.",
-                                cooldown,
-                            ) from retry_error
-                        elif is_authentication_error(retry_error):
-                            raise ConnectorAuthenticationError(clean_message(str(retry_error))) from retry_error
-                        else:
-                            confirmation_pending = True
-                            confirmation_reason = confirmation_reason or "verification_retry_unconfirmed"
-                            connector_log(
-                                logging.WARNING,
-                                "Repetição protegida do comando %s não pôde ser confirmada: %s",
-                                command,
-                                clean_message(str(retry_error)),
-                            )
-
-        # Depois da única repetição idempotente da climatização, fazemos uma
-        # última leitura. Ela não dispara outra ação: serve apenas para distinguir
-        # "enviado e aplicado" de "a nuvem aceitou, mas o estado continuou igual".
-        if safe_retry_performed and command in SAFE_STATE_RETRY_COMMANDS and not verified_by_gateway:
-            report("confirming", "Ação reenviada uma única vez. Fazendo a última leitura de confirmação.")
-            time.sleep(8.0)
-            try:
-                matched_after_retry, evaluable_after_retry, retry_state = verify_command_state(
-                    client, resolved_vehicle_id, command, parameters, None
-                )
-                verification_state = f"after_retry:{retry_state}"
-                if matched_after_retry:
-                    verified_by_gateway = True
-                    confirmation_pending = False
-                    confirmation_reason = None
-                    report("confirming", "Estado confirmado depois da repetição protegida.", {"verified_by_gateway": True})
-                elif evaluable_after_retry:
-                    confirmation_pending = True
-                    confirmation_reason = "state_not_applied_after_retry"
-                    execution_warning = "climate_not_applied_after_retry"
+                if bool(initial_sample.get("evaluable")) and bool(initial_sample.get("fresh")):
+                    confirmation_reason = "state_not_applied_after_wake_retry"
+                    execution_warning = "climate_not_applied_after_wake_retry"
                 else:
-                    confirmation_pending = True
-                    confirmation_reason = confirmation_reason or "retry_state_unknown"
-            except Exception as final_verification_error:  # noqa: BLE001
-                confirmation_pending = True
-                confirmation_reason = confirmation_reason or "final_verification_unavailable"
-                verification_state = "after_retry:verification_unavailable"
-                connector_log(
-                    logging.WARNING,
-                    "Leitura final da climatização indisponível após a repetição protegida: %s",
-                    clean_message(str(final_verification_error)),
-                )
+                    confirmation_reason = confirmation_reason or "verification_unavailable"
+        elif first_error is not None:
+            raise_classified(first_error)
+
+        if not is_climate_state_command and first_error is None and not command_dispatched:
+            # Defensive invariant for non-idempotent actions.
+            raise ConnectorTemporaryError("A ação não chegou à etapa de envio e foi encerrada sem repetição automática.")
 
         if verified_by_gateway:
             message = "A ação foi executada e confirmada por uma leitura nova do veículo."
-        elif execution_warning == "climate_not_applied_after_retry":
-            message = "A nuvem aceitou a climatização, mas uma leitura nova ainda mostrou o sistema desligado após a repetição protegida. Confira o veículo antes de tentar novamente."
+        elif execution_warning == "climate_not_applied_after_wake_retry":
+            message = "O veículo acordou e a climatização foi enviada novamente, mas uma leitura nova ainda mostrou o sistema desligado."
         elif safe_retry_performed:
-            message = "O veículo acordou e a ação foi reenviada uma única vez com proteção idempotente. A telemetria confirmará o estado."
+            message = "O veículo acordou e a climatização foi enviada na etapa pós-despertar. A telemetria continuará confirmando o estado."
         elif confirmation_pending:
-            message = "A ação foi aceita pela nuvem. O estado será confirmado pela telemetria sem reenviar comandos não idempotentes."
+            message = "A ação foi aceita pela nuvem. O estado será confirmado pela telemetria sem repetir comandos não idempotentes."
         else:
             message = "A ação foi enviada ao veículo. Atualizando o estado automaticamente."
-        report("accepted", message, {"confirmation_pending": confirmation_pending})
+
+        # This is progress only; command_journal_finish is the sole point that
+        # turns the request into sent/completed after this function returns.
+        report(
+            "verifying" if confirmation_pending and not verified_by_gateway else "executing",
+            message,
+            {
+                "confirmation_pending": confirmation_pending,
+                "verified_by_gateway": verified_by_gateway,
+                "cloud_accepted": cloud_accepted,
+            },
+        )
         return {
             "ok": True,
             "message": message,
@@ -2801,21 +2934,24 @@ def handle_command(
             "result_type": type(result).__name__,
             "connector_version": CONNECTOR_VERSION,
             "library_version": package_version(),
-            "wake_attempted": bool(wake_info.get("attempted")),
+            "wake_attempted": bool(wake_info.get("attempted")) or stale_snapshot or safe_retry_performed,
             "wake_method": wake_info.get("method"),
-            "wake_strategy": "fallback_after_explicit_sleep" if wake_info.get("attempted") else "command_direct",
+            "wake_strategy": "staged_climate_after_wake" if is_climate_state_command else (
+                "fallback_after_explicit_sleep" if wake_info.get("attempted") else "command_direct"
+            ),
             "attempts": command_attempts,
             "session_attempts": session_attempts,
-            "verification_requested": verification_requested,
+            "verification_requested": bool(verify_after),
             "confirmation_pending": confirmation_pending,
             "confirmation_reason": confirmation_reason,
             "identifier_source": identifier_source or ("vin_hint" if vehicle_vin else "resolved"),
-            "command_dispatched": True,
-            "cloud_accepted": True,
+            "command_dispatched": command_dispatched,
+            "cloud_accepted": cloud_accepted,
             "session_reused": borrowed_client is not None,
             "verified_by_gateway": verified_by_gateway,
             "safe_retry_performed": safe_retry_performed,
             "verification_state": verification_state,
+            "verification_samples": verification_samples,
             "execution_warning": execution_warning,
         }
     finally:
@@ -2826,7 +2962,6 @@ def handle_command(
                 pass
         close_client()
         shutil.rmtree(temp_dir, ignore_errors=True)
-
 
 def main() -> None:
     request = read_request()
