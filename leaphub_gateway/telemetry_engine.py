@@ -24,7 +24,7 @@ from cryptography.fernet import Fernet, InvalidToken
 import leaphub_connector as connector
 
 LOG = logging.getLogger("leaphub.telemetry")
-ENGINE_VERSION = "1.11.92"
+ENGINE_VERSION = "1.11.93"
 
 
 def utc_iso() -> str:
@@ -121,6 +121,7 @@ class TelemetryEngine:
         self.sleep_seconds = self._bounded("telemetry_sleep_seconds", 900, 300, 14400)
         self.presence_window_seconds = self._bounded("telemetry_presence_window_seconds", 420, 300, 1800)
         self.rate_limit_cooldown_seconds = self._bounded("telemetry_rate_limit_cooldown_seconds", 21600, 1800, 86400)
+        self.login_cooldown_max_seconds = 300
         self.charge_watch_seconds = max(5, min(15, self.charging_seconds * 2))
         self.batch_size = self._bounded("telemetry_batch_size", 25, 1, 50)
         self.retention_days = self._bounded("telemetry_retention_days", 7, 1, 60)
@@ -425,8 +426,23 @@ class TelemetryEngine:
                     CREATE INDEX IF NOT EXISTS idx_events_vehicle_order ON events(subscription_id, remote_id, status, sequence);
                     """
                 )
+                # 1.11.92 podia converter "try again in 2 minutes" em 6 horas.
+                # Somente cooldowns de LOGIN com prazo absurdo são liberados;
+                # limites gerais de API continuam preservados.
+                now_epoch = time.time()
+                repaired = db.execute(
+                    "UPDATE subscriptions SET status='waiting',cooldown_until=0,next_run_at=?,"
+                    "consecutive_failures=0,updated_at=? WHERE status='cooldown' "
+                    "AND cooldown_until>? AND (LOWER(COALESCE(last_error,'')) LIKE '%password error limit%' "
+                    "OR LOWER(COALESCE(last_error,'')) LIKE '%try again in%' "
+                    "OR LOWER(COALESCE(last_error,'')) LIKE '%login attempt limit%')",
+                    (now_epoch + 2, utc_iso(), now_epoch + self.login_cooldown_max_seconds),
+                ).rowcount
+                if repaired:
+                    LOG.warning("Corrigidos %s cooldown(s) de login com prazo inválido da versão anterior.", repaired)
+
     def _set_account_login_cooldown(self, environment: str, account_id: int, retry_after_seconds: int, message: str) -> None:
-        delay = max(30, min(1800, int(retry_after_seconds or 120)))
+        delay = max(30, min(self.login_cooldown_max_seconds, int(retry_after_seconds or 135)))
         until = time.time() + delay
         now = utc_iso()
         with self.lock, self._db() as db:
@@ -441,6 +457,20 @@ class TelemetryEngine:
             )
         for row in rows:
             self._close_session(str(row["subscription_id"] or ""))
+        self.wake_event.set()
+
+    def _clear_account_login_cooldown(self, environment: str, account_id: int) -> None:
+        if int(account_id or 0) < 1:
+            return
+        now = utc_iso()
+        with self.lock, self._db() as db:
+            db.execute(
+                "UPDATE subscriptions SET cooldown_until=0,status=CASE WHEN status='cooldown' THEN 'waiting' ELSE status END,"
+                "next_run_at=CASE WHEN status='cooldown' THEN MIN(next_run_at,?) ELSE next_run_at END,"
+                "last_error=CASE WHEN status='cooldown' THEN NULL ELSE last_error END,updated_at=? "
+                "WHERE environment=? AND account_id=?",
+                (time.time() + 2, now, str(environment or ""), int(account_id or 0)),
+            )
         self.wake_event.set()
 
     def execute_command(
@@ -484,7 +514,9 @@ class TelemetryEngine:
 
         def isolated_command() -> dict[str, Any]:
             try:
-                return connector.handle_command(payload, progress=progress)
+                result = connector.handle_command(payload, progress=progress)
+                self._clear_account_login_cooldown(environment, account_id)
+                return result
             except connector.ConnectorLoginCooldownError as exc:
                 self._set_account_login_cooldown(environment, account_id, exc.retry_after_seconds, str(exc))
                 raise
@@ -519,6 +551,7 @@ class TelemetryEngine:
                     borrowed_vehicles=session.get("vehicles") if isinstance(session.get("vehicles"), list) else None,
                 )
                 session["last_used_at"] = time.time()
+                self._clear_account_login_cooldown(environment, account_id)
                 return result
             except Exception as exc:
                 session["last_used_at"] = time.time()
@@ -1220,7 +1253,7 @@ class TelemetryEngine:
                 self._close_session(sid)
             if isinstance(exc, connector.ConnectorLoginCooldownError):
                 self._close_session(sid)
-                delay = max(30, min(1800, int(exc.retry_after_seconds or 120)))
+                delay = max(30, min(self.login_cooldown_max_seconds, int(exc.retry_after_seconds or 135)))
                 now = utc_iso()
                 with self.lock, self._db() as db:
                     db.execute(
@@ -1420,13 +1453,19 @@ class TelemetryEngine:
                 # Uma única tentativa de login. Falhas nunca geram uma sequência
                 # imediata de novas autenticações.
                 client.login()
-            except Exception:
+            except Exception as exc:
                 if client is not None:
                     try:
                         client.close()
                     except Exception:
                         pass
                 shutil.rmtree(temp_dir, ignore_errors=True)
+                delay = connector.login_cooldown_seconds(exc)
+                if delay > 0:
+                    raise connector.ConnectorLoginCooldownError(
+                        "A Leapmotor limitou temporariamente novas autenticações. A próxima tentativa respeitará o prazo informado pela nuvem.",
+                        delay,
+                    ) from exc
                 raise
             session = {
                 "client": client,
@@ -1702,6 +1741,8 @@ class TelemetryEngine:
     @staticmethod
     def _looks_rate_limited(message: str) -> bool:
         normalized = str(message or "").lower()
+        if connector.login_cooldown_seconds(normalized) > 0:
+            return False
         return any(token in normalized for token in (
             "429", "too many", "password error limit", "login attempt limit", "rate limit", "rate-limit", "throttle", "temporarily blocked",
             "muitas solicitações", "limite de requisições", "conta bloqueada",

@@ -32,7 +32,7 @@ except ModuleNotFoundError as exc:
         "Módulo interno leaphub_connector ausente na imagem. Atualize o Leap Hub Gateway."
     ) from exc
 
-VERSION = "1.11.92"
+VERSION = "1.11.93"
 SERVICE = "Leap Hub Leapmotor Connector"
 MAX_BODY = 1024 * 1024
 WINDOW_SECONDS = 180
@@ -250,16 +250,28 @@ def command_journal_begin(environment: str, payload: dict[str, Any]) -> tuple[st
         if existing_payload_hash and not hmac.compare_digest(existing_payload_hash, payload_hash):
             raise ValueError("O identificador da solicitação já pertence a outro comando.")
         response_raw = str(row.get("response_json") or "")
+        existing_status = str(row.get("status") or "")
+        stale_waiting_auth = False
         if response_raw:
             try:
                 response = json.loads(response_raw)
             except (ValueError, TypeError, json.JSONDecodeError):
                 response = {}
             if isinstance(response, dict):
-                response["duplicate"] = True
-                response["request_id"] = request_id
-                return None, response
-        if str(row.get("status") or "") in active_states and now - float(row.get("updated_at") or 0) < 900:
+                retry_at = float(response.get("retry_at") or 0)
+                retry_after = int(response.get("retry_after_seconds") or 0)
+                stale_waiting_auth = existing_status == "waiting_auth" and (
+                    retry_after > 300 or retry_at > now + 300 or retry_at <= now
+                )
+                if not stale_waiting_auth:
+                    response["duplicate"] = True
+                    response["request_id"] = request_id
+                    return None, response
+        if stale_waiting_auth:
+            LOG.warning("Descartando espera de autenticação inválida da versão anterior para o comando %s.", request_id[:12])
+            row["status"] = "queued"
+            row["response_json"] = ""
+        if str(row.get("status") or "") in active_states and now - float(row.get("updated_at") or 0) < 900 and not stale_waiting_auth:
             return None, {
                 "ok": True,
                 "accepted": True,
@@ -359,7 +371,7 @@ def command_journal_finish(request_hash: str | None, request_id: str, response: 
 def command_journal_wait_auth(request_hash: str | None, request_id: str, retry_after_seconds: int) -> None:
     if not request_hash:
         return
-    delay = max(30, min(1800, int(retry_after_seconds or 120)))
+    delay = max(30, min(300, int(retry_after_seconds or 135)))
     now = time.time()
     retry_at = now + delay
     response = {
@@ -460,6 +472,31 @@ def command_journal_status(environment: str, payload: dict[str, Any]) -> dict[st
     status = str(row.get("status") or "queued")
     active_states = {"queued", "waiting_auth", "waiting_account", "waiting_slot", "preparing", "waking", "reconnecting", "executing", "running"}
     retry_at = float(response.get("retry_at") or 0)
+    retry_after_recorded = int(response.get("retry_after_seconds") or 0)
+    impossible_waiting_auth = status == "waiting_auth" and (
+        retry_after_recorded > 300 or retry_at > time.time() + 300
+    )
+    if impossible_waiting_auth:
+        response = {
+            "ok": False,
+            "status": "failed",
+            "temporary": True,
+            "retry_after_seconds": 1,
+            "request_id": request_id,
+            "message": "A espera de autenticação da versão anterior foi corrigida. O comando pode ser retomado com segurança.",
+            "connector_version": connector.CONNECTOR_VERSION,
+            "stale_login_cooldown_repaired": True,
+        }
+        raw_repaired = json.dumps(response, ensure_ascii=False, separators=(",", ":"))
+        now = time.time()
+        cache_command(request_hash, str(row.get("payload_hash") or ""), "failed", raw_repaired, float(row.get("created_at") or now), now, now + 900)
+        try:
+            with command_db(0.3) as db:
+                db.execute("UPDATE command_requests SET status='failed',response_json=?,updated_at=?,expires_at=? WHERE request_hash=?", (raw_repaired, now, now + 900, request_hash))
+                db.commit()
+        except (OSError, sqlite3.Error):
+            pass
+        return response
     waiting_auth_valid = status == "waiting_auth" and retry_at > time.time() - 180
     if status in active_states and not waiting_auth_valid and time.time() - float(row.get("updated_at") or 0) > 120:
         stale_message = "O Gateway reiniciou ou perdeu o worker antes de concluir este comando. A ação não será repetida automaticamente."
@@ -528,7 +565,7 @@ def schedule_command_retry(
     request_id: str,
     retry_after_seconds: int,
 ) -> None:
-    delay = max(30, min(1800, int(retry_after_seconds or 120)))
+    delay = max(30, min(300, int(retry_after_seconds or 135)))
     worker_key = command_worker_key(environment, request_id)
 
     def resume() -> None:
@@ -644,7 +681,7 @@ def run_command_job(
                 str(result.get("verification_state") or "unknown")[:80],
             )
     except connector.ConnectorLoginCooldownError as exc:
-        retry_after_seconds = max(30, min(1800, int(exc.retry_after_seconds or 120)))
+        retry_after_seconds = max(30, min(300, int(exc.retry_after_seconds or 135)))
         command_journal_wait_auth(request_hash, request_id, retry_after_seconds)
         defer_seconds = 1
         LOG.info(

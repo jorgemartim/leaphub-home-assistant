@@ -1,3 +1,13 @@
+## 1.11.93
+
+- Corrige `try again in 2 minutes` para cerca de 135 segundos, nunca 30 minutos ou 6 horas.
+- Classifica o bloqueio diretamente no login da telemetria antes do limitador geral de API.
+- Limita cooldown de autenticação a cinco minutos e mantém limites gerais separados.
+- Limpa automaticamente cooldowns inválidos gravados pela 1.11.92.
+- Remove o cooldown assim que uma sessão ou comando autentica com sucesso.
+- Repara diários `waiting_auth` antigos para permitir retomada segura após atualização.
+- Mantém VIN, PIN, senha, token e certificados fora dos logs.
+
 ## 1.11.92
 
 - Reconhece `Password error limit has reached maximum` como bloqueio temporário, não como senha inválida.

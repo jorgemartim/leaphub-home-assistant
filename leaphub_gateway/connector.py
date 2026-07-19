@@ -27,7 +27,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable
 
-CONNECTOR_VERSION = "1.11.92"
+CONNECTOR_VERSION = "1.11.93"
 MAX_INPUT_BYTES = 1024 * 1024
 logging.getLogger("leapmotor_api").setLevel(logging.WARNING)
 LOGGER = logging.getLogger("leaphub.connector")
@@ -108,9 +108,11 @@ class ConnectorAuthenticationError(RuntimeError):
 class ConnectorLoginCooldownError(ConnectorTemporaryError):
     """A nuvem bloqueou novos logins temporariamente; não é senha inválida."""
 
-    def __init__(self, message: str, retry_after_seconds: int = 120) -> None:
+    def __init__(self, message: str, retry_after_seconds: int = 135) -> None:
         super().__init__(message)
-        self.retry_after_seconds = max(30, min(1800, int(retry_after_seconds or 120)))
+        # Bloqueios de login informados pela Leapmotor são curtos. Nunca deixe
+        # uma mensagem de 2 minutos virar 30 minutos ou 6 horas localmente.
+        self.retry_after_seconds = max(30, min(300, int(retry_after_seconds or 135)))
 
 
 LOGIN_COOLDOWN_MARKERS = (
@@ -129,11 +131,14 @@ def login_cooldown_seconds(value: Any) -> int:
         return 0
     match = re.search(r"try again in\s+(\d+)\s*(second|seconds|minute|minutes|hour|hours)", message)
     if not match:
-        return 120
-    amount = max(1, int(match.group(1)))
-    unit = match.group(2)
-    multiplier = 1 if unit.startswith("second") else (60 if unit.startswith("minute") else 3600)
-    return max(30, min(1800, amount * multiplier))
+        base_seconds = 120
+    else:
+        amount = max(1, int(match.group(1)))
+        unit = match.group(2)
+        multiplier = 1 if unit.startswith("second") else (60 if unit.startswith("minute") else 3600)
+        base_seconds = amount * multiplier
+    # Pequena margem para o relógio da nuvem, limitada a cinco minutos.
+    return max(30, min(300, base_seconds + 15))
 
 
 def is_login_cooldown_error(value: Any) -> bool:
