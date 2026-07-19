@@ -1,3 +1,12 @@
+## 1.11.85
+
+- elimina a disputa de SQLite causada por `PRAGMA journal_mode` e criação de tabelas em cada consulta de comando;
+- adiciona cache idempotente em memória com persistência best-effort para status de comandos;
+- impede `BrokenPipeError` de virar falso HTTP 500 quando o Cloudflare encerra uma conexão;
+- reduz a latência da proteção anti-replay e mantém segurança em memória durante lock temporário;
+- usa resumo de saúde não bloqueante para não derrubar o watchdog durante uma coleta;
+- adiciona protocolo configurável do Cloudflare Tunnel e usa HTTP/2 por padrão em redes com QUIC instável.
+
 ## 1.11.84
 
 - Corrigida concorrência do SQLite durante a inicialização do Connector.

@@ -1,5 +1,5 @@
 name: "Leap Hub Gateway"
-version: "1.11.84"
+version: "1.11.85"
 slug: "leaphub_gateway"
 description: "Gateway unificado com sincronização automática adaptativa, fila persistente, Leapmotor, OCPP e Cloudflare Tunnel."
 url: "https://github.com/jorgemartim/leaphub-home-assistant"
@@ -59,6 +59,7 @@ options:
   tunnel_enabled: false
   tunnel_token: ""
   tunnel_log_level: "info"
+  tunnel_protocol: "http2"
   log_level: "INFO"
   dashboard_log_lines: 80
 schema:
@@ -94,5 +95,6 @@ schema:
   tunnel_enabled: bool
   tunnel_token: "password?"
   tunnel_log_level: "list(debug|info|warn|error|fatal)"
+  tunnel_protocol: "list(http2|auto|quic)"
   log_level: "list(DEBUG|INFO|WARNING|ERROR)"
   dashboard_log_lines: "int(20,300)"

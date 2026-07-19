@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import errno
 import hashlib
 import hmac
 import json
@@ -31,15 +32,21 @@ except ModuleNotFoundError as exc:
         "Módulo interno leaphub_connector ausente na imagem. Atualize o Leap Hub Gateway."
     ) from exc
 
-VERSION = "1.11.84"
+VERSION = "1.11.85"
 SERVICE = "Leap Hub Leapmotor Connector"
 MAX_BODY = 1024 * 1024
 WINDOW_SECONDS = 180
 STARTED_AT = time.time()
 NONCES: dict[str, float] = {}
 NONCE_LOCK = threading.Lock()
+NONCE_DB_LOCK = threading.Lock()
+NONCE_DB_LAST_CLEANUP = 0.0
+NONCE_DB_LAST_WARNING = 0.0
 NONCE_DB_PATH = Path(os.getenv("LEAPHUB_NONCE_DB_PATH", "/data/security/connector-nonces.sqlite"))
 COMMAND_DB_PATH = Path(os.getenv("LEAPHUB_COMMAND_DB_PATH", "/data/security/connector-commands.sqlite"))
+COMMAND_CACHE: dict[str, dict[str, Any]] = {}
+COMMAND_CACHE_LOCK = threading.RLock()
+COMMAND_CACHE_MAX = 2000
 ACCOUNT_LOCKS: dict[str, threading.Lock] = {}
 ACCOUNT_LOCK_LAST_USED: dict[str, float] = {}
 ACCOUNT_LOCKS_GUARD = threading.Lock()
@@ -95,22 +102,78 @@ def command_payload_hash(payload: dict[str, Any]) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
-def command_db() -> sqlite3.Connection:
-    COMMAND_DB_PATH.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    db = sqlite3.connect(COMMAND_DB_PATH, timeout=5.0)
-    db.row_factory = sqlite3.Row
-    db.execute("PRAGMA busy_timeout = 5000")
-    db.execute("PRAGMA journal_mode = WAL")
-    db.execute(
-        "CREATE TABLE IF NOT EXISTS command_requests ("
-        "request_hash TEXT PRIMARY KEY,payload_hash TEXT NOT NULL,status TEXT NOT NULL,"
-        "response_json TEXT NULL,created_at REAL NOT NULL,updated_at REAL NOT NULL,expires_at REAL NOT NULL)"
-    )
+def _chmod_private(path: Path) -> None:
     try:
-        os.chmod(COMMAND_DB_PATH, 0o600)
+        os.chmod(path, 0o600)
     except OSError:
         pass
+
+
+def initialize_command_db() -> None:
+    """Prepare the journal once; request threads must never renegotiate journal mode."""
+    COMMAND_DB_PATH.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with sqlite3.connect(COMMAND_DB_PATH, timeout=10.0) as db:
+        db.execute("PRAGMA busy_timeout = 10000")
+        db.execute("PRAGMA journal_mode = WAL")
+        db.execute("PRAGMA synchronous = NORMAL")
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS command_requests ("
+            "request_hash TEXT PRIMARY KEY,payload_hash TEXT NOT NULL,status TEXT NOT NULL,"
+            "response_json TEXT NULL,created_at REAL NOT NULL,updated_at REAL NOT NULL,expires_at REAL NOT NULL)"
+        )
+        db.execute("CREATE INDEX IF NOT EXISTS idx_command_requests_expiry ON command_requests(expires_at)")
+        db.commit()
+    _chmod_private(COMMAND_DB_PATH)
+
+
+def command_db(timeout: float = 0.75) -> sqlite3.Connection:
+    COMMAND_DB_PATH.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    timeout = max(0.05, min(5.0, float(timeout)))
+    db = sqlite3.connect(COMMAND_DB_PATH, timeout=timeout)
+    db.row_factory = sqlite3.Row
+    db.execute(f"PRAGMA busy_timeout = {max(50, int(timeout * 1000))}")
+    db.execute("PRAGMA synchronous = NORMAL")
     return db
+
+
+def prune_command_cache(now: float) -> None:
+    expired = [key for key, item in COMMAND_CACHE.items() if float(item.get("expires_at") or 0) < now]
+    for key in expired:
+        COMMAND_CACHE.pop(key, None)
+    if len(COMMAND_CACHE) <= COMMAND_CACHE_MAX:
+        return
+    oldest = sorted(COMMAND_CACHE.items(), key=lambda item: float(item[1].get("updated_at") or 0))
+    for key, _ in oldest[: max(1, len(COMMAND_CACHE) - COMMAND_CACHE_MAX)]:
+        COMMAND_CACHE.pop(key, None)
+
+
+def cache_command(
+    request_hash: str,
+    payload_hash: str,
+    status: str,
+    response_json: str | None,
+    created_at: float,
+    updated_at: float,
+    expires_at: float,
+) -> None:
+    with COMMAND_CACHE_LOCK:
+        prune_command_cache(updated_at)
+        COMMAND_CACHE[request_hash] = {
+            "payload_hash": payload_hash,
+            "status": status,
+            "response_json": response_json or "",
+            "created_at": created_at,
+            "updated_at": updated_at,
+            "expires_at": expires_at,
+        }
+
+
+def cached_command(request_hash: str) -> dict[str, Any] | None:
+    now = time.time()
+    with COMMAND_CACHE_LOCK:
+        prune_command_cache(now)
+        row = COMMAND_CACHE.get(request_hash)
+        return dict(row) if isinstance(row, dict) else None
 
 
 def command_journal_begin(environment: str, payload: dict[str, Any]) -> tuple[str | None, dict[str, Any] | None]:
@@ -120,56 +183,69 @@ def command_journal_begin(environment: str, payload: dict[str, Any]) -> tuple[st
     now = time.time()
     request_hash = hashlib.sha256(f"{environment}|{request_id}".encode("utf-8")).hexdigest()
     payload_hash = command_payload_hash(payload)
+    active_states = {"queued", "preparing", "waking", "reconnecting", "executing", "running", "confirming"}
+
+    row = cached_command(request_hash)
+    if row is None:
+        try:
+            with command_db(0.35) as db:
+                persisted = db.execute(
+                    "SELECT payload_hash,status,response_json,created_at,updated_at,expires_at FROM command_requests WHERE request_hash=?",
+                    (request_hash,),
+                ).fetchone()
+            if persisted is not None:
+                row = dict(persisted)
+                cache_command(
+                    request_hash, str(row.get("payload_hash") or ""), str(row.get("status") or "queued"),
+                    str(row.get("response_json") or ""), float(row.get("created_at") or now),
+                    float(row.get("updated_at") or now), float(row.get("expires_at") or now + 900),
+                )
+        except (OSError, sqlite3.Error) as exc:
+            LOG.debug("Consulta persistente do diário adiada: %s", exc)
+
+    if row is not None:
+        existing_payload_hash = str(row.get("payload_hash") or "")
+        if existing_payload_hash and not hmac.compare_digest(existing_payload_hash, payload_hash):
+            raise ValueError("O identificador da solicitação já pertence a outro comando.")
+        response_raw = str(row.get("response_json") or "")
+        if response_raw:
+            try:
+                response = json.loads(response_raw)
+            except (ValueError, TypeError, json.JSONDecodeError):
+                response = {}
+            if isinstance(response, dict):
+                response["duplicate"] = True
+                response["request_id"] = request_id
+                return None, response
+        if str(row.get("status") or "") in active_states and now - float(row.get("updated_at") or 0) < 900:
+            return None, {
+                "ok": True,
+                "accepted": True,
+                "queued": True,
+                "confirmation_pending": True,
+                "duplicate": True,
+                "request_id": request_id,
+                "status": str(row.get("status") or "queued"),
+                "message": "O Gateway já recebeu este comando. A ação não será enviada novamente.",
+                "connector_version": connector.CONNECTOR_VERSION,
+            }
+
+    created_at = float(row.get("created_at") or now) if row else now
+    cache_command(request_hash, payload_hash, "queued", None, created_at, now, now + 900)
     try:
-        with command_db() as db:
-            db.execute("BEGIN IMMEDIATE")
+        with command_db(0.75) as db:
             db.execute("DELETE FROM command_requests WHERE expires_at<?", (now,))
-            row = db.execute(
-                "SELECT payload_hash,status,response_json,updated_at FROM command_requests WHERE request_hash=?",
-                (request_hash,),
-            ).fetchone()
-            if row is not None:
-                if not hmac.compare_digest(str(row["payload_hash"]), payload_hash):
-                    raise ValueError("O identificador da solicitação já pertence a outro comando.")
-                response_raw = str(row["response_json"] or "")
-                if response_raw:
-                    try:
-                        response = json.loads(response_raw)
-                    except (ValueError, TypeError, json.JSONDecodeError):
-                        response = {}
-                    if isinstance(response, dict):
-                        response["duplicate"] = True
-                        response["request_id"] = request_id
-                        db.commit()
-                        return None, response
-                active_states = {"queued", "preparing", "waking", "reconnecting", "executing", "running", "confirming"}
-                if str(row["status"] or "") in active_states and now - float(row["updated_at"] or 0) < 900:
-                    db.commit()
-                    return None, {
-                        "ok": True,
-                        "accepted": True,
-                        "queued": True,
-                        "confirmation_pending": True,
-                        "duplicate": True,
-                        "request_id": request_id,
-                        "status": str(row["status"] or "queued"),
-                        "message": "O Gateway já recebeu este comando. A ação não será enviada novamente.",
-                        "connector_version": connector.CONNECTOR_VERSION,
-                    }
-                db.execute(
-                    "UPDATE command_requests SET status='queued',response_json=NULL,updated_at=?,expires_at=? WHERE request_hash=?",
-                    (now, now + 900, request_hash),
-                )
-            else:
-                db.execute(
-                    "INSERT INTO command_requests(request_hash,payload_hash,status,response_json,created_at,updated_at,expires_at) VALUES(?,?, 'queued',NULL,?,?,?)",
-                    (request_hash, payload_hash, now, now, now + 900),
-                )
+            db.execute(
+                "INSERT INTO command_requests(request_hash,payload_hash,status,response_json,created_at,updated_at,expires_at) "
+                "VALUES(?,?, 'queued',NULL,?,?,?) "
+                "ON CONFLICT(request_hash) DO UPDATE SET payload_hash=excluded.payload_hash,status='queued',"
+                "response_json=NULL,updated_at=excluded.updated_at,expires_at=excluded.expires_at",
+                (request_hash, payload_hash, created_at, now, now + 900),
+            )
             db.commit()
-        return request_hash, None
     except (OSError, sqlite3.Error) as exc:
-        LOG.warning("Diário de comandos indisponível; usando a proteção do Leap Hub: %s", exc)
-        return None, None
+        LOG.warning("Diário persistente ocupado; o comando permanece protegido em memória: %s", exc)
+    return request_hash, None
 
 
 def command_journal_progress(
@@ -198,11 +274,14 @@ def command_journal_progress(
             if key in extra:
                 response[key] = extra[key]
     raw = json.dumps(response, ensure_ascii=False, separators=(",", ":"), default=connector.json_default)
+    now = time.time()
+    existing = cached_command(request_hash) or {}
+    cache_command(request_hash, str(existing.get("payload_hash") or ""), status, raw, float(existing.get("created_at") or now), now, now + 900)
     try:
-        with command_db() as db:
+        with command_db(0.5) as db:
             db.execute(
                 "UPDATE command_requests SET status=?,response_json=?,updated_at=?,expires_at=? WHERE request_hash=?",
-                (status, raw[:16000], time.time(), time.time() + 900, request_hash),
+                (status, raw[:16000], now, now + 900, request_hash),
             )
             db.commit()
     except (OSError, sqlite3.Error) as exc:
@@ -218,11 +297,14 @@ def command_journal_finish(request_hash: str | None, request_id: str, response: 
     safe["status"] = final_status
     safe["queued"] = False
     raw = json.dumps(safe, ensure_ascii=False, separators=(",", ":"), default=connector.json_default)
+    now = time.time()
+    existing = cached_command(request_hash) or {}
+    cache_command(request_hash, str(existing.get("payload_hash") or ""), final_status, raw, float(existing.get("created_at") or now), now, now + 900)
     try:
-        with command_db() as db:
+        with command_db(0.5) as db:
             db.execute(
                 "UPDATE command_requests SET status=?,response_json=?,updated_at=?,expires_at=? WHERE request_hash=?",
-                (final_status, raw[:16000], time.time(), time.time() + 900, request_hash),
+                (final_status, raw[:16000], now, now + 900, request_hash),
             )
             db.commit()
     except (OSError, sqlite3.Error) as exc:
@@ -244,11 +326,14 @@ def command_journal_fail(request_hash: str | None, request_id: str, exc: BaseExc
         "connector_version": connector.CONNECTOR_VERSION,
     }
     raw = json.dumps(response, ensure_ascii=False, separators=(",", ":"), default=connector.json_default)
+    now = time.time()
+    existing = cached_command(request_hash) or {}
+    cache_command(request_hash, str(existing.get("payload_hash") or ""), "failed", raw, float(existing.get("created_at") or now), now, now + 900)
     try:
-        with command_db() as db:
+        with command_db(0.5) as db:
             db.execute(
                 "UPDATE command_requests SET status='failed',response_json=?,updated_at=?,expires_at=? WHERE request_hash=?",
-                (raw[:16000], time.time(), time.time() + 900, request_hash),
+                (raw[:16000], now, now + 900, request_hash),
             )
             db.commit()
     except (OSError, sqlite3.Error) as db_exc:
@@ -260,14 +345,23 @@ def command_journal_status(environment: str, payload: dict[str, Any]) -> dict[st
     if not request_id:
         raise ValueError("Identificador do comando ausente.")
     request_hash = hashlib.sha256(f"{environment}|{request_id}".encode("utf-8")).hexdigest()
-    try:
-        with command_db() as db:
-            row = db.execute(
-                "SELECT status,response_json,updated_at,expires_at FROM command_requests WHERE request_hash=?",
-                (request_hash,),
-            ).fetchone()
-    except (OSError, sqlite3.Error) as exc:
-        raise RuntimeError("O diário de comandos está temporariamente indisponível.") from exc
+    row = cached_command(request_hash)
+    if row is None:
+        try:
+            with command_db(0.3) as db:
+                persisted = db.execute(
+                    "SELECT payload_hash,status,response_json,created_at,updated_at,expires_at FROM command_requests WHERE request_hash=?",
+                    (request_hash,),
+                ).fetchone()
+            if persisted is not None:
+                row = dict(persisted)
+                cache_command(
+                    request_hash, str(row.get("payload_hash") or ""), str(row.get("status") or "queued"),
+                    str(row.get("response_json") or ""), float(row.get("created_at") or time.time()),
+                    float(row.get("updated_at") or time.time()), float(row.get("expires_at") or time.time() + 900),
+                )
+        except (OSError, sqlite3.Error) as exc:
+            raise connector.ConnectorTemporaryError("O diário de comandos está ocupado. A consulta será repetida sem reenviar a ação.") from exc
     if row is None:
         return {
             "ok": False,
@@ -276,7 +370,7 @@ def command_journal_status(environment: str, payload: dict[str, Any]) -> dict[st
             "message": "O Gateway ainda não localizou este comando.",
         }
     response: dict[str, Any] = {}
-    raw = str(row["response_json"] or "")
+    raw = str(row.get("response_json") or "")
     if raw:
         try:
             parsed = json.loads(raw)
@@ -284,9 +378,9 @@ def command_journal_status(environment: str, payload: dict[str, Any]) -> dict[st
                 response = parsed
         except (ValueError, TypeError, json.JSONDecodeError):
             response = {}
-    status = str(row["status"] or "queued")
+    status = str(row.get("status") or "queued")
     active_states = {"queued", "preparing", "waking", "reconnecting", "executing", "running"}
-    if status in active_states and time.time() - float(row["updated_at"] or 0) > 120:
+    if status in active_states and time.time() - float(row.get("updated_at") or 0) > 120:
         stale_message = "O Gateway reiniciou ou perdeu o worker antes de concluir este comando. A ação não será repetida automaticamente."
         stale_response = {
             "ok": False,
@@ -297,11 +391,14 @@ def command_journal_status(environment: str, payload: dict[str, Any]) -> dict[st
             "message": stale_message,
             "connector_version": connector.CONNECTOR_VERSION,
         }
+        raw_stale = json.dumps(stale_response, ensure_ascii=False, separators=(",", ":"))
+        now = time.time()
+        cache_command(request_hash, str(row.get("payload_hash") or ""), "failed", raw_stale, float(row.get("created_at") or now), now, now + 900)
         try:
-            with command_db() as db:
+            with command_db(0.3) as db:
                 db.execute(
                     "UPDATE command_requests SET status='failed',response_json=?,updated_at=?,expires_at=? WHERE request_hash=?",
-                    (json.dumps(stale_response, ensure_ascii=False, separators=(",", ":")), time.time(), time.time() + 900, request_hash),
+                    (raw_stale, now, now + 900, request_hash),
                 )
                 db.commit()
         except (OSError, sqlite3.Error):
@@ -310,8 +407,8 @@ def command_journal_status(environment: str, payload: dict[str, Any]) -> dict[st
     response.setdefault("ok", status != "failed")
     response["status"] = status
     response["request_id"] = request_id
-    response["updated_at"] = float(row["updated_at"] or 0)
-    if status in {"queued", "preparing", "waking", "reconnecting", "executing", "running"}:
+    response["updated_at"] = float(row.get("updated_at") or 0)
+    if status in active_states:
         response.setdefault("accepted", True)
         response.setdefault("queued", status in {"queued", "preparing"})
         response.setdefault("confirmation_pending", True)
@@ -419,8 +516,10 @@ def start_command_job(
 def command_journal_abort(request_hash: str | None) -> None:
     if not request_hash:
         return
+    with COMMAND_CACHE_LOCK:
+        COMMAND_CACHE.pop(request_hash, None)
     try:
-        with command_db() as db:
+        with command_db(0.3) as db:
             db.execute("DELETE FROM command_requests WHERE request_hash=?", (request_hash,))
             db.commit()
     except (OSError, sqlite3.Error):
@@ -433,37 +532,50 @@ def cleanup_nonces(now: float) -> None:
         NONCES.pop(key, None)
 
 
-def remember_nonce(environment: str, nonce: str, now: float) -> None:
-    """Persist replay protection across Gateway restarts, with an in-memory fallback."""
-    nonce_hash = hashlib.sha256(f"{environment}|{nonce}".encode("utf-8")).hexdigest()
-    expires_at = now + WINDOW_SECONDS + 30
-    try:
-        NONCE_DB_PATH.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        with sqlite3.connect(NONCE_DB_PATH, timeout=3.0) as db:
-            db.execute("PRAGMA busy_timeout = 3000")
-            db.execute("CREATE TABLE IF NOT EXISTS connector_nonces (nonce_hash TEXT PRIMARY KEY, expires_at REAL NOT NULL)")
-            db.execute("DELETE FROM connector_nonces WHERE expires_at < ?", (now,))
-            try:
-                db.execute("INSERT INTO connector_nonces (nonce_hash, expires_at) VALUES (?, ?)", (nonce_hash, expires_at))
-            except sqlite3.IntegrityError as exc:
-                raise PermissionError("Requisição repetida.") from exc
-            db.commit()
-        try:
-            os.chmod(NONCE_DB_PATH, 0o600)
-        except OSError:
-            pass
-        return
-    except PermissionError:
-        raise
-    except (OSError, sqlite3.Error) as exc:
-        LOG.warning("Proteção persistente de nonce indisponível; usando memória: %s", exc)
+def initialize_nonce_db() -> None:
+    NONCE_DB_PATH.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with sqlite3.connect(NONCE_DB_PATH, timeout=10.0) as db:
+        db.execute("PRAGMA busy_timeout = 10000")
+        db.execute("PRAGMA journal_mode = WAL")
+        db.execute("PRAGMA synchronous = NORMAL")
+        db.execute("CREATE TABLE IF NOT EXISTS connector_nonces (nonce_hash TEXT PRIMARY KEY, expires_at REAL NOT NULL)")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_connector_nonces_expiry ON connector_nonces(expires_at)")
+        db.commit()
+    _chmod_private(NONCE_DB_PATH)
 
+
+def remember_nonce(environment: str, nonce: str, now: float) -> None:
+    """Reject replay immediately in memory and persist without blocking request traffic."""
+    global NONCE_DB_LAST_CLEANUP, NONCE_DB_LAST_WARNING
     nonce_key = environment + ":" + nonce
     with NONCE_LOCK:
         cleanup_nonces(now)
         if nonce_key in NONCES:
             raise PermissionError("Requisição repetida.")
         NONCES[nonce_key] = now
+
+    nonce_hash = hashlib.sha256(f"{environment}|{nonce}".encode("utf-8")).hexdigest()
+    expires_at = now + WINDOW_SECONDS + 30
+    try:
+        with NONCE_DB_LOCK, sqlite3.connect(NONCE_DB_PATH, timeout=0.2) as db:
+            db.execute("PRAGMA busy_timeout = 200")
+            db.execute("PRAGMA synchronous = NORMAL")
+            if now - NONCE_DB_LAST_CLEANUP >= 60:
+                db.execute("DELETE FROM connector_nonces WHERE expires_at < ?", (now,))
+                NONCE_DB_LAST_CLEANUP = now
+            try:
+                db.execute("INSERT INTO connector_nonces (nonce_hash, expires_at) VALUES (?, ?)", (nonce_hash, expires_at))
+            except sqlite3.IntegrityError as exc:
+                with NONCE_LOCK:
+                    NONCES.pop(nonce_key, None)
+                raise PermissionError("Requisição repetida.") from exc
+            db.commit()
+    except PermissionError:
+        raise
+    except (OSError, sqlite3.Error) as exc:
+        if now - NONCE_DB_LAST_WARNING >= 60:
+            NONCE_DB_LAST_WARNING = now
+            LOG.warning("Proteção persistente de nonce ocupada; proteção imediata em memória permanece ativa: %s", exc)
 
 
 def verify_signature(method: str, path: str, body: bytes, headers: Any) -> str:
@@ -606,21 +718,35 @@ class Handler(BaseHTTPRequestHandler):
                 return
         LOG.info("%s - %s", self.address_string(), line)
 
-    def send_json(self, status: int, payload: dict[str, Any]) -> None:
+    def send_json(self, status: int, payload: dict[str, Any]) -> bool:
         body = json_bytes(payload)
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
-        self.send_header("Pragma", "no-cache")
-        self.send_header("X-Content-Type-Options", "nosniff")
-        self.send_header("X-Robots-Tag", "noindex, nofollow, noarchive")
-        self.send_header("Referrer-Policy", "no-referrer")
-        retry_after = int(payload.get("retry_after_seconds") or 0) if isinstance(payload, dict) else 0
-        if retry_after > 0:
-            self.send_header("Retry-After", str(min(86400, retry_after)))
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+            self.send_header("Pragma", "no-cache")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("X-Robots-Tag", "noindex, nofollow, noarchive")
+            self.send_header("Referrer-Policy", "no-referrer")
+            self.send_header("Connection", "close")
+            retry_after = int(payload.get("retry_after_seconds") or 0) if isinstance(payload, dict) else 0
+            if retry_after > 0:
+                self.send_header("Retry-After", str(min(86400, retry_after)))
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            self.wfile.flush()
+            return True
+        except (BrokenPipeError, ConnectionResetError, TimeoutError) as exc:
+            self.close_connection = True
+            LOG.debug("Cliente encerrou a resposta antes do fim: %s", exc)
+            return False
+        except OSError as exc:
+            if exc.errno in {errno.EPIPE, errno.ECONNRESET, errno.ETIMEDOUT, errno.EBADF}:
+                self.close_connection = True
+                LOG.debug("Transporte encerrado durante a resposta: %s", exc)
+                return False
+            raise
 
     def do_GET(self) -> None:
         path = self.path.split("?", 1)[0]
@@ -636,7 +762,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if path == "/health/details":
                 details = detailed_health_payload(environment)
-                details["telemetry"] = TELEMETRY.status()
+                details["telemetry"] = TELEMETRY.status_fast()
                 self.send_json(200, details)
             else:
                 self.send_json(200, TELEMETRY.status())
@@ -769,6 +895,15 @@ class Handler(BaseHTTPRequestHandler):
                 if acquired:
                     SEMAPHORE.release()
                 manual_operation_leave(pending_key)
+        except sqlite3.OperationalError as exc:
+            LOG.warning("Armazenamento local temporariamente ocupado: %s", exc)
+            self.send_json(503, {
+                "ok": False,
+                "temporary": True,
+                "retry_after_seconds": 2,
+                "message": "O Gateway está concluindo uma gravação local. A solicitação pode ser repetida sem duplicar ações.",
+                "connector_version": connector.CONNECTOR_VERSION,
+            })
         except connector.ConnectorTemporaryError as exc:
             LOG.warning("Reconexão automática adiada: %s", connector.clean_message(str(exc)))
             self.send_json(503, {
@@ -807,11 +942,18 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(500, {"ok": False, "message": "Falha interna no conector.", "connector_version": connector.CONNECTOR_VERSION})
 
 
+class ConnectorHTTPServer(ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+    request_queue_size = 128
+
+
 if __name__ == "__main__":
     if not any(len(secret) >= 32 for secret in SECRETS.values()):
         LOG.error("Configure staging_secret ou production_secret antes de iniciar.")
-    server = ThreadingHTTPServer(("0.0.0.0", 8094), Handler)
-    server.daemon_threads = True
+    initialize_command_db()
+    initialize_nonce_db()
+    server = ConnectorHTTPServer(("0.0.0.0", 8094), Handler)
     TELEMETRY.start()
     LOG.info("%s listening on port 8094", SERVICE)
     try:

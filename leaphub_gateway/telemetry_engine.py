@@ -24,7 +24,7 @@ from cryptography.fernet import Fernet, InvalidToken
 import leaphub_connector as connector
 
 LOG = logging.getLogger("leaphub.telemetry")
-ENGINE_VERSION = "1.11.84"
+ENGINE_VERSION = "1.11.85"
 
 
 def utc_iso() -> str:
@@ -249,13 +249,14 @@ class TelemetryEngine:
             except OSError:
                 pass
 
-    def _db(self) -> sqlite3.Connection:
+    def _db(self, timeout_seconds: float = 30.0) -> sqlite3.Connection:
         self._prepare_storage(probe=False)
         db: sqlite3.Connection | None = None
         try:
-            db = sqlite3.connect(self.db_path, timeout=30, isolation_level=None)
+            timeout_seconds = max(0.05, min(30.0, float(timeout_seconds)))
+            db = sqlite3.connect(self.db_path, timeout=timeout_seconds, isolation_level=None)
             db.row_factory = sqlite3.Row
-            db.execute("PRAGMA busy_timeout=30000")
+            db.execute(f"PRAGMA busy_timeout={max(50, int(timeout_seconds * 1000))}")
             db.execute("PRAGMA foreign_keys=ON")
             # Evita depender de /tmp ou de arquivos temporários externos ao /data.
             db.execute("PRAGMA temp_store=MEMORY")
@@ -781,6 +782,44 @@ class TelemetryEngine:
             "last_error_at": self.storage_last_error_at or None,
             "retry_in_seconds": max(0, int(self.storage_next_retry_at - now)),
         }
+
+    def status_fast(self) -> dict[str, Any]:
+        """Bounded health snapshot that never holds Cloudflare health checks hostage."""
+        acquired = self.lock.acquire(timeout=0.15)
+        if not acquired:
+            return {
+                "ok": True,
+                "busy": True,
+                "message": "Telemetria ocupada em uma coleta; armazenamento continua ativo.",
+                "storage": self.storage_status(),
+            }
+        try:
+            with self._db(0.2) as db:
+                row = db.execute(
+                    "SELECT COUNT(*) subscriptions, "
+                    "SUM(CASE WHEN enabled=1 THEN 1 ELSE 0 END) enabled, "
+                    "SUM(CASE WHEN status IN ('error','auth_required') THEN 1 ELSE 0 END) errors "
+                    "FROM subscriptions"
+                ).fetchone()
+                pending = db.execute("SELECT COUNT(*) FROM events WHERE status='pending'").fetchone()[0]
+            return {
+                "ok": True,
+                "storage": self.storage_status(),
+                "subscriptions": int(row["subscriptions"] or 0),
+                "enabled_subscriptions": int(row["enabled"] or 0),
+                "subscriptions_with_errors": int(row["errors"] or 0),
+                "pending_events": int(pending or 0),
+            }
+        except (OSError, sqlite3.Error) as exc:
+            return {
+                "ok": True,
+                "busy": True,
+                "message": "Resumo temporariamente ocupado; o worker permanece ativo.",
+                "storage": self.storage_status(),
+                "detail": str(exc)[:160],
+            }
+        finally:
+            self.lock.release()
 
     def status(self) -> dict[str, Any]:
         try:
