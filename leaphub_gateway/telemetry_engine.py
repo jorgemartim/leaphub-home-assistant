@@ -24,7 +24,7 @@ from cryptography.fernet import Fernet, InvalidToken
 import leaphub_connector as connector
 
 LOG = logging.getLogger("leaphub.telemetry")
-ENGINE_VERSION = "1.11.86"
+ENGINE_VERSION = "1.11.87"
 
 
 def utc_iso() -> str:
@@ -425,6 +425,76 @@ class TelemetryEngine:
                     CREATE INDEX IF NOT EXISTS idx_events_vehicle_order ON events(subscription_id, remote_id, status, sequence);
                     """
                 )
+    def execute_command(
+        self,
+        environment: str,
+        payload: dict[str, Any],
+        progress: Callable[[str, str, dict[str, Any] | None], None] | None = None,
+    ) -> dict[str, Any]:
+        """Executa a ação sob a mesma sessão e trava usadas pela telemetria.
+
+        Uma sessão válida nunca é destruída apenas porque o usuário acionou um
+        comando. Se não houver sessão ativa, o conector mantém o fluxo isolado
+        anterior como fallback. Falhas transitórias preservam a sessão.
+        """
+        try:
+            account_id = int(payload.get("account_id") or 0)
+        except (TypeError, ValueError):
+            account_id = 0
+        if account_id < 1:
+            return connector.handle_command(payload, progress=progress)
+
+        with self.lock, self._db() as db:
+            row = db.execute(
+                "SELECT subscription_id FROM subscriptions "
+                "WHERE environment=? AND account_id=? AND enabled=1 "
+                "ORDER BY updated_at DESC LIMIT 1",
+                (str(environment or ""), account_id),
+            ).fetchone()
+        if row is None:
+            return connector.handle_command(payload, progress=progress)
+
+        subscription_id = str(row["subscription_id"] or "")
+        if not subscription_id:
+            return connector.handle_command(payload, progress=progress)
+
+        with self._session_operation_lock(subscription_id):
+            with self.session_lock:
+                session = self.sessions.get(subscription_id)
+            if not isinstance(session, dict) or session.get("client") is None:
+                return connector.handle_command(payload, progress=progress)
+
+            now_epoch = time.time()
+            command_credentials = payload.get("credentials") if isinstance(payload.get("credentials"), dict) else {}
+            session_credentials = dict(command_credentials)
+            session_credentials.pop("operation_password", None)
+            expected_hash = hashlib.sha256(canonical_json(session_credentials)).hexdigest() if session_credentials else ""
+            session_stale = (
+                expected_hash == ""
+                or session.get("credential_hash") != expected_hash
+                or now_epoch - float(session.get("created_at") or 0) >= self.session_max_age_seconds
+                or now_epoch - float(session.get("last_used_at") or 0) >= self.session_idle_seconds
+            )
+            if session_stale:
+                self._close_session_locked(subscription_id)
+                return connector.handle_command(payload, progress=progress)
+
+            session["last_used_at"] = now_epoch
+            try:
+                result = connector.handle_command(
+                    payload,
+                    progress=progress,
+                    borrowed_client=session["client"],
+                    borrowed_vehicles=session.get("vehicles") if isinstance(session.get("vehicles"), list) else None,
+                )
+                session["last_used_at"] = time.time()
+                return result
+            except Exception as exc:
+                session["last_used_at"] = time.time()
+                if connector.is_authentication_error(exc):
+                    self._close_session_locked(subscription_id)
+                raise
+
     def invalidate_account_session(self, environment: str, payload: dict[str, Any]) -> int:
         """Feche a sessão automática antes de uma operação manual da conta.
 
@@ -1341,6 +1411,7 @@ class TelemetryEngine:
             if not serialized:
                 raise RuntimeError("Nenhum veículo foi encontrado para esta conta.")
             session["last_used_at"] = time.time()
+            session["vehicles"] = vehicles
             return {
                 "ok": True,
                 "account_name": "Conta Leapmotor",

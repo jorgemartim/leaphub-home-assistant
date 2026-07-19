@@ -1,3 +1,11 @@
+## 1.11.87
+
+- Sessão Leapmotor reutilizada entre telemetria e comandos sob trava por conta.
+- Removido o encerramento preventivo que provocava nova validação antes do comando.
+- Cache da última lista válida de veículos para resolver o VIN sem chamada adicional.
+- Estado `cloud_accepted` somente após a ação realmente ser enviada.
+- Persistência de nonce com WAL, busy timeout e novas tentativas limitadas.
+
 ## 1.11.86
 
 - climatização verifica uma leitura fresca e pode repetir uma única vez somente `climate_on`/`climate_off`;

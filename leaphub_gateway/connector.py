@@ -27,7 +27,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable
 
-CONNECTOR_VERSION = "1.11.86"
+CONNECTOR_VERSION = "1.11.87"
 MAX_INPUT_BYTES = 1024 * 1024
 logging.getLogger("leapmotor_api").setLevel(logging.WARNING)
 
@@ -2277,6 +2277,7 @@ def resolve_command_vehicle(
     client: Any,
     supplied_identifier: str,
     vin_hint: str = "",
+    vehicles_hint: list[Any] | None = None,
 ) -> tuple[str, list[Any] | None, str]:
     """Resolve o identificador salvo pelo Leap Hub para o VIN exigido pela biblioteca.
 
@@ -2286,10 +2287,13 @@ def resolve_command_vehicle(
     """
     vin_hint = str(vin_hint or "").strip()[:40]
     if vin_hint:
-        return vin_hint, None, "vin_hint"
+        return vin_hint, list(vehicles_hint) if isinstance(vehicles_hint, list) and vehicles_hint else None, "vin_hint"
 
     supplied_identifier = str(supplied_identifier or "").strip()[:190]
-    vehicles = list(client.get_vehicle_list() or [])
+    # Quando a telemetria já possui uma sessão autenticada, reutilizamos também
+    # a última lista válida de veículos. Isso evita destruir um token saudável e
+    # refazer vehicle/list imediatamente antes de um comando remoto.
+    vehicles = list(vehicles_hint) if isinstance(vehicles_hint, list) and vehicles_hint else list(client.get_vehicle_list() or [])
     selected = None
     source = ""
     for vehicle in vehicles:
@@ -2366,6 +2370,8 @@ def verify_command_state(
 def handle_command(
     payload: dict[str, Any],
     progress: Callable[[str, str, dict[str, Any] | None], None] | None = None,
+    borrowed_client: Any | None = None,
+    borrowed_vehicles: list[Any] | None = None,
 ) -> dict[str, Any]:
     """Execute one remote action without sending an unsafe duplicate.
 
@@ -2405,7 +2411,16 @@ def handle_command(
         wake_timeout = 45
 
     temp_dir = secure_temp_directory()
-    client = None
+    client = borrowed_client
+    client_is_borrowed = borrowed_client is not None
+    borrowed_original_operation_password = getattr(borrowed_client, "operation_password", None) if borrowed_client is not None else None
+    if borrowed_client is not None:
+        # leapmotor-api mantém o PIN como atributo simples. Ele é aplicado apenas
+        # durante a operação e restaurado no finally, sem criar um segundo login.
+        try:
+            borrowed_client.operation_password = operation_password
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError("A sessão ativa não permite preparar o PIN do veículo.") from exc
     result: Any = None
     identifier_source = ""
     wake_info: dict[str, Any] = {"attempted": False, "method": None}
@@ -2417,24 +2432,35 @@ def handle_command(
     safe_retry_performed = False
     verification_state = "not_checked"
 
-    def close_client() -> None:
-        nonlocal client
+    def close_client(force: bool = False) -> None:
+        nonlocal client, client_is_borrowed
         if client is None:
+            return
+        if client_is_borrowed and not force:
             return
         try:
             client.close()
         except Exception:
             pass
         client = None
+        client_is_borrowed = False
 
     def open_client(attempt: int) -> tuple[Any, str, list[Any] | None, Any, str]:
-        nonlocal client, session_attempts
+        nonlocal client, session_attempts, client_is_borrowed
         session_attempts += 1
-        attempt_dir = temp_dir / f"command-{attempt}"
-        attempt_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-        client = create_client(credentials, attempt_dir, operation_password, request_timeout_seconds=32)
-        client.login()
-        resolved_id, resolved_list, source = resolve_command_vehicle(client, vehicle_id, vehicle_vin)
+        if attempt == 1 and borrowed_client is not None:
+            client = borrowed_client
+            client_is_borrowed = True
+            resolved_id, resolved_list, source = resolve_command_vehicle(
+                client, vehicle_id, vehicle_vin, borrowed_vehicles
+            )
+        else:
+            attempt_dir = temp_dir / f"command-{attempt}"
+            attempt_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+            client = create_client(credentials, attempt_dir, operation_password, request_timeout_seconds=32)
+            client_is_borrowed = False
+            client.login()
+            resolved_id, resolved_list, source = resolve_command_vehicle(client, vehicle_id, vehicle_vin)
         method_name = COMMAND_METHODS[command]
         method = getattr(client, method_name, None)
         if not callable(method):
@@ -2461,7 +2487,12 @@ def handle_command(
         return True
 
     try:
-        report("preparing", "Preparando uma sessão exclusiva para o comando.")
+        report(
+            "preparing",
+            "Reutilizando a sessão autenticada da conta para o comando." if borrowed_client is not None
+            else "Preparando uma sessão exclusiva para o comando.",
+            {"session_reused": borrowed_client is not None},
+        )
         try:
             _, resolved_vehicle_id, _, method, identifier_source = open_client(1)
         except Exception as exc:  # noqa: BLE001
@@ -2495,21 +2526,23 @@ def handle_command(
                         str(wake_info.get("message") or "Não foi possível acordar o veículo agora.")
                     ) from first_error
 
-                # A wake request may rotate the cloud token. Never reuse that
-                # session for the real command. Wait briefly and authenticate a
-                # clean command-only session before one safe retry.
-                close_client()
                 wait_seconds = min(6.0, max(3.0, wake_timeout / 12))
                 time.sleep(wait_seconds)
-                report("reconnecting", "Veículo acordando. Criando uma conexão limpa para executar a ação.")
-                try:
-                    _, resolved_vehicle_id, _, method, identifier_source = open_client(2)
-                except Exception as exc:  # noqa: BLE001
-                    if is_transient_cloud_error(exc):
-                        raise ConnectorTemporaryError(reconnect_message(exc)) from exc
-                    if is_authentication_error(exc):
-                        raise ConnectorAuthenticationError(clean_message(str(exc))) from exc
-                    raise RuntimeError(clean_message(str(exc))) from exc
+                if borrowed_client is not None:
+                    # A mesma sessão autenticada continua sob trava exclusiva da
+                    # conta. A biblioteca renova o token internamente se preciso.
+                    report("reconnecting", "Veículo acordando. Mantendo a sessão autenticada para executar a ação.")
+                else:
+                    close_client()
+                    report("reconnecting", "Veículo acordando. Criando uma conexão limpa para executar a ação.")
+                    try:
+                        _, resolved_vehicle_id, _, method, identifier_source = open_client(2)
+                    except Exception as exc:  # noqa: BLE001
+                        if is_transient_cloud_error(exc):
+                            raise ConnectorTemporaryError(reconnect_message(exc)) from exc
+                        if is_authentication_error(exc):
+                            raise ConnectorAuthenticationError(clean_message(str(exc))) from exc
+                        raise RuntimeError(clean_message(str(exc))) from exc
 
                 report("executing", "Veículo acordado. Enviando a ação agora.", {"attempt": 2})
                 command_attempts = 2
@@ -2535,11 +2568,15 @@ def handle_command(
         # idempotente, fazemos uma leitura fresca e no máximo uma segunda entrega
         # protegida. Outros comandos jamais são repetidos automaticamente.
         if verify_after and command in SAFE_STATE_RETRY_COMMANDS:
-            report("confirming", "Ação aceita. Verificando o estado real do veículo.")
-            close_client()
+            report("confirming", "Ação enviada. Verificando o estado real do veículo.")
+            if borrowed_client is None:
+                close_client()
             time.sleep(6.0)
             try:
-                _, resolved_vehicle_id, resolved_list, method, identifier_source = open_client(3)
+                if borrowed_client is not None:
+                    resolved_list = borrowed_vehicles
+                else:
+                    _, resolved_vehicle_id, resolved_list, method, identifier_source = open_client(3)
                 matched, evaluable, verification_state = verify_command_state(
                     client, resolved_vehicle_id, command, parameters, resolved_list
                 )
@@ -2598,11 +2635,18 @@ def handle_command(
             "confirmation_reason": confirmation_reason,
             "identifier_source": identifier_source or ("vin_hint" if vehicle_vin else "resolved"),
             "command_dispatched": True,
+            "cloud_accepted": True,
+            "session_reused": borrowed_client is not None,
             "verified_by_gateway": verified_by_gateway,
             "safe_retry_performed": safe_retry_performed,
             "verification_state": verification_state,
         }
     finally:
+        if borrowed_client is not None:
+            try:
+                borrowed_client.operation_password = borrowed_original_operation_password
+            except Exception:
+                pass
         close_client()
         shutil.rmtree(temp_dir, ignore_errors=True)
 

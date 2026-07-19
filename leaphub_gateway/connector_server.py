@@ -32,7 +32,7 @@ except ModuleNotFoundError as exc:
         "Módulo interno leaphub_connector ausente na imagem. Atualize o Leap Hub Gateway."
     ) from exc
 
-VERSION = "1.11.86"
+VERSION = "1.11.87"
 SERVICE = "Leap Hub Leapmotor Connector"
 MAX_BODY = 1024 * 1024
 WINDOW_SECONDS = 180
@@ -454,12 +454,10 @@ def run_command_job(
         account_acquired = account_lock.acquire(timeout=max(60, MANUAL_WAIT_SECONDS))
         if not account_acquired:
             raise connector.ConnectorTemporaryError("A conta ainda finalizava uma leitura anterior. Tente novamente em instantes.")
-        TELEMETRY.invalidate_account_session(environment, payload)
-
         def progress(stage: str, message: str, extra: dict[str, Any] | None = None) -> None:
             command_journal_progress(request_hash, request_id, stage, message, extra)
 
-        result = connector.handle_command(payload, progress=progress)
+        result = TELEMETRY.execute_command(environment, payload, progress=progress)
         if request_id:
             result["request_id"] = request_id
         result["queued"] = False
@@ -559,26 +557,38 @@ def remember_nonce(environment: str, nonce: str, now: float) -> None:
 
     nonce_hash = hashlib.sha256(f"{environment}|{nonce}".encode("utf-8")).hexdigest()
     expires_at = now + WINDOW_SECONDS + 30
-    try:
-        with NONCE_DB_LOCK, sqlite3.connect(NONCE_DB_PATH, timeout=0.2) as db:
-            db.execute("PRAGMA busy_timeout = 200")
-            db.execute("PRAGMA synchronous = NORMAL")
-            if now - NONCE_DB_LAST_CLEANUP >= 60:
-                db.execute("DELETE FROM connector_nonces WHERE expires_at < ?", (now,))
-                NONCE_DB_LAST_CLEANUP = now
-            try:
-                db.execute("INSERT INTO connector_nonces (nonce_hash, expires_at) VALUES (?, ?)", (nonce_hash, expires_at))
-            except sqlite3.IntegrityError as exc:
-                with NONCE_LOCK:
-                    NONCES.pop(nonce_key, None)
-                raise PermissionError("Requisição repetida.") from exc
-            db.commit()
-    except PermissionError:
-        raise
-    except (OSError, sqlite3.Error) as exc:
-        if now - NONCE_DB_LAST_WARNING >= 60:
-            NONCE_DB_LAST_WARNING = now
-            LOG.warning("Proteção persistente de nonce ocupada; proteção imediata em memória permanece ativa: %s", exc)
+    last_error: BaseException | None = None
+    for attempt, delay in enumerate((0.0, 0.06, 0.18, 0.42), start=1):
+        if delay > 0:
+            time.sleep(delay)
+        try:
+            with NONCE_DB_LOCK, sqlite3.connect(NONCE_DB_PATH, timeout=2.5) as db:
+                db.execute("PRAGMA busy_timeout = 2500")
+                db.execute("PRAGMA journal_mode = WAL")
+                db.execute("PRAGMA synchronous = NORMAL")
+                if now - NONCE_DB_LAST_CLEANUP >= 60:
+                    db.execute("DELETE FROM connector_nonces WHERE expires_at < ?", (now,))
+                    NONCE_DB_LAST_CLEANUP = now
+                try:
+                    db.execute("INSERT INTO connector_nonces (nonce_hash, expires_at) VALUES (?, ?)", (nonce_hash, expires_at))
+                except sqlite3.IntegrityError as exc:
+                    with NONCE_LOCK:
+                        NONCES.pop(nonce_key, None)
+                    raise PermissionError("Requisição repetida.") from exc
+                db.commit()
+                return
+        except PermissionError:
+            raise
+        except (OSError, sqlite3.Error) as exc:
+            last_error = exc
+            if "locked" not in str(exc).lower() and "busy" not in str(exc).lower():
+                break
+    if now - NONCE_DB_LAST_WARNING >= 60:
+        NONCE_DB_LAST_WARNING = now
+        LOG.warning(
+            "Proteção persistente de nonce temporariamente ocupada após novas tentativas; proteção imediata em memória permanece ativa: %s",
+            last_error,
+        )
 
 
 def verify_signature(method: str, path: str, body: bytes, headers: Any) -> str:
