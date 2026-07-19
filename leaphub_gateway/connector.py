@@ -27,9 +27,19 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable
 
-CONNECTOR_VERSION = "1.11.87"
+CONNECTOR_VERSION = "1.11.88"
 MAX_INPUT_BYTES = 1024 * 1024
 logging.getLogger("leapmotor_api").setLevel(logging.WARNING)
+LOGGER = logging.getLogger("leaphub.connector")
+
+
+def connector_log(level: int, message: str, *args: Any) -> None:
+    """Best-effort logging that can never interrupt a vehicle command."""
+    try:
+        LOGGER.log(level, message, *args)
+    except Exception:
+        pass
+
 
 SAFE_STATE_RETRY_COMMANDS = {"climate_on", "climate_off"}
 
@@ -2603,11 +2613,44 @@ def handle_command(
                 verification_state = "verification_unavailable"
                 confirmation_pending = True
                 confirmation_reason = confirmation_reason or "verification_unavailable"
-                LOG.info(
-                    "Verificação direta do comando %s adiada: %s",
+                connector_log(
+                    logging.WARNING,
+                    "Verificação direta do comando %s indisponível: %s",
                     command,
                     clean_message(str(verification_error)),
                 )
+
+                # climate_on/climate_off são comandos de estado idempotentes. Se
+                # a leitura de confirmação falhar depois que o veículo acordou,
+                # fazemos no máximo uma segunda entrega protegida. Isso evita que
+                # uma falha de leitura deixe o carro acordado sem aplicar o estado.
+                if command_attempts < 2:
+                    report(
+                        "executing",
+                        "O veículo acordou, mas a leitura de confirmação falhou. Repetindo uma única vez a ação idempotente.",
+                        {"safe_retry": True, "verification_unavailable": True},
+                    )
+                    command_attempts += 1
+                    try:
+                        result = execute_vehicle_command(method, command, resolved_vehicle_id, parameters)
+                        safe_retry_performed = True
+                        confirmation_pending = True
+                        confirmation_reason = "verification_retry"
+                    except Exception as retry_error:  # noqa: BLE001
+                        if classify_accepted_ambiguity(retry_error):
+                            safe_retry_performed = True
+                            confirmation_pending = True
+                        elif is_authentication_error(retry_error):
+                            raise ConnectorAuthenticationError(clean_message(str(retry_error))) from retry_error
+                        else:
+                            confirmation_pending = True
+                            confirmation_reason = confirmation_reason or "verification_retry_unconfirmed"
+                            connector_log(
+                                logging.WARNING,
+                                "Repetição protegida do comando %s não pôde ser confirmada: %s",
+                                command,
+                                clean_message(str(retry_error)),
+                            )
 
         if verified_by_gateway:
             message = "A ação foi executada e confirmada por uma leitura nova do veículo."

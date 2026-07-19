@@ -1,3 +1,10 @@
+## 1.11.88
+
+- Corrigido logger indefinido no caminho de verificação do comando remoto.
+- O tratamento de erro de confirmação não pode mais gerar uma segunda exceção.
+- Climatização repete uma única vez a ação idempotente quando o carro acorda, mas a leitura direta falha.
+- Logs preservam o erro original sem expor credenciais, VIN ou PIN.
+
 ## 1.11.87
 
 - Sessão Leapmotor reutilizada entre telemetria e comandos sob trava por conta.
