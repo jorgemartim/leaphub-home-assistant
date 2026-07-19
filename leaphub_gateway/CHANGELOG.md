@@ -1,3 +1,12 @@
+## 1.11.92
+
+- Reconhece `Password error limit has reached maximum` como bloqueio temporário, não como senha inválida.
+- Extrai o prazo informado pela Leapmotor e impede qualquer novo login antes desse horário.
+- Mantém o comando no estado `waiting_auth` e o retoma automaticamente após o cooldown.
+- Compartilha a proteção com a telemetria para evitar logins concorrentes da mesma conta.
+- Preserva credenciais, fila e sessão válida; não desconecta a conta por limite temporário.
+- A resposta de status inclui contagem regressiva segura sem e-mail, VIN, PIN, token ou senha.
+
 ## 1.11.91
 
 - Introduz o estado `sent`: a entrega termina quando a nuvem aceita a ação, enquanto a confirmação física continua separadamente.

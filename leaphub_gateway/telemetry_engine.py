@@ -24,7 +24,7 @@ from cryptography.fernet import Fernet, InvalidToken
 import leaphub_connector as connector
 
 LOG = logging.getLogger("leaphub.telemetry")
-ENGINE_VERSION = "1.11.91"
+ENGINE_VERSION = "1.11.92"
 
 
 def utc_iso() -> str:
@@ -425,6 +425,24 @@ class TelemetryEngine:
                     CREATE INDEX IF NOT EXISTS idx_events_vehicle_order ON events(subscription_id, remote_id, status, sequence);
                     """
                 )
+    def _set_account_login_cooldown(self, environment: str, account_id: int, retry_after_seconds: int, message: str) -> None:
+        delay = max(30, min(1800, int(retry_after_seconds or 120)))
+        until = time.time() + delay
+        now = utc_iso()
+        with self.lock, self._db() as db:
+            rows = db.execute(
+                "SELECT subscription_id FROM subscriptions WHERE environment=? AND account_id=?",
+                (str(environment or ""), int(account_id or 0)),
+            ).fetchall()
+            db.execute(
+                "UPDATE subscriptions SET status='cooldown',cooldown_until=?,next_run_at=?,last_error=?,updated_at=? "
+                "WHERE environment=? AND account_id=?",
+                (until, until, connector.clean_message(message)[:500], now, str(environment or ""), int(account_id or 0)),
+            )
+        for row in rows:
+            self._close_session(str(row["subscription_id"] or ""))
+        self.wake_event.set()
+
     def execute_command(
         self,
         environment: str,
@@ -446,7 +464,7 @@ class TelemetryEngine:
 
         with self.lock, self._db() as db:
             row = db.execute(
-                "SELECT subscription_id FROM subscriptions "
+                "SELECT subscription_id,cooldown_until,status FROM subscriptions "
                 "WHERE environment=? AND account_id=? AND enabled=1 "
                 "ORDER BY updated_at DESC LIMIT 1",
                 (str(environment or ""), account_id),
@@ -457,12 +475,25 @@ class TelemetryEngine:
         subscription_id = str(row["subscription_id"] or "")
         if not subscription_id:
             return connector.handle_command(payload, progress=progress)
+        cooldown_until = float(row["cooldown_until"] or 0)
+        if cooldown_until > time.time():
+            raise connector.ConnectorLoginCooldownError(
+                "A Leapmotor limitou temporariamente novas autenticações. O comando continua protegido na fila.",
+                max(30, int(cooldown_until - time.time())),
+            )
+
+        def isolated_command() -> dict[str, Any]:
+            try:
+                return connector.handle_command(payload, progress=progress)
+            except connector.ConnectorLoginCooldownError as exc:
+                self._set_account_login_cooldown(environment, account_id, exc.retry_after_seconds, str(exc))
+                raise
 
         with self._session_operation_lock(subscription_id):
             with self.session_lock:
                 session = self.sessions.get(subscription_id)
             if not isinstance(session, dict) or session.get("client") is None:
-                return connector.handle_command(payload, progress=progress)
+                return isolated_command()
 
             now_epoch = time.time()
             command_credentials = payload.get("credentials") if isinstance(payload.get("credentials"), dict) else {}
@@ -477,7 +508,7 @@ class TelemetryEngine:
             )
             if session_stale:
                 self._close_session_locked(subscription_id)
-                return connector.handle_command(payload, progress=progress)
+                return isolated_command()
 
             session["last_used_at"] = now_epoch
             try:
@@ -510,10 +541,12 @@ class TelemetryEngine:
                             )
                         except Exception:
                             pass
-                    recovered = connector.handle_command(payload, progress=progress)
+                    recovered = isolated_command()
                     recovered["session_recovered"] = True
                     recovered["session_reused"] = False
                     return recovered
+                if isinstance(exc, connector.ConnectorLoginCooldownError):
+                    self._set_account_login_cooldown(environment, account_id, exc.retry_after_seconds, str(exc))
                 if connector.is_authentication_error(exc):
                     self._close_session_locked(subscription_id)
                 raise
@@ -1185,7 +1218,17 @@ class TelemetryEngine:
             transient = connector.is_transient_cloud_error(exc) or isinstance(exc, connector.ConnectorTemporaryError)
             if not transient or failures >= 3:
                 self._close_session(sid)
-            if self._looks_rate_limited(message):
+            if isinstance(exc, connector.ConnectorLoginCooldownError):
+                self._close_session(sid)
+                delay = max(30, min(1800, int(exc.retry_after_seconds or 120)))
+                now = utc_iso()
+                with self.lock, self._db() as db:
+                    db.execute(
+                        "UPDATE subscriptions SET status='cooldown',cooldown_until=?,next_run_at=?,last_run_at=?,last_error=?,consecutive_failures=consecutive_failures+1,updated_at=? WHERE subscription_id=?",
+                        (time.time() + delay, time.time() + delay, now, message[:500], now, sid),
+                    )
+                LOG.warning("Autenticação de %s aguardará %ss antes da próxima tentativa; credenciais permanecem protegidas.", sid, delay)
+            elif self._looks_rate_limited(message):
                 self._close_session(sid)
                 delay = self.rate_limit_cooldown_seconds
                 now = utc_iso()
@@ -1660,7 +1703,7 @@ class TelemetryEngine:
     def _looks_rate_limited(message: str) -> bool:
         normalized = str(message or "").lower()
         return any(token in normalized for token in (
-            "429", "too many", "rate limit", "rate-limit", "throttle", "temporarily blocked",
+            "429", "too many", "password error limit", "login attempt limit", "rate limit", "rate-limit", "throttle", "temporarily blocked",
             "muitas solicitações", "limite de requisições", "conta bloqueada",
         ))
 

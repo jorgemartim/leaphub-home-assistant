@@ -27,7 +27,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable
 
-CONNECTOR_VERSION = "1.11.91"
+CONNECTOR_VERSION = "1.11.92"
 MAX_INPUT_BYTES = 1024 * 1024
 logging.getLogger("leapmotor_api").setLevel(logging.WARNING)
 LOGGER = logging.getLogger("leaphub.connector")
@@ -105,6 +105,41 @@ class ConnectorAuthenticationError(RuntimeError):
     """Credencial realmente recusada depois das tentativas de reautenticação."""
 
 
+class ConnectorLoginCooldownError(ConnectorTemporaryError):
+    """A nuvem bloqueou novos logins temporariamente; não é senha inválida."""
+
+    def __init__(self, message: str, retry_after_seconds: int = 120) -> None:
+        super().__init__(message)
+        self.retry_after_seconds = max(30, min(1800, int(retry_after_seconds or 120)))
+
+
+LOGIN_COOLDOWN_MARKERS = (
+    "password error limit has reached maximum",
+    "password error limit",
+    "too many login attempts",
+    "login attempt limit",
+    "login limit has reached maximum",
+    "try again in",
+)
+
+
+def login_cooldown_seconds(value: Any) -> int:
+    message = clean_message(str(value)).lower()
+    if not any(marker in message for marker in LOGIN_COOLDOWN_MARKERS):
+        return 0
+    match = re.search(r"try again in\s+(\d+)\s*(second|seconds|minute|minutes|hour|hours)", message)
+    if not match:
+        return 120
+    amount = max(1, int(match.group(1)))
+    unit = match.group(2)
+    multiplier = 1 if unit.startswith("second") else (60 if unit.startswith("minute") else 3600)
+    return max(30, min(1800, amount * multiplier))
+
+
+def is_login_cooldown_error(value: Any) -> bool:
+    return login_cooldown_seconds(value) > 0
+
+
 TRANSIENT_CLOUD_MARKERS = (
     "information verification failed",
     "please try again later",
@@ -119,6 +154,9 @@ TRANSIENT_CLOUD_MARKERS = (
     "connection aborted",
     "remote disconnected",
     "too many requests",
+    "too many login attempts",
+    "password error limit has reached maximum",
+    "login attempt limit",
     "rate limit",
     "request limit",
     "token expired",
@@ -2167,6 +2205,12 @@ def handle_account(payload: dict[str, Any], sync: bool) -> dict[str, Any]:
             vehicles_value = client.get_vehicle_list()
             vehicles = vehicles_value if isinstance(vehicles_value, list) else list(vehicles_value or [])
         except Exception as exc:  # noqa: BLE001
+            cooldown = login_cooldown_seconds(exc)
+            if cooldown > 0:
+                raise ConnectorLoginCooldownError(
+                    "A Leapmotor limitou temporariamente novas autenticações. O comando continuará protegido até a próxima tentativa permitida.",
+                    cooldown,
+                ) from exc
             if is_transient_cloud_error(exc):
                 raise ConnectorTemporaryError(reconnect_message(exc)) from exc
             if is_authentication_error(exc):
@@ -2525,6 +2569,12 @@ def handle_command(
         try:
             _, resolved_vehicle_id, _, method, identifier_source = open_client(1)
         except Exception as exc:  # noqa: BLE001
+            cooldown = login_cooldown_seconds(exc)
+            if cooldown > 0:
+                raise ConnectorLoginCooldownError(
+                    "A Leapmotor limitou temporariamente novas autenticações. O comando continuará na fila e será retomado automaticamente.",
+                    cooldown,
+                ) from exc
             if is_transient_cloud_error(exc):
                 raise ConnectorTemporaryError(reconnect_message(exc)) from exc
             if is_authentication_error(exc):
@@ -2541,6 +2591,12 @@ def handle_command(
         except Exception as first_error:  # noqa: BLE001
             if classify_accepted_ambiguity(first_error):
                 report("confirming", "A nuvem recebeu a ação. Aguardando confirmação do veículo.")
+            cooldown = login_cooldown_seconds(first_error)
+            if cooldown > 0:
+                raise ConnectorLoginCooldownError(
+                    "A Leapmotor limitou temporariamente novas autenticações. O comando continuará na fila e será retomado automaticamente.",
+                    cooldown,
+                ) from first_error
             elif is_authentication_error(first_error):
                 raise ConnectorAuthenticationError(clean_message(str(first_error))) from first_error
             elif wake_on_sleep and is_vehicle_sleep_error(first_error):
@@ -2567,6 +2623,12 @@ def handle_command(
                     try:
                         _, resolved_vehicle_id, _, method, identifier_source = open_client(2)
                     except Exception as exc:  # noqa: BLE001
+                        cooldown = login_cooldown_seconds(exc)
+                        if cooldown > 0:
+                            raise ConnectorLoginCooldownError(
+                                "A Leapmotor limitou temporariamente novas autenticações. O comando continuará na fila e será retomado automaticamente.",
+                                cooldown,
+                            ) from exc
                         if is_transient_cloud_error(exc):
                             raise ConnectorTemporaryError(reconnect_message(exc)) from exc
                         if is_authentication_error(exc):
@@ -2580,6 +2642,12 @@ def handle_command(
                 except Exception as second_error:  # noqa: BLE001
                     if classify_accepted_ambiguity(second_error):
                         report("confirming", "A nuvem recebeu a ação. Aguardando confirmação do veículo.")
+                    cooldown = login_cooldown_seconds(second_error)
+                    if cooldown > 0:
+                        raise ConnectorLoginCooldownError(
+                            "A Leapmotor limitou temporariamente novas autenticações. O comando continuará na fila e será retomado automaticamente.",
+                            cooldown,
+                        ) from second_error
                     elif is_authentication_error(second_error):
                         raise ConnectorAuthenticationError(clean_message(str(second_error))) from second_error
                     elif is_transient_cloud_error(second_error):
@@ -2659,6 +2727,12 @@ def handle_command(
                         if classify_accepted_ambiguity(retry_error):
                             safe_retry_performed = True
                             confirmation_pending = True
+                        cooldown = login_cooldown_seconds(retry_error)
+                        if cooldown > 0:
+                            raise ConnectorLoginCooldownError(
+                                "A Leapmotor limitou temporariamente novas autenticações. O comando continuará na fila e será retomado automaticamente.",
+                                cooldown,
+                            ) from retry_error
                         elif is_authentication_error(retry_error):
                             raise ConnectorAuthenticationError(clean_message(str(retry_error))) from retry_error
                         else:

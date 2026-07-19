@@ -32,7 +32,7 @@ except ModuleNotFoundError as exc:
         "Módulo interno leaphub_connector ausente na imagem. Atualize o Leap Hub Gateway."
     ) from exc
 
-VERSION = "1.11.91"
+VERSION = "1.11.92"
 SERVICE = "Leap Hub Leapmotor Connector"
 MAX_BODY = 1024 * 1024
 WINDOW_SECONDS = 180
@@ -94,6 +94,7 @@ MANUAL_PENDING: dict[str, int] = {}
 MANUAL_DEFER_UNTIL: dict[str, float] = {}
 MANUAL_PENDING_GUARD = threading.Lock()
 COMMAND_WORKERS: dict[str, threading.Thread] = {}
+COMMAND_RETRY_TIMERS: dict[str, threading.Timer] = {}
 COMMAND_WORKERS_GUARD = threading.Lock()
 OPTIONS_PATH = Path(os.getenv("LEAPHUB_OPTIONS_PATH", "/data/options.json"))
 
@@ -224,7 +225,7 @@ def command_journal_begin(environment: str, payload: dict[str, Any]) -> tuple[st
     now = time.time()
     request_hash = hashlib.sha256(f"{environment}|{request_id}".encode("utf-8")).hexdigest()
     payload_hash = command_payload_hash(payload)
-    active_states = {"queued", "preparing", "waking", "reconnecting", "executing", "running", "confirming"}
+    active_states = {"queued", "waiting_auth", "preparing", "waking", "reconnecting", "executing", "running", "confirming"}
 
     row = cached_command(request_hash)
     if row is None:
@@ -298,12 +299,12 @@ def command_journal_progress(
 ) -> None:
     if not request_hash:
         return
-    allowed = {"queued", "waiting_account", "waiting_slot", "preparing", "waking", "reconnecting", "executing", "confirming"}
+    allowed = {"queued", "waiting_auth", "waiting_account", "waiting_slot", "preparing", "waking", "reconnecting", "executing", "confirming"}
     status = status if status in allowed else "executing"
     response: dict[str, Any] = {
         "ok": True,
         "accepted": True,
-        "queued": status in {"queued", "waiting_account", "waiting_slot", "preparing"},
+        "queued": status in {"queued", "waiting_auth", "waiting_account", "waiting_slot", "preparing"},
         "confirmation_pending": True,
         "status": status,
         "request_id": request_id,
@@ -311,7 +312,7 @@ def command_journal_progress(
         "connector_version": connector.CONNECTOR_VERSION,
     }
     if isinstance(extra, dict):
-        for key in ("attempt", "confirmation_pending", "verified_by_gateway", "safe_retry", "queue_wait_seconds", "waiting_for", "session_recovery"):
+        for key in ("attempt", "confirmation_pending", "verified_by_gateway", "safe_retry", "queue_wait_seconds", "waiting_for", "session_recovery", "retry_after_seconds", "retry_at"):
             if key in extra:
                 response[key] = extra[key]
     raw = json.dumps(response, ensure_ascii=False, separators=(",", ":"), default=connector.json_default)
@@ -353,6 +354,40 @@ def command_journal_finish(request_hash: str | None, request_id: str, response: 
             db.commit()
     except (OSError, sqlite3.Error) as exc:
         LOG.warning("Não foi possível concluir o diário de comandos: %s", exc)
+
+
+def command_journal_wait_auth(request_hash: str | None, request_id: str, retry_after_seconds: int) -> None:
+    if not request_hash:
+        return
+    delay = max(30, min(1800, int(retry_after_seconds or 120)))
+    now = time.time()
+    retry_at = now + delay
+    response = {
+        "ok": True,
+        "accepted": True,
+        "queued": True,
+        "temporary": True,
+        "status": "waiting_auth",
+        "retry_after_seconds": delay,
+        "retry_at": retry_at,
+        "confirmation_pending": True,
+        "request_id": request_id,
+        "message": "A Leapmotor limitou temporariamente novas autenticações. O comando continuará na fila e será enviado automaticamente.",
+        "connector_version": connector.CONNECTOR_VERSION,
+    }
+    raw = json.dumps(response, ensure_ascii=False, separators=(",", ":"), default=connector.json_default)
+    existing = cached_command(request_hash) or {}
+    expires_at = max(now + 900, retry_at + 300)
+    cache_command(request_hash, str(existing.get("payload_hash") or ""), "waiting_auth", raw, float(existing.get("created_at") or now), now, expires_at)
+    try:
+        with command_db(0.5) as db:
+            db.execute(
+                "UPDATE command_requests SET status='waiting_auth',response_json=?,updated_at=?,expires_at=? WHERE request_hash=?",
+                (raw[:16000], now, expires_at, request_hash),
+            )
+            db.commit()
+    except (OSError, sqlite3.Error) as exc:
+        LOG.warning("Não foi possível persistir a espera de autenticação: %s", exc)
 
 
 def command_journal_fail(request_hash: str | None, request_id: str, exc: BaseException) -> None:
@@ -423,8 +458,10 @@ def command_journal_status(environment: str, payload: dict[str, Any]) -> dict[st
         except (ValueError, TypeError, json.JSONDecodeError):
             response = {}
     status = str(row.get("status") or "queued")
-    active_states = {"queued", "waiting_account", "waiting_slot", "preparing", "waking", "reconnecting", "executing", "running"}
-    if status in active_states and time.time() - float(row.get("updated_at") or 0) > 120:
+    active_states = {"queued", "waiting_auth", "waiting_account", "waiting_slot", "preparing", "waking", "reconnecting", "executing", "running"}
+    retry_at = float(response.get("retry_at") or 0)
+    waiting_auth_valid = status == "waiting_auth" and retry_at > time.time() - 180
+    if status in active_states and not waiting_auth_valid and time.time() - float(row.get("updated_at") or 0) > 120:
         stale_message = "O Gateway reiniciou ou perdeu o worker antes de concluir este comando. A ação não será repetida automaticamente."
         stale_response = {
             "ok": False,
@@ -454,10 +491,11 @@ def command_journal_status(environment: str, payload: dict[str, Any]) -> dict[st
     response["updated_at"] = float(row.get("updated_at") or 0)
     if status in active_states:
         response.setdefault("accepted", True)
-        response.setdefault("queued", status in {"queued", "waiting_account", "waiting_slot", "preparing"})
+        response.setdefault("queued", status in {"queued", "waiting_auth", "waiting_account", "waiting_slot", "preparing"})
         response.setdefault("confirmation_pending", True)
         messages = {
             "queued": "Comando recebido e protegido contra repetição.",
+            "waiting_auth": "A Leapmotor limitou temporariamente novas autenticações. O comando continuará na fila.",
             "waiting_account": "Aguardando a leitura atual da conta terminar. O comando está na fila prioritária.",
             "waiting_slot": "Conta liberada. Aguardando uma vaga no Connector.",
             "preparing": "Preparando uma conexão exclusiva para a ação.",
@@ -466,6 +504,8 @@ def command_journal_status(environment: str, payload: dict[str, Any]) -> dict[st
             "executing": "Enviando a ação ao veículo.",
             "running": "Executando o comando remoto.",
         }
+        if status == "waiting_auth" and retry_at > 0:
+            response["retry_after_seconds"] = max(0, int(retry_at - time.time()))
         response.setdefault("message", messages.get(status, "Acompanhando a execução do comando."))
     elif status in {"accepted", "sent", "confirming"}:
         response.setdefault("accepted", True)
@@ -481,6 +521,31 @@ def command_worker_key(environment: str, request_id: str) -> str:
     return hashlib.sha256(f"{environment}|{request_id}".encode("utf-8")).hexdigest()
 
 
+def schedule_command_retry(
+    environment: str,
+    payload: dict[str, Any],
+    request_hash: str,
+    request_id: str,
+    retry_after_seconds: int,
+) -> None:
+    delay = max(30, min(1800, int(retry_after_seconds or 120)))
+    worker_key = command_worker_key(environment, request_id)
+
+    def resume() -> None:
+        with COMMAND_WORKERS_GUARD:
+            COMMAND_RETRY_TIMERS.pop(worker_key, None)
+        start_command_job(environment, payload, request_hash, request_id)
+
+    timer = threading.Timer(float(delay) + 1.0, resume)
+    timer.daemon = True
+    with COMMAND_WORKERS_GUARD:
+        previous = COMMAND_RETRY_TIMERS.pop(worker_key, None)
+        if previous is not None:
+            previous.cancel()
+        COMMAND_RETRY_TIMERS[worker_key] = timer
+    timer.start()
+
+
 def run_command_job(
     environment: str,
     payload: dict[str, Any],
@@ -493,6 +558,7 @@ def run_command_job(
     account_lock: AccountOperationLock | None = None
     worker_key = command_worker_key(environment, request_id)
     defer_seconds = 4
+    retry_after_seconds = 0
     queue_started = time.monotonic()
     try:
         def progress(stage: str, message: str, extra: dict[str, Any] | None = None) -> None:
@@ -577,6 +643,15 @@ def run_command_job(
                 str(result.get("execution_warning") or "warning")[:80],
                 str(result.get("verification_state") or "unknown")[:80],
             )
+    except connector.ConnectorLoginCooldownError as exc:
+        retry_after_seconds = max(30, min(1800, int(exc.retry_after_seconds or 120)))
+        command_journal_wait_auth(request_hash, request_id, retry_after_seconds)
+        defer_seconds = 1
+        LOG.info(
+            "Comando %s aguardará %ss pelo desbloqueio temporário de autenticação; nenhuma nova tentativa será feita antes disso.",
+            request_id[:12],
+            retry_after_seconds,
+        )
     except BaseException as exc:  # noqa: BLE001
         command_journal_fail(request_hash, request_id, exc)
         defer_seconds = 3
@@ -593,6 +668,8 @@ def run_command_job(
         timer.start()
         with COMMAND_WORKERS_GUARD:
             COMMAND_WORKERS.pop(worker_key, None)
+        if retry_after_seconds > 0 and request_hash:
+            schedule_command_retry(environment, dict(payload), request_hash, request_id, retry_after_seconds)
 
 def start_command_job(
     environment: str, payload: dict[str, Any], request_hash: str | None, request_id: str
@@ -604,6 +681,9 @@ def start_command_job(
         existing = COMMAND_WORKERS.get(worker_key)
         if existing is not None and existing.is_alive():
             return True
+        pending_timer = COMMAND_RETRY_TIMERS.pop(worker_key, None)
+        if pending_timer is not None and threading.current_thread() is not pending_timer:
+            pending_timer.cancel()
         pending_key = manual_operation_enter(environment, payload)
         TELEMETRY.wake_event.set()
         worker = threading.Thread(
@@ -1019,6 +1099,16 @@ class Handler(BaseHTTPRequestHandler):
                 "temporary": True,
                 "retry_after_seconds": 2,
                 "message": "O Gateway está concluindo uma gravação local. A solicitação pode ser repetida sem duplicar ações.",
+                "connector_version": connector.CONNECTOR_VERSION,
+            })
+        except connector.ConnectorLoginCooldownError as exc:
+            LOG.info("Autenticação temporariamente limitada; nova tentativa permitida em %ss.", exc.retry_after_seconds)
+            self.send_json(503, {
+                "ok": False,
+                "temporary": True,
+                "waiting_auth": True,
+                "retry_after_seconds": int(exc.retry_after_seconds),
+                "message": connector.clean_message(str(exc)),
                 "connector_version": connector.CONNECTOR_VERSION,
             })
         except connector.ConnectorTemporaryError as exc:
