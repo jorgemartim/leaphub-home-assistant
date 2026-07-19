@@ -1,3 +1,11 @@
+## 1.11.96
+
+- Mantém filas independentes por conta Leapmotor; uma conta não bloqueia as demais.
+- Dá prioridade global aos comandos manuais sobre leituras automáticas de telemetria.
+- Preserva o limite total configurado para proteger CPU, memória e a nuvem Leapmotor.
+- Aceita configurações antigas de cooldown de 21600 segundos e limita o valor internamente.
+- Expõe apenas contadores agregados do limitador no diagnóstico, sem e-mail, VIN ou credenciais.
+
 ## 1.11.95
 
 - Reduz cooldown geral sem `Retry-After` de seis horas para quinze minutos, com limite máximo de uma hora.

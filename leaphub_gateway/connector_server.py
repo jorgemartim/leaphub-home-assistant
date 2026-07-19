@@ -32,7 +32,7 @@ except ModuleNotFoundError as exc:
         "Módulo interno leaphub_connector ausente na imagem. Atualize o Leap Hub Gateway."
     ) from exc
 
-VERSION = "1.11.95"
+VERSION = "1.11.96"
 SERVICE = "Leap Hub Leapmotor Connector"
 MAX_BODY = 1024 * 1024
 WINDOW_SECONDS = 180
@@ -47,6 +47,56 @@ COMMAND_DB_PATH = Path(os.getenv("LEAPHUB_COMMAND_DB_PATH", "/data/security/conn
 COMMAND_CACHE: dict[str, dict[str, Any]] = {}
 COMMAND_CACHE_LOCK = threading.RLock()
 COMMAND_CACHE_MAX = 2000
+class PriorityOperationLimiter:
+    """Limite global com prioridade para comandos manuais.
+
+    Cada conta continua com sua própria trava. Este limitador apenas protege os
+    recursos totais do add-on e impede a telemetria de ocupar todas as vagas
+    quando há comandos de usuários aguardando.
+    """
+
+    def __init__(self, capacity: int) -> None:
+        self.capacity = max(1, int(capacity))
+        self._active = 0
+        self._manual_waiters = 0
+        self._condition = threading.Condition()
+
+    def acquire(self, blocking: bool = True, timeout: float = -1, priority: bool = False) -> bool:
+        deadline = None if timeout is None or timeout < 0 else time.monotonic() + float(timeout)
+        with self._condition:
+            if priority:
+                self._manual_waiters += 1
+            try:
+                while self._active >= self.capacity or (not priority and self._manual_waiters > 0):
+                    if not blocking:
+                        return False
+                    remaining = None if deadline is None else deadline - time.monotonic()
+                    if remaining is not None and remaining <= 0:
+                        return False
+                    self._condition.wait(remaining)
+                self._active += 1
+                return True
+            finally:
+                if priority:
+                    self._manual_waiters = max(0, self._manual_waiters - 1)
+                    self._condition.notify_all()
+
+    def release(self) -> None:
+        with self._condition:
+            if self._active <= 0:
+                raise ValueError("Operation limiter released too many times")
+            self._active -= 1
+            self._condition.notify_all()
+
+    def snapshot(self) -> dict[str, int]:
+        with self._condition:
+            return {
+                "capacity": self.capacity,
+                "active": self._active,
+                "manual_waiters": self._manual_waiters,
+            }
+
+
 class AccountOperationLock:
     """Lock por conta com diagnóstico seguro do ocupante atual.
 
@@ -113,7 +163,7 @@ SECRETS = {
     "production": str(OPTIONS.get("production_secret") or "").strip(),
 }
 MAX_PARALLEL = max(1, min(8, int(OPTIONS.get("connector_max_parallel") or OPTIONS.get("max_parallel_requests") or 2)))
-SEMAPHORE = threading.BoundedSemaphore(MAX_PARALLEL)
+SEMAPHORE = PriorityOperationLimiter(MAX_PARALLEL)
 MANUAL_WAIT_SECONDS = max(2, min(60, int(OPTIONS.get("connector_manual_wait_seconds") or OPTIONS.get("manual_wait_seconds") or 35)))
 MANUAL_QUEUE_SECONDS = max(120, min(300, int(OPTIONS.get("connector_manual_queue_seconds") or 180)))
 LOG_LEVEL = str(OPTIONS.get("log_level") or "INFO").upper()
@@ -653,7 +703,7 @@ def run_command_job(
             "Conta liberada. Aguardando uma vaga no Connector.",
             {"queue_wait_seconds": int(time.monotonic() - queue_started), "waiting_for": "connector_slot"},
         )
-        acquired = SEMAPHORE.acquire(timeout=max(30, MANUAL_WAIT_SECONDS))
+        acquired = SEMAPHORE.acquire(timeout=max(30, MANUAL_WAIT_SECONDS), priority=True)
         if not acquired:
             raise connector.ConnectorTemporaryError(
                 "A conta foi liberada, mas o Connector permaneceu ocupado. O comando não foi enviado."
@@ -931,6 +981,7 @@ def detailed_health_payload(environment: str) -> dict[str, Any]:
         "version": VERSION,
         "connector_version": connector.CONNECTOR_VERSION,
         "library_version": library,
+        "operation_limiter": SEMAPHORE.snapshot(),
         "python_version": sys.version.split()[0],
         "environment": environment,
         "configured_environments": configured,
@@ -1088,7 +1139,7 @@ class Handler(BaseHTTPRequestHandler):
             account_acquired = False
             account_lock: AccountOperationLock | None = None
             try:
-                acquired = SEMAPHORE.acquire(timeout=MANUAL_WAIT_SECONDS)
+                acquired = SEMAPHORE.acquire(timeout=MANUAL_WAIT_SECONDS, priority=True)
                 if not acquired:
                     self.send_json(503, {"ok": False, "temporary": True, "retry_after_seconds": 3, "message": "Conector ocupado. A telemetria automática cedeu prioridade; tente novamente em instantes."})
                     return
