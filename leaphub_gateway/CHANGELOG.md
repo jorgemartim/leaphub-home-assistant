@@ -1,3 +1,9 @@
+## 1.11.84
+
+- Corrigida concorrência do SQLite durante a inicialização do Connector.
+- Painel passa a respeitar a janela de migração e usa conexão somente leitura.
+- Migração de journal agora é idempotente e tolera travas curtas.
+
 ## 1.11.83
 
 - Corrige `sqlite3.OperationalError: unable to open database file` na fila persistente.

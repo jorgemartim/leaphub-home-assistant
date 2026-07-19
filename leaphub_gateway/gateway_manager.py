@@ -19,7 +19,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-VERSION = "1.11.83"
+VERSION = "1.11.84"
 OPTIONS_PATH = Path(os.getenv("LEAPHUB_OPTIONS_PATH", "/data/options.json"))
 RUNTIME = Path(os.getenv("LEAPHUB_RUNTIME_DIR", "/data/runtime"))
 LOG_DIR = Path(os.getenv("LEAPHUB_LOG_DIR", "/data/logs"))
@@ -324,11 +324,26 @@ SERVICES: dict[str, ManagedService] = {
 
 def telemetry_summary() -> dict[str, Any]:
     db_path = Path("/data/telemetry/telemetry.sqlite")
+    migration_marker = db_path.parent / ".journal-migration.lock"
+    if migration_marker.exists():
+        try:
+            age = max(0.0, time.time() - migration_marker.stat().st_mtime)
+        except OSError:
+            age = 0.0
+        if age <= 180:
+            return {"subscriptions": 0, "pending_events": 0, "status": "initializing"}
+        try:
+            migration_marker.unlink(missing_ok=True)
+        except OSError:
+            pass
     if not db_path.is_file():
         return {"subscriptions": 0, "pending_events": 0, "status": "waiting"}
     try:
         import sqlite3
-        with sqlite3.connect(db_path, timeout=2) as db:
+        uri = f"file:{db_path.as_posix()}?mode=ro"
+        with sqlite3.connect(uri, uri=True, timeout=0.5) as db:
+            db.execute("PRAGMA query_only=ON")
+            db.execute("PRAGMA busy_timeout=500")
             subscriptions = int(db.execute("SELECT COUNT(*) FROM subscriptions WHERE enabled=1").fetchone()[0])
             pending = int(db.execute("SELECT COUNT(*) FROM events WHERE status='pending'").fetchone()[0])
             failed = int(db.execute("SELECT COUNT(*) FROM events WHERE status='failed'").fetchone()[0])
@@ -360,7 +375,10 @@ def telemetry_summary() -> dict[str, Any]:
             "status": "active" if subscriptions else "waiting",
         }
     except Exception as exc:
-        return {"subscriptions": 0, "pending_events": 0, "status": "degraded", "message": str(exc)[:160]}
+        message = str(exc)[:160]
+        if "locked" in message.lower() or "busy" in message.lower():
+            return {"subscriptions": 0, "pending_events": 0, "status": "initializing", "message": message}
+        return {"subscriptions": 0, "pending_events": 0, "status": "degraded", "message": message}
 
 def status_payload(include_logs: bool = True) -> dict[str, Any]:
     result: dict[str, Any] = {
@@ -407,7 +425,7 @@ main{max-width:1180px;margin:auto;padding:24px}.hero{display:flex;gap:18px;align
 details{margin-top:12px}summary{cursor:pointer;color:var(--muted)}pre{white-space:pre-wrap;word-break:break-word;background:#050c15;border:1px solid var(--line);border-radius:12px;padding:12px;max-height:260px;overflow:auto;color:#bcd0e8;font-size:12px}.wide{grid-column:1/-1}.routes{display:grid;grid-template-columns:1fr auto;gap:8px}.routes code{background:#050c15;border:1px solid var(--line);border-radius:10px;padding:9px;overflow:auto}.notice{border-left:3px solid var(--blue);padding:10px 12px;background:rgba(85,167,255,.08);border-radius:10px;color:#cfe4ff}.foot{color:var(--muted);text-align:center;padding:20px}
 @media(max-width:760px){main{padding:14px}.grid{grid-template-columns:1fr}.hero{align-items:flex-start}.badge{display:none}.meta{grid-template-columns:1fr 1fr}.routes{grid-template-columns:1fr}}
 </style></head><body><main>
-<div class="hero"><div class="mark">LH</div><div><h1>Leap Hub Gateway</h1><p class="sub">Telemetria resiliente, Connector, OCPP e Cloudflare em um único App</p></div><span class="badge">v1.11.83</span></div>
+<div class="hero"><div class="mark">LH</div><div><h1>Leap Hub Gateway</h1><p class="sub">Telemetria resiliente, Connector, OCPP e Cloudflare em um único App</p></div><span class="badge">v1.11.84</span></div>
 <div class="grid" id="cards"></div>
 <section class="card wide" style="margin-top:16px"><div class="head"><div><h2>Rotas do Cloudflare Tunnel</h2><p>Como o Tunnel roda dentro do mesmo App, use 127.0.0.1 nas origens.</p></div></div><div class="routes"><code>connector.leaphub.com.br → http://127.0.0.1:8094</code><span>Connector</span><code>ocpp-beta.leaphub.com.br → http://127.0.0.1:8092</code><span>OCPP Beta</span><code>ocpp.leaphub.com.br → http://127.0.0.1:8093</code><span>Produção</span></div><p class="notice">A fila de telemetria sobrevive a reinícios do App. Uma queda do Home Assistant inteiro ainda cria uma lacuna real, que nunca será preenchida com dados inventados.</p></section>
 <div class="foot">Tokens e chaves nunca são exibidos neste painel.</div></main><script>

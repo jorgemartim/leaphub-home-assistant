@@ -14,6 +14,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -23,7 +24,7 @@ from cryptography.fernet import Fernet, InvalidToken
 import leaphub_connector as connector
 
 LOG = logging.getLogger("leaphub.telemetry")
-ENGINE_VERSION = "1.11.83"
+ENGINE_VERSION = "1.11.84"
 
 
 def utc_iso() -> str:
@@ -89,6 +90,9 @@ class TelemetryEngine:
         self.data_dir = Path(os.getenv("LEAPHUB_TELEMETRY_DIR", "/data/telemetry"))
         self.db_path = self.data_dir / "telemetry.sqlite"
         self.key_path = self.data_dir / "telemetry.key"
+        self.migration_marker_path = self.data_dir / ".journal-migration.lock"
+        self.instance_lock_path = self.data_dir / ".engine.lock"
+        self._instance_lock_handle = None
         self.storage_lock = threading.RLock()
         self.storage_healthy = False
         self.storage_failures = 0
@@ -98,6 +102,7 @@ class TelemetryEngine:
         self.storage_next_log_at = 0.0
         self.storage_journal_mode = "unknown"
         self._prepare_storage(probe=True)
+        self._acquire_instance_lock()
         self.fernet = Fernet(self._load_key())
         self.stop_event = threading.Event()
         self.wake_event = threading.Event()
@@ -202,13 +207,55 @@ class TelemetryEngine:
             os.fsync(handle.fileno())
         return key
 
+    def _acquire_instance_lock(self) -> None:
+        """Impede dois Connector de abrirem a mesma fila ao mesmo tempo."""
+        try:
+            import fcntl
+        except ImportError:
+            return
+        handle = self.instance_lock_path.open("a+", encoding="utf-8")
+        deadline = time.monotonic() + 45.0
+        while True:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                handle.seek(0)
+                handle.truncate()
+                handle.write(f"pid={os.getpid()} started={utc_iso()}\n")
+                handle.flush()
+                self._instance_lock_handle = handle
+                return
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    handle.close()
+                    raise RuntimeError("Outra instância do Connector ainda utiliza a fila de telemetria.")
+                time.sleep(0.5)
+
+    @contextmanager
+    def _journal_migration_guard(self):
+        """Sinaliza ao painel que a fila está em migração e não deve ser consultada."""
+        self.migration_marker_path.write_text(
+            json.dumps({"pid": os.getpid(), "started_at": utc_iso()}),
+            encoding="utf-8",
+        )
+        try:
+            self.migration_marker_path.chmod(0o600)
+        except OSError:
+            pass
+        try:
+            yield
+        finally:
+            try:
+                self.migration_marker_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
     def _db(self) -> sqlite3.Connection:
         self._prepare_storage(probe=False)
         db: sqlite3.Connection | None = None
         try:
-            db = sqlite3.connect(self.db_path, timeout=15, isolation_level=None)
+            db = sqlite3.connect(self.db_path, timeout=30, isolation_level=None)
             db.row_factory = sqlite3.Row
-            db.execute("PRAGMA busy_timeout=15000")
+            db.execute("PRAGMA busy_timeout=30000")
             db.execute("PRAGMA foreign_keys=ON")
             # Evita depender de /tmp ou de arquivos temporários externos ao /data.
             db.execute("PRAGMA temp_store=MEMORY")
@@ -219,135 +266,164 @@ class TelemetryEngine:
             raise
 
     def _configure_journal(self, db: sqlite3.Connection) -> None:
-        """Usa journal tradicional: o acesso é serializado e não precisa de -wal/-shm."""
+        """Migra WAL com espera e não pede trava exclusiva quando já está em DELETE."""
         current_row = db.execute("PRAGMA journal_mode").fetchone()
         current = str(current_row[0] if current_row else "unknown").lower()
-        if current == "wal":
+
+        # PRAGMA journal_mode=DELETE exige trava exclusiva até quando o banco já
+        # está em DELETE. Evitar a escrita desnecessária elimina a disputa com o painel.
+        if current == "delete":
+            self.storage_journal_mode = current
+            db.execute("PRAGMA synchronous=FULL")
+            return
+
+        last_error: Exception | None = None
+        for attempt in range(12):
             try:
-                db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            except sqlite3.DatabaseError:
-                # A mudança de modo abaixo ainda pode concluir a recuperação.
-                pass
-        mode_row = db.execute("PRAGMA journal_mode=DELETE").fetchone()
-        mode = str(mode_row[0] if mode_row else current).lower()
-        self.storage_journal_mode = mode
-        if mode != "delete":
-            raise sqlite3.OperationalError(f"journal SQLite incompatível: {mode}")
-        db.execute("PRAGMA synchronous=FULL")
+                if current == "wal":
+                    try:
+                        db.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+                    except sqlite3.OperationalError as exc:
+                        if "locked" not in str(exc).lower() and "busy" not in str(exc).lower():
+                            raise
+                mode_row = db.execute("PRAGMA journal_mode=DELETE").fetchone()
+                mode = str(mode_row[0] if mode_row else current).lower()
+                self.storage_journal_mode = mode
+                if mode != "delete":
+                    raise sqlite3.OperationalError(f"journal SQLite incompatível: {mode}")
+                db.execute("PRAGMA synchronous=FULL")
+                return
+            except sqlite3.OperationalError as exc:
+                last_error = exc
+                message = str(exc).lower()
+                if "locked" not in message and "busy" not in message:
+                    raise
+                # Dá tempo para uma leitura curta terminar. O painel respeita o
+                # marcador e deixa de abrir novas conexões durante esta janela.
+                time.sleep(min(3.0, 0.25 * (attempt + 1)))
+                current_row = db.execute("PRAGMA journal_mode").fetchone()
+                current = str(current_row[0] if current_row else current).lower()
+                if current == "delete":
+                    self.storage_journal_mode = current
+                    db.execute("PRAGMA synchronous=FULL")
+                    return
+        raise sqlite3.OperationalError(
+            "Não foi possível obter acesso exclusivo para migrar a fila SQLite."
+        ) from last_error
 
     def _init_db(self) -> None:
         self._prepare_storage(probe=True)
-        with self._db() as db:
-            self._configure_journal(db)
-            db.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS subscriptions (
-                    subscription_id TEXT PRIMARY KEY,
-                    environment TEXT NOT NULL,
-                    account_id INTEGER NOT NULL,
-                    credentials_encrypted BLOB NOT NULL,
-                    vehicle_ids_json TEXT NOT NULL,
-                    enabled INTEGER NOT NULL DEFAULT 1,
-                    status TEXT NOT NULL DEFAULT 'waiting',
-                    next_run_at REAL NOT NULL,
-                    last_run_at TEXT NULL,
-                    last_success_at TEXT NULL,
-                    last_delivery_at TEXT NULL,
-                    last_error TEXT NULL,
-                    last_state TEXT NULL,
-                    parked_streak INTEGER NOT NULL DEFAULT 0,
-                    consecutive_failures INTEGER NOT NULL DEFAULT 0,
-                    cooldown_until REAL NOT NULL DEFAULT 0,
-                    active_until REAL NOT NULL DEFAULT 0,
-                    interactive_until REAL NOT NULL DEFAULT 0,
-                    command_until REAL NOT NULL DEFAULT 0,
-                    command_key TEXT NULL,
-                    command_vehicle_id TEXT NULL,
-                    command_context_json TEXT NULL,
-                    command_poll_count INTEGER NOT NULL DEFAULT 0,
-                    command_started_at REAL NOT NULL DEFAULT 0,
-                    last_presence_at TEXT NULL,
-                    auth_required INTEGER NOT NULL DEFAULT 0,
-                    credential_hash TEXT NULL,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                );
-                CREATE INDEX IF NOT EXISTS idx_subscriptions_due ON subscriptions(enabled, next_run_at);
-                CREATE TABLE IF NOT EXISTS events (
-                    event_id TEXT PRIMARY KEY,
-                    subscription_id TEXT NOT NULL,
-                    environment TEXT NOT NULL,
-                    account_id INTEGER NOT NULL,
-                    remote_id TEXT NOT NULL,
-                    source_at TEXT NOT NULL,
-                    payload_encrypted BLOB NOT NULL,
-                    payload_hash TEXT NOT NULL,
-                    status TEXT NOT NULL DEFAULT 'pending',
-                    attempts INTEGER NOT NULL DEFAULT 0,
-                    next_attempt_at REAL NOT NULL,
-                    last_error TEXT NULL,
-                    created_at TEXT NOT NULL,
-                    delivered_at TEXT NULL,
-                    FOREIGN KEY(subscription_id) REFERENCES subscriptions(subscription_id) ON DELETE CASCADE
-                );
-                CREATE INDEX IF NOT EXISTS idx_events_delivery ON events(status, next_attempt_at, created_at);
-                CREATE INDEX IF NOT EXISTS idx_events_subscription ON events(subscription_id, created_at);
-                """
-            )
-            columns = {str(row[1]) for row in db.execute("PRAGMA table_info(subscriptions)").fetchall()}
-            if "cooldown_until" not in columns:
-                db.execute("ALTER TABLE subscriptions ADD COLUMN cooldown_until REAL NOT NULL DEFAULT 0")
-            if "active_until" not in columns:
-                db.execute("ALTER TABLE subscriptions ADD COLUMN active_until REAL NOT NULL DEFAULT 0")
-            if "interactive_until" not in columns:
-                db.execute("ALTER TABLE subscriptions ADD COLUMN interactive_until REAL NOT NULL DEFAULT 0")
-            if "command_until" not in columns:
-                db.execute("ALTER TABLE subscriptions ADD COLUMN command_until REAL NOT NULL DEFAULT 0")
-            if "command_key" not in columns:
-                db.execute("ALTER TABLE subscriptions ADD COLUMN command_key TEXT NULL")
-            if "command_vehicle_id" not in columns:
-                db.execute("ALTER TABLE subscriptions ADD COLUMN command_vehicle_id TEXT NULL")
-            if "command_context_json" not in columns:
-                db.execute("ALTER TABLE subscriptions ADD COLUMN command_context_json TEXT NULL")
-            if "command_poll_count" not in columns:
-                db.execute("ALTER TABLE subscriptions ADD COLUMN command_poll_count INTEGER NOT NULL DEFAULT 0")
-            if "command_started_at" not in columns:
-                db.execute("ALTER TABLE subscriptions ADD COLUMN command_started_at REAL NOT NULL DEFAULT 0")
-            if "last_presence_at" not in columns:
-                db.execute("ALTER TABLE subscriptions ADD COLUMN last_presence_at TEXT NULL")
-            if "auth_required" not in columns:
-                db.execute("ALTER TABLE subscriptions ADD COLUMN auth_required INTEGER NOT NULL DEFAULT 0")
-            if "credential_hash" not in columns:
-                db.execute("ALTER TABLE subscriptions ADD COLUMN credential_hash TEXT NULL")
-            event_columns = {str(row[1]) for row in db.execute("PRAGMA table_info(events)").fetchall()}
-            if "sequence" not in event_columns:
-                db.execute("ALTER TABLE events ADD COLUMN sequence INTEGER NOT NULL DEFAULT 0")
-            if "semantic_hash" not in event_columns:
-                db.execute("ALTER TABLE events ADD COLUMN semantic_hash TEXT NULL")
-            if "state_changed" not in event_columns:
-                db.execute("ALTER TABLE events ADD COLUMN state_changed INTEGER NOT NULL DEFAULT 1")
-            if "event_kind" not in event_columns:
-                db.execute("ALTER TABLE events ADD COLUMN event_kind TEXT NOT NULL DEFAULT 'change'")
-            db.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS vehicle_state_cache (
-                    subscription_id TEXT NOT NULL,
-                    remote_id TEXT NOT NULL,
-                    semantic_hash TEXT NOT NULL,
-                    visual_fingerprint TEXT NULL,
-                    last_source_at TEXT NULL,
-                    last_queued_at REAL NOT NULL DEFAULT 0,
-                    sequence INTEGER NOT NULL DEFAULT 0,
-                    skipped_unchanged INTEGER NOT NULL DEFAULT 0,
-                    updated_at TEXT NOT NULL,
-                    PRIMARY KEY(subscription_id, remote_id),
-                    FOREIGN KEY(subscription_id) REFERENCES subscriptions(subscription_id) ON DELETE CASCADE
-                );
-                CREATE INDEX IF NOT EXISTS idx_vehicle_state_updated ON vehicle_state_cache(updated_at);
-                CREATE INDEX IF NOT EXISTS idx_events_vehicle_order ON events(subscription_id, remote_id, status, sequence);
-                """
-            )
-
+        with self._journal_migration_guard():
+            with self._db() as db:
+                self._configure_journal(db)
+                db.executescript(
+                    """
+                    CREATE TABLE IF NOT EXISTS subscriptions (
+                        subscription_id TEXT PRIMARY KEY,
+                        environment TEXT NOT NULL,
+                        account_id INTEGER NOT NULL,
+                        credentials_encrypted BLOB NOT NULL,
+                        vehicle_ids_json TEXT NOT NULL,
+                        enabled INTEGER NOT NULL DEFAULT 1,
+                        status TEXT NOT NULL DEFAULT 'waiting',
+                        next_run_at REAL NOT NULL,
+                        last_run_at TEXT NULL,
+                        last_success_at TEXT NULL,
+                        last_delivery_at TEXT NULL,
+                        last_error TEXT NULL,
+                        last_state TEXT NULL,
+                        parked_streak INTEGER NOT NULL DEFAULT 0,
+                        consecutive_failures INTEGER NOT NULL DEFAULT 0,
+                        cooldown_until REAL NOT NULL DEFAULT 0,
+                        active_until REAL NOT NULL DEFAULT 0,
+                        interactive_until REAL NOT NULL DEFAULT 0,
+                        command_until REAL NOT NULL DEFAULT 0,
+                        command_key TEXT NULL,
+                        command_vehicle_id TEXT NULL,
+                        command_context_json TEXT NULL,
+                        command_poll_count INTEGER NOT NULL DEFAULT 0,
+                        command_started_at REAL NOT NULL DEFAULT 0,
+                        last_presence_at TEXT NULL,
+                        auth_required INTEGER NOT NULL DEFAULT 0,
+                        credential_hash TEXT NULL,
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_subscriptions_due ON subscriptions(enabled, next_run_at);
+                    CREATE TABLE IF NOT EXISTS events (
+                        event_id TEXT PRIMARY KEY,
+                        subscription_id TEXT NOT NULL,
+                        environment TEXT NOT NULL,
+                        account_id INTEGER NOT NULL,
+                        remote_id TEXT NOT NULL,
+                        source_at TEXT NOT NULL,
+                        payload_encrypted BLOB NOT NULL,
+                        payload_hash TEXT NOT NULL,
+                        status TEXT NOT NULL DEFAULT 'pending',
+                        attempts INTEGER NOT NULL DEFAULT 0,
+                        next_attempt_at REAL NOT NULL,
+                        last_error TEXT NULL,
+                        created_at TEXT NOT NULL,
+                        delivered_at TEXT NULL,
+                        FOREIGN KEY(subscription_id) REFERENCES subscriptions(subscription_id) ON DELETE CASCADE
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_events_delivery ON events(status, next_attempt_at, created_at);
+                    CREATE INDEX IF NOT EXISTS idx_events_subscription ON events(subscription_id, created_at);
+                    """
+                )
+                columns = {str(row[1]) for row in db.execute("PRAGMA table_info(subscriptions)").fetchall()}
+                if "cooldown_until" not in columns:
+                    db.execute("ALTER TABLE subscriptions ADD COLUMN cooldown_until REAL NOT NULL DEFAULT 0")
+                if "active_until" not in columns:
+                    db.execute("ALTER TABLE subscriptions ADD COLUMN active_until REAL NOT NULL DEFAULT 0")
+                if "interactive_until" not in columns:
+                    db.execute("ALTER TABLE subscriptions ADD COLUMN interactive_until REAL NOT NULL DEFAULT 0")
+                if "command_until" not in columns:
+                    db.execute("ALTER TABLE subscriptions ADD COLUMN command_until REAL NOT NULL DEFAULT 0")
+                if "command_key" not in columns:
+                    db.execute("ALTER TABLE subscriptions ADD COLUMN command_key TEXT NULL")
+                if "command_vehicle_id" not in columns:
+                    db.execute("ALTER TABLE subscriptions ADD COLUMN command_vehicle_id TEXT NULL")
+                if "command_context_json" not in columns:
+                    db.execute("ALTER TABLE subscriptions ADD COLUMN command_context_json TEXT NULL")
+                if "command_poll_count" not in columns:
+                    db.execute("ALTER TABLE subscriptions ADD COLUMN command_poll_count INTEGER NOT NULL DEFAULT 0")
+                if "command_started_at" not in columns:
+                    db.execute("ALTER TABLE subscriptions ADD COLUMN command_started_at REAL NOT NULL DEFAULT 0")
+                if "last_presence_at" not in columns:
+                    db.execute("ALTER TABLE subscriptions ADD COLUMN last_presence_at TEXT NULL")
+                if "auth_required" not in columns:
+                    db.execute("ALTER TABLE subscriptions ADD COLUMN auth_required INTEGER NOT NULL DEFAULT 0")
+                if "credential_hash" not in columns:
+                    db.execute("ALTER TABLE subscriptions ADD COLUMN credential_hash TEXT NULL")
+                event_columns = {str(row[1]) for row in db.execute("PRAGMA table_info(events)").fetchall()}
+                if "sequence" not in event_columns:
+                    db.execute("ALTER TABLE events ADD COLUMN sequence INTEGER NOT NULL DEFAULT 0")
+                if "semantic_hash" not in event_columns:
+                    db.execute("ALTER TABLE events ADD COLUMN semantic_hash TEXT NULL")
+                if "state_changed" not in event_columns:
+                    db.execute("ALTER TABLE events ADD COLUMN state_changed INTEGER NOT NULL DEFAULT 1")
+                if "event_kind" not in event_columns:
+                    db.execute("ALTER TABLE events ADD COLUMN event_kind TEXT NOT NULL DEFAULT 'change'")
+                db.executescript(
+                    """
+                    CREATE TABLE IF NOT EXISTS vehicle_state_cache (
+                        subscription_id TEXT NOT NULL,
+                        remote_id TEXT NOT NULL,
+                        semantic_hash TEXT NOT NULL,
+                        visual_fingerprint TEXT NULL,
+                        last_source_at TEXT NULL,
+                        last_queued_at REAL NOT NULL DEFAULT 0,
+                        sequence INTEGER NOT NULL DEFAULT 0,
+                        skipped_unchanged INTEGER NOT NULL DEFAULT 0,
+                        updated_at TEXT NOT NULL,
+                        PRIMARY KEY(subscription_id, remote_id),
+                        FOREIGN KEY(subscription_id) REFERENCES subscriptions(subscription_id) ON DELETE CASCADE
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_vehicle_state_updated ON vehicle_state_cache(updated_at);
+                    CREATE INDEX IF NOT EXISTS idx_events_vehicle_order ON events(subscription_id, remote_id, status, sequence);
+                    """
+                )
     def invalidate_account_session(self, environment: str, payload: dict[str, Any]) -> int:
         """Feche a sessão automática antes de uma operação manual da conta.
 
