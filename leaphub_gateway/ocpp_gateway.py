@@ -19,6 +19,7 @@ import os
 import re
 import secrets
 import signal
+import sqlite3
 import struct
 import sys
 import time
@@ -30,7 +31,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-GATEWAY_VERSION = "1.12.01"
+GATEWAY_VERSION = "1.12.02"
 IS_RAILWAY = bool(os.getenv("RAILWAY_ENVIRONMENT_NAME") or os.getenv("RAILWAY_SERVICE_ID"))
 RUNTIME_DIR = Path(os.getenv("LEAPHUB_RUNTIME_DIR", "/tmp/leaphub-ocpp" if IS_RAILWAY else "."))
 BIND = os.getenv("LEAPHUB_OCPP_BIND", "0.0.0.0")
@@ -74,37 +75,134 @@ logging.basicConfig(
 LOG = logging.getLogger("leaphub.ocpp")
 
 
-def load_secret() -> str:
-    secret = os.getenv("LEAPHUB_GATEWAY_SECRET", "").strip()
-    if not secret:
-        try:
-            secret = SECRET_FILE.read_text(encoding="utf-8").strip()
-        except OSError as exc:
-            raise RuntimeError(
-                "Gateway secret not available. Set LEAPHUB_GATEWAY_SECRET or provide the secret file."
-            ) from exc
-    if len(secret) < 32:
-        raise RuntimeError("Gateway secret is invalid.")
+def configured_secret(name: str) -> str:
+    specific = os.getenv(f"LEAPHUB_{name.upper()}_GATEWAY_SECRET", "").strip()
+    legacy = os.getenv("LEAPHUB_GATEWAY_SECRET", "").strip()
+    secret = specific or legacy
+    if secret and len(secret) < 32:
+        raise RuntimeError(f"Gateway secret for {name} is invalid.")
     return secret
-
-
-GATEWAY_SECRET = load_secret()
 
 
 @dataclass(frozen=True)
 class ApiTarget:
     name: str
     url: str
+    secret: str
 
 
 def configured_targets() -> list[ApiTarget]:
     targets: list[ApiTarget] = []
-    for name, url in (("production", PRODUCTION_INTERNAL_URL), ("staging", BETA_INTERNAL_URL)):
-        if url and all(existing.url != url for existing in targets): targets.append(ApiTarget(name, url))
+    # Staging comes first only for a brand-new Charge ID. A cached route or a
+    # production route override always takes precedence after promotion.
+    definitions = (
+        ("staging", BETA_INTERNAL_URL, configured_secret("beta")),
+        ("production", PRODUCTION_INTERNAL_URL, configured_secret("production")),
+    )
+    for name, url, secret in definitions:
+        if url and secret and all(existing.url != url for existing in targets):
+            targets.append(ApiTarget(name, url, secret))
     return targets
 
 
 API_TARGETS = configured_targets()
+TARGETS_BY_NAME = {target.name: target for target in API_TARGETS}
+STATE_DB = Path(os.getenv("LEAPHUB_OCPP_STATE_DB", str(RUNTIME_DIR / "ocpp-state.sqlite")))
+ROUTE_CACHE_SECONDS = max(3600, int(os.getenv("LEAPHUB_OCPP_ROUTE_CACHE_SECONDS", str(14 * 86400))))
+RESILIENT_ACTIONS = {
+    "BootNotification",
+    "Heartbeat",
+    "StatusNotification",
+    "MeterValues",
+    "FirmwareStatusNotification",
+    "DiagnosticsStatusNotification",
+}
+
+
+def state_db() -> sqlite3.Connection:
+    STATE_DB.parent.mkdir(parents=True, exist_ok=True)
+    db = sqlite3.connect(STATE_DB, timeout=3.0)
+    db.execute("PRAGMA journal_mode=WAL")
+    db.execute("PRAGMA busy_timeout=3000")
+    db.execute("""CREATE TABLE IF NOT EXISTS routes (
+        identity TEXT PRIMARY KEY,
+        target_name TEXT NOT NULL,
+        updated_at REAL NOT NULL
+    )""")
+    db.execute("""CREATE TABLE IF NOT EXISTS event_queue (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        target_name TEXT NOT NULL,
+        identity TEXT NOT NULL,
+        message_id TEXT NOT NULL,
+        ocpp_action TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        available_at REAL NOT NULL,
+        created_at REAL NOT NULL,
+        last_error TEXT NULL,
+        UNIQUE(target_name, identity, message_id, ocpp_action)
+    )""")
+    db.commit()
+    return db
+
+
+def cached_target(identity: str) -> ApiTarget | None:
+    try:
+        with state_db() as db:
+            row = db.execute("SELECT target_name, updated_at FROM routes WHERE identity=?", (identity,)).fetchone()
+        if not row or time.time() - float(row[1]) > ROUTE_CACHE_SECONDS:
+            return None
+        return TARGETS_BY_NAME.get(str(row[0]))
+    except sqlite3.Error as exc:
+        LOG.warning("OCPP route cache unavailable: %s", exc)
+        return None
+
+
+def remember_route(identity: str, target_name: str) -> None:
+    if target_name not in TARGETS_BY_NAME:
+        return
+    try:
+        with state_db() as db:
+            db.execute(
+                "INSERT INTO routes(identity,target_name,updated_at) VALUES(?,?,?) "
+                "ON CONFLICT(identity) DO UPDATE SET target_name=excluded.target_name, updated_at=excluded.updated_at",
+                (identity, target_name, time.time()),
+            )
+            db.commit()
+    except sqlite3.Error as exc:
+        LOG.warning("Could not persist OCPP route for %s: %s", identity, exc)
+
+
+def queue_event(target: ApiTarget, identity: str, message_id: str, action: str, payload: dict[str, Any], error: str) -> None:
+    try:
+        with state_db() as db:
+            db.execute(
+                "INSERT OR IGNORE INTO event_queue(target_name,identity,message_id,ocpp_action,payload_json,attempts,available_at,created_at,last_error) "
+                "VALUES(?,?,?,?,?,0,?,?,?)",
+                (target.name, identity, message_id, action, json.dumps(payload, ensure_ascii=False, separators=(",", ":")), time.time(), time.time(), error[:300]),
+            )
+            db.commit()
+    except sqlite3.Error as exc:
+        LOG.error("Could not queue OCPP event %s for %s: %s", action, identity, exc)
+
+
+def queue_counts() -> tuple[int, int]:
+    try:
+        with state_db() as db:
+            pending = int(db.execute("SELECT COUNT(*) FROM event_queue").fetchone()[0])
+            routes = int(db.execute("SELECT COUNT(*) FROM routes").fetchone()[0])
+        return pending, routes
+    except sqlite3.Error:
+        return 0, 0
+
+
+def local_response(action: str, authorization: dict[str, Any] | None = None) -> dict[str, Any]:
+    if action == "BootNotification":
+        interval = int((authorization or {}).get("heartbeat_interval", 60) or 60)
+        return {"status": "Accepted", "currentTime": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "interval": max(30, min(3600, interval))}
+    if action == "Heartbeat":
+        return {"currentTime": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+    return {}
 
 
 def safe_http_error_detail(code: int, raw: bytes) -> str:
@@ -122,7 +220,7 @@ def safe_http_error_detail(code: int, raw: bytes) -> str:
 def api_call(target: ApiTarget, payload: dict[str, Any], timeout: float = 8.0) -> dict[str, Any]:
     body=json.dumps(payload,ensure_ascii=False,separators=(",",":")).encode("utf-8"); timestamp=str(int(time.time())); nonce=secrets.token_hex(16)
     path=urllib.parse.urlsplit(target.url).path or "/api/internal/ocpp"; canonical=f"POST\n{path}\n{timestamp}\n{nonce}\n{hashlib.sha256(body).hexdigest()}".encode("utf-8")
-    signature=hmac.new(GATEWAY_SECRET.encode("utf-8"),canonical,hashlib.sha256).hexdigest()
+    signature=hmac.new(target.secret.encode("utf-8"),canonical,hashlib.sha256).hexdigest()
     request=urllib.request.Request(target.url,data=body,method="POST",headers={"Content-Type":"application/json","Accept":"application/json","X-LeapHub-Timestamp":timestamp,"X-LeapHub-Nonce":nonce,"X-LeapHub-Signature":signature,"User-Agent":f"LeapHub-OCPP-Gateway/{GATEWAY_VERSION}"})
     try:
         with urllib.request.urlopen(request,timeout=timeout) as response: raw=response.read(1024*1024)
@@ -139,12 +237,25 @@ def api_call(target: ApiTarget, payload: dict[str, Any], timeout: float = 8.0) -
 
 
 def resolve_route(identity: str, password: str, remote_ip: str) -> tuple[ApiTarget, dict[str, Any]]:
-    unavailable=[]
-    for target in API_TARGETS:
-        try: result=api_call(target,{"action":"authorize_connection","identity":identity,"password":password,"remote_ip":remote_ip},5.0)
-        except RuntimeError as exc: unavailable.append(str(exc)); continue
-        if result.get("accepted"): return target,result
-    if len(unavailable)==len(API_TARGETS) and unavailable: raise RuntimeError("; ".join(unavailable[:2]))
+    unavailable: list[str] = []
+    ordered: list[ApiTarget] = []
+    cached = cached_target(identity)
+    if cached is not None:
+        ordered.append(cached)
+    ordered.extend(target for target in API_TARGETS if target not in ordered)
+    rejected = 0
+    for target in ordered:
+        try:
+            result = api_call(target, {"action": "authorize_connection", "identity": identity, "password": password, "remote_ip": remote_ip}, 4.0)
+        except RuntimeError as exc:
+            unavailable.append(str(exc))
+            continue
+        if result.get("accepted"):
+            remember_route(identity, target.name)
+            return target, result
+        rejected += 1
+    if unavailable and rejected == 0:
+        raise RuntimeError("; ".join(unavailable[:2]))
     raise PermissionError("Charge point is not approved")
 
 
@@ -253,6 +364,8 @@ def detailed_health_payload() -> dict[str, Any]:
         "max_connections": MAX_CONNECTIONS,
         "started_at": STARTED_AT,
         "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "queued_events": queue_counts()[0],
+        "cached_routes": queue_counts()[1],
     }
 
 
@@ -325,6 +438,7 @@ async def write_frame(writer: asyncio.StreamWriter, opcode: int, payload: bytes 
 class ChargePointConnection:
     identity: str
     target: ApiTarget
+    authorization: dict[str, Any]
     reader: asyncio.StreamReader
     writer: asyncio.StreamWriter
     remote_ip: str
@@ -366,35 +480,30 @@ class ChargePointConnection:
                 future.set_result(message)
 
     async def handle_call(self, message_id: str, action: str, payload: dict[str, Any]) -> None:
+        request_payload = {
+            "action": "ocpp_call",
+            "identity": self.identity,
+            "message_id": message_id,
+            "ocpp_action": action,
+            "payload": payload,
+        }
         try:
-            result = await asyncio.to_thread(
-                api_call,
-                self.target,
-                {
-                    "action": "ocpp_call",
-                    "identity": self.identity,
-                    "message_id": message_id,
-                    "ocpp_action": action,
-                    "payload": payload,
-                },
-            )
-            if isinstance(result.get("call_error"), dict):
-                error = result["call_error"]
-                await self.send_json(
-                    [
-                        4,
-                        message_id,
-                        str(error.get("code", "InternalError")),
-                        str(error.get("description", "Request failed.")),
-                        error.get("details") if isinstance(error.get("details"), dict) else {},
-                    ]
-                )
-            else:
-                response_payload = result.get("response_payload")
-                await self.send_json([3, message_id, response_payload if isinstance(response_payload, dict) else {}])
+            result = await asyncio.to_thread(api_call, self.target, request_payload, 5.0)
         except Exception as exc:  # noqa: BLE001
-            LOG.exception("Failed to process %s from %s", action, self.identity)
+            if action in RESILIENT_ACTIONS:
+                queue_event(self.target, self.identity, message_id, action, payload, str(exc))
+                await self.send_json([3, message_id, local_response(action, self.authorization)])
+                LOG.warning("Queued %s from %s after API failure: %s", action, self.identity, exc)
+                return
+            LOG.warning("Synchronous OCPP action %s from %s failed: %s", action, self.identity, exc)
             await self.send_json([4, message_id, "InternalError", "Request could not be processed.", {}])
+            return
+        if isinstance(result.get("call_error"), dict):
+            error = result["call_error"]
+            await self.send_json([4, message_id, str(error.get("code", "InternalError")), str(error.get("description", "Request failed.")), error.get("details") if isinstance(error.get("details"), dict) else {}])
+        else:
+            response_payload = result.get("response_payload")
+            await self.send_json([3, message_id, response_payload if isinstance(response_payload, dict) else {}])
 
     async def command_loop(self) -> None:
         delay = COMMAND_POLL_SECONDS
@@ -711,7 +820,7 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
         if previous and not previous.closed:
             previous.closed = True
             previous.writer.close()
-        connection = ChargePointConnection(identity, route_target, reader, writer, remote_ip)
+        connection = ChargePointConnection(identity, route_target, authorization, reader, writer, remote_ip)
         CONNECTIONS[identity] = connection
         ACTIVE_BY_IP[remote_ip] = ACTIVE_BY_IP.get(remote_ip, 0) + 1
         LOG.info("Charge point connected: %s route=%s", identity, route_target.name)
@@ -745,27 +854,115 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
             LOG.info("Charge point disconnected: %s", identity)
 
 
-async def status_loop() -> None:
-    next_attempt={target.name:0.0 for target in API_TARGETS}; failures={target.name:0 for target in API_TARGETS}; last_errors={}; last_logged={}
+def replay_queue_once(limit: int = 25) -> int:
+    now = time.time()
+    try:
+        with state_db() as db:
+            rows = db.execute(
+                "SELECT id,target_name,identity,message_id,ocpp_action,payload_json,attempts FROM event_queue WHERE available_at<=? ORDER BY id LIMIT ?",
+                (now, limit),
+            ).fetchall()
+    except sqlite3.Error as exc:
+        LOG.warning("OCPP queue read failed: %s", exc)
+        return 0
+    delivered = 0
+    for row in rows:
+        event_id, target_name, identity, message_id, action, payload_json, attempts = row
+        target = TARGETS_BY_NAME.get(str(target_name))
+        if target is None:
+            continue
+        try:
+            payload = json.loads(str(payload_json))
+            api_call(target, {"action": "ocpp_call", "identity": identity, "message_id": message_id, "ocpp_action": action, "payload": payload, "gateway_replay": True}, 6.0)
+            with state_db() as db:
+                db.execute("DELETE FROM event_queue WHERE id=?", (event_id,)); db.commit()
+            delivered += 1
+        except Exception as exc:  # noqa: BLE001
+            attempt_count = int(attempts) + 1
+            delay = min(900.0, 5.0 * (2 ** min(attempt_count, 7)))
+            with state_db() as db:
+                db.execute("UPDATE event_queue SET attempts=?,available_at=?,last_error=? WHERE id=?", (attempt_count, time.time()+delay, str(exc)[:300], event_id)); db.commit()
+    return delivered
+
+
+async def queue_loop() -> None:
     while not STOP_EVENT.is_set():
-        status={"pid":os.getpid(),"connections":len(CONNECTIONS),"connections_by_route":{target.name:sum(1 for connection in CONNECTIONS.values() if connection.target.name==target.name) for target in API_TARGETS},"active_ips":len(ACTIVE_BY_IP),"blocked_ips":len(AUTH_BLOCKED_UNTIL),"auth_failure_ips":len(AUTH_FAILURES),"max_connections":MAX_CONNECTIONS,"port":PORT,"started_at":STARTED_AT,"gateway_mode":GATEWAY_MODE,"provider":GATEWAY_PROVIDER,"service_name":SERVICE_NAME,"deployment_id":DEPLOYMENT_ID,"railway_environment":RAILWAY_ENVIRONMENT,"public_domain":PUBLIC_DOMAIN,"version":GATEWAY_VERSION,"unified_endpoint":True,"updated_at":time.strftime("%Y-%m-%dT%H:%M:%SZ",time.gmtime())}
-        temporary=STATUS_FILE.with_suffix(STATUS_FILE.suffix+".tmp"); temporary.write_text(json.dumps(status,ensure_ascii=False),encoding="utf-8"); temporary.replace(STATUS_FILE)
-        now=time.monotonic()
+        try:
+            delivered = await asyncio.to_thread(replay_queue_once, 25)
+            wait = 2.0 if delivered else 10.0
+        except Exception as exc:  # noqa: BLE001
+            LOG.warning("OCPP queue loop failed: %s", exc)
+            wait = 30.0
+        try:
+            await asyncio.wait_for(STOP_EVENT.wait(), timeout=wait)
+        except asyncio.TimeoutError:
+            pass
+
+
+def apply_route_overrides(source: ApiTarget, result: dict[str, Any]) -> None:
+    if source.name != "production":
+        return
+    overrides = result.get("route_overrides")
+    if not isinstance(overrides, list):
+        return
+    for raw in overrides[:2000]:
+        identity = str(raw).strip()
+        if not identity:
+            continue
+        remember_route(identity, "production")
+        active = CONNECTIONS.get(identity)
+        if active is not None and active.target.name != "production" and not active.closed:
+            LOG.info("Promoted OCPP route detected for %s; reconnecting on production", identity)
+            active.closed = True
+            active.writer.close()
+
+
+async def status_loop() -> None:
+    next_attempt = {target.name: 0.0 for target in API_TARGETS}
+    failures = {target.name: 0 for target in API_TARGETS}
+    last_errors: dict[str, str] = {}
+    last_logged: dict[str, float] = {}
+    while not STOP_EVENT.is_set():
+        pending_events, cached_routes = queue_counts()
+        status = {
+            "pid": os.getpid(), "connections": len(CONNECTIONS),
+            "connections_by_route": {target.name: sum(1 for connection in CONNECTIONS.values() if connection.target.name == target.name) for target in API_TARGETS},
+            "active_ips": len(ACTIVE_BY_IP), "blocked_ips": len(AUTH_BLOCKED_UNTIL), "auth_failure_ips": len(AUTH_FAILURES),
+            "max_connections": MAX_CONNECTIONS, "port": PORT, "started_at": STARTED_AT, "gateway_mode": GATEWAY_MODE,
+            "provider": GATEWAY_PROVIDER, "service_name": SERVICE_NAME, "deployment_id": DEPLOYMENT_ID,
+            "railway_environment": RAILWAY_ENVIRONMENT, "public_domain": PUBLIC_DOMAIN, "version": GATEWAY_VERSION,
+            "unified_endpoint": True, "queued_events": pending_events, "cached_routes": cached_routes,
+            "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+        temporary = STATUS_FILE.with_suffix(STATUS_FILE.suffix + ".tmp")
+        temporary.write_text(json.dumps(status, ensure_ascii=False), encoding="utf-8")
+        temporary.replace(STATUS_FILE)
+        now = time.monotonic()
         for target in API_TARGETS:
-            if now < next_attempt.get(target.name,0.0): continue
+            if now < next_attempt.get(target.name, 0.0):
+                continue
             try:
-                await asyncio.to_thread(api_call,target,{"action":"gateway_status",**status},4.0); failures[target.name]=0; next_attempt[target.name]=now+60.0; last_errors.pop(target.name,None)
-            except Exception as exc:
-                failures[target.name]=failures.get(target.name,0)+1; delay=min(900.0,60.0*(2**min(failures[target.name]-1,4))); next_attempt[target.name]=now+delay; message=str(exc)
-                if message != last_errors.get(target.name) or now-last_logged.get(target.name,0.0)>=900:
-                    LOG.warning("Gateway status API %s failed; retry in %.0fs: %s",target.name,delay,message); last_errors[target.name]=message; last_logged[target.name]=now
-        try: await asyncio.wait_for(STOP_EVENT.wait(),timeout=15)
-        except asyncio.TimeoutError: pass
+                result = await asyncio.to_thread(api_call, target, {"action": "gateway_status", **status}, 4.0)
+                apply_route_overrides(target, result)
+                failures[target.name] = 0; next_attempt[target.name] = now + 60.0; last_errors.pop(target.name, None)
+            except Exception as exc:  # noqa: BLE001
+                failures[target.name] = failures.get(target.name, 0) + 1
+                delay = min(900.0, 60.0 * (2 ** min(failures[target.name] - 1, 4)))
+                next_attempt[target.name] = now + delay; message = str(exc)
+                if message != last_errors.get(target.name) or now - last_logged.get(target.name, 0.0) >= 900:
+                    LOG.warning("Gateway status API %s failed; retry in %.0fs: %s", target.name, delay, message)
+                    last_errors[target.name] = message; last_logged[target.name] = now
+        try:
+            await asyncio.wait_for(STOP_EVENT.wait(), timeout=15)
+        except asyncio.TimeoutError:
+            pass
 
 
 async def main() -> None:
     if not API_TARGETS: raise RuntimeError("At least one internal OCPP API target is required.")
     if GATEWAY_MODE != "local" and any(not target.url.lower().startswith("https://") for target in API_TARGETS): raise RuntimeError("Internal OCPP API targets must use https:// outside local mode.")
+    with state_db() as _db:
+        pass
     PID_FILE.write_text(str(os.getpid()) + "\n", encoding="utf-8")
     try:
         os.chmod(PID_FILE, 0o600)
@@ -775,13 +972,16 @@ async def main() -> None:
     sockets = ", ".join(str(sock.getsockname()) for sock in server.sockets or [])
     LOG.info("Leap Hub OCPP gateway listening on %s", sockets)
     status_task = asyncio.create_task(status_loop())
+    queue_task = asyncio.create_task(queue_loop())
     async with server:
         await STOP_EVENT.wait()
     status_task.cancel()
-    try:
-        await status_task
-    except asyncio.CancelledError:
-        pass
+    queue_task.cancel()
+    for task in (status_task, queue_task):
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
     for connection in list(CONNECTIONS.values()):
         connection.closed = True
         connection.writer.close()

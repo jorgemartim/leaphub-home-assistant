@@ -1,4 +1,4 @@
-## 1.12.01
+## 1.12.02
 
 - Adiciona cancelamento protegido de comandos antes do envio à nuvem.
 - Cancela timers de retomada e filas de autenticação sem interromper ações já iniciadas.

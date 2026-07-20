@@ -52,7 +52,7 @@ configuration:
     description: Proteção de armazenamento para a fila persistente.
   ocpp_beta_enabled:
     name: Ativar OCPP Beta
-    description: Inicia o gateway OCPP Beta na porta 8092.
+    description: Inicia o gateway OCPP unificado na porta 8092.
   ocpp_beta_internal_url:
     name: URL interna OCPP Beta
     description: Endpoint HTTPS do Leap Hub Beta.
