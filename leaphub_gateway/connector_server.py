@@ -32,7 +32,7 @@ except ModuleNotFoundError as exc:
         "Módulo interno leaphub_connector ausente na imagem. Atualize o Leap Hub Gateway."
     ) from exc
 
-VERSION = "1.11.99"
+VERSION = "1.12.00"
 SERVICE = "Leap Hub Leapmotor Connector"
 MAX_BODY = 1024 * 1024
 WINDOW_SECONDS = 180
@@ -47,6 +47,13 @@ COMMAND_DB_PATH = Path(os.getenv("LEAPHUB_COMMAND_DB_PATH", "/data/security/conn
 COMMAND_CACHE: dict[str, dict[str, Any]] = {}
 COMMAND_CACHE_LOCK = threading.RLock()
 COMMAND_CACHE_MAX = 2000
+COMMAND_CANCEL_REQUESTS: set[str] = set()
+
+
+class CommandCancelled(RuntimeError):
+    """Internal control flow for requests cancelled before cloud dispatch."""
+
+
 class PriorityOperationLimiter:
     """Limite global com prioridade para comandos manuais.
 
@@ -580,7 +587,7 @@ def command_journal_status(environment: str, payload: dict[str, Any]) -> dict[st
         except (OSError, sqlite3.Error):
             pass
         return stale_response
-    response.setdefault("ok", status != "failed")
+    response.setdefault("ok", status not in {"failed", "cancelled"})
     response["status"] = status
     response["request_id"] = request_id
     response["updated_at"] = float(row.get("updated_at") or 0)
@@ -608,6 +615,13 @@ def command_journal_status(environment: str, payload: dict[str, Any]) -> dict[st
         if status == "waiting_auth" and retry_at > 0:
             response["retry_after_seconds"] = max(0, int(retry_at - time.time()))
         response.setdefault("message", messages.get(status, "Acompanhando a execução do comando."))
+    elif status == "cancelled":
+        response["ok"] = True
+        response["cancelled"] = True
+        response["accepted"] = False
+        response["queued"] = False
+        response["confirmation_pending"] = False
+        response.setdefault("message", "Solicitação cancelada antes do envio ao veículo.")
     elif status == "not_applied":
         response["ok"] = False
         response.setdefault("accepted", True)
@@ -628,6 +642,66 @@ def command_journal_status(environment: str, payload: dict[str, Any]) -> dict[st
     return response
 
 
+def command_cancel_requested(environment: str, request_id: str) -> bool:
+    worker_key = command_worker_key(environment, request_id)
+    with COMMAND_WORKERS_GUARD:
+        return worker_key in COMMAND_CANCEL_REQUESTS
+
+
+def command_journal_cancel(environment: str, payload: dict[str, Any]) -> dict[str, Any]:
+    request_id = request_identifier(payload)
+    if not request_id:
+        raise ValueError("Identificador do comando ausente.")
+    request_hash = hashlib.sha256(f"{environment}|{request_id}".encode("utf-8")).hexdigest()
+    status_payload = command_journal_status(environment, {"request_id": request_id})
+    status = str(status_payload.get("status") or "unknown")
+    cancellable_states = {"queued", "waiting_auth", "waiting_account", "waiting_slot", "preparing", "reconnecting", "retry_wait"}
+    if status == "cancelled":
+        return status_payload
+    if status not in cancellable_states:
+        return {
+            "ok": False,
+            "cancelled": False,
+            "status": status,
+            "request_id": request_id,
+            "message": "O comando já começou a ser enviado ao veículo e não pode mais ser cancelado.",
+            "connector_version": connector.CONNECTOR_VERSION,
+        }
+    worker_key = command_worker_key(environment, request_id)
+    with COMMAND_WORKERS_GUARD:
+        COMMAND_CANCEL_REQUESTS.add(worker_key)
+        timer = COMMAND_RETRY_TIMERS.pop(worker_key, None)
+        if timer is not None:
+            timer.cancel()
+    response = {
+        "ok": True,
+        "cancelled": True,
+        "accepted": False,
+        "queued": False,
+        "confirmation_pending": False,
+        "status": "cancelled",
+        "request_id": request_id,
+        "message": "Solicitação cancelada antes do envio ao veículo.",
+        "connector_version": connector.CONNECTOR_VERSION,
+    }
+    raw = json.dumps(response, ensure_ascii=False, separators=(",", ":"))
+    now = time.time()
+    existing = cached_command(request_hash) or {}
+    cache_command(request_hash, str(existing.get("payload_hash") or ""), "cancelled", raw, float(existing.get("created_at") or now), now, now + 900)
+    try:
+        with command_db(0.5) as db:
+            db.execute(
+                "UPDATE command_requests SET status='cancelled',response_json=?,updated_at=?,expires_at=? WHERE request_hash=?",
+                (raw, now, now + 900, request_hash),
+            )
+            db.commit()
+    except (OSError, sqlite3.Error) as exc:
+        LOG.warning("Cancelamento persistido apenas em memória: %s", exc)
+    TELEMETRY.wake_event.set()
+    LOG.info("Comando %s cancelado antes do envio à nuvem.", request_id[:12])
+    return response
+
+
 def command_worker_key(environment: str, request_id: str) -> str:
     return hashlib.sha256(f"{environment}|{request_id}".encode("utf-8")).hexdigest()
 
@@ -645,7 +719,9 @@ def schedule_command_retry(
     def resume() -> None:
         with COMMAND_WORKERS_GUARD:
             COMMAND_RETRY_TIMERS.pop(worker_key, None)
-        start_command_job(environment, payload, request_hash, request_id)
+            cancelled = worker_key in COMMAND_CANCEL_REQUESTS
+        if not cancelled:
+            start_command_job(environment, payload, request_hash, request_id)
 
     timer = threading.Timer(float(delay) + 1.0, resume)
     timer.daemon = True
@@ -672,12 +748,17 @@ def run_command_job(
     retry_after_seconds = 0
     queue_started = time.monotonic()
     try:
+        def ensure_not_cancelled() -> None:
+            if command_cancel_requested(environment, request_id):
+                raise CommandCancelled("Solicitação cancelada antes do envio ao veículo.")
+
         def progress(stage: str, message: str, extra: dict[str, Any] | None = None) -> None:
             command_journal_progress(request_hash, request_id, stage, message, extra)
 
         # A operação manual entra em estado pendente antes do worker iniciar.
         # Isso impede novas leituras automáticas desta conta. Uma leitura já em
         # andamento termina no próximo ponto seguro e libera a mesma sessão.
+        ensure_not_cancelled()
         account_lock = account_operation_lock(environment, payload)
         next_progress_at = 0.0
         next_log_at = 15.0
@@ -688,6 +769,7 @@ def run_command_job(
         )
         TELEMETRY.wake_event.set()
         while not account_lock.acquire(timeout=0.5):
+            ensure_not_cancelled()
             elapsed = time.monotonic() - queue_started
             TELEMETRY.wake_event.set()
             if elapsed >= next_progress_at:
@@ -715,6 +797,7 @@ def run_command_job(
                     "A leitura anterior excedeu a janela segura. O comando não foi enviado e pode ser tentado novamente."
                 )
         account_acquired = True
+        ensure_not_cancelled()
 
         progress(
             "waiting_slot",
@@ -727,7 +810,9 @@ def run_command_job(
                 "A conta foi liberada, mas o Connector permaneceu ocupado. O comando não foi enviado."
             )
 
+        ensure_not_cancelled()
         progress("preparing", "Preparando a sessão autenticada para a ação.")
+        ensure_not_cancelled()
         result = TELEMETRY.execute_command(environment, payload, progress=progress)
         if request_id:
             result["request_id"] = request_id
@@ -757,6 +842,9 @@ def run_command_job(
                 str(result.get("execution_warning") or "warning")[:80],
                 str(result.get("verification_state") or "unknown")[:80],
             )
+    except CommandCancelled:
+        defer_seconds = 0
+        retry_after_seconds = 0
     except connector.ConnectorLoginCooldownError as exc:
         retry_after_seconds = max(30, min(300, int(exc.retry_after_seconds or 135)))
         command_journal_wait_auth(request_hash, request_id, retry_after_seconds)
@@ -782,7 +870,10 @@ def run_command_job(
         timer.start()
         with COMMAND_WORKERS_GUARD:
             COMMAND_WORKERS.pop(worker_key, None)
-        if retry_after_seconds > 0 and request_hash:
+            cancelled = worker_key in COMMAND_CANCEL_REQUESTS
+            if cancelled:
+                COMMAND_CANCEL_REQUESTS.discard(worker_key)
+        if retry_after_seconds > 0 and request_hash and not cancelled:
             schedule_command_retry(environment, dict(payload), request_hash, request_id, retry_after_seconds)
 
 def start_command_job(
@@ -792,6 +883,8 @@ def start_command_job(
         return False
     worker_key = command_worker_key(environment, request_id)
     with COMMAND_WORKERS_GUARD:
+        if worker_key in COMMAND_CANCEL_REQUESTS:
+            return False
         existing = COMMAND_WORKERS.get(worker_key)
         if existing is not None and existing.is_alive():
             return True
@@ -1082,7 +1175,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json(404, {"ok": False, "message": "Página não encontrada."})
 
     def do_POST(self) -> None:
-        if self.path not in {"/v1/accounts/test", "/v1/vehicles/sync", "/v1/vehicles/command", "/v1/vehicles/command/status", "/v1/telemetry/subscriptions/upsert", "/v1/telemetry/subscriptions/remove", "/v1/telemetry/subscriptions/boost", "/v1/telemetry/subscriptions/release"}:
+        if self.path not in {"/v1/accounts/test", "/v1/vehicles/sync", "/v1/vehicles/command", "/v1/vehicles/command/status", "/v1/vehicles/command/cancel", "/v1/telemetry/subscriptions/upsert", "/v1/telemetry/subscriptions/remove", "/v1/telemetry/subscriptions/boost", "/v1/telemetry/subscriptions/release"}:
             self.send_json(404, {"ok": False, "message": "Página não encontrada."})
             return
         try:
@@ -1135,6 +1228,10 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if self.path == "/v1/vehicles/command/status":
                 self.send_json(200, command_journal_status(environment, payload))
+                return
+            if self.path == "/v1/vehicles/command/cancel":
+                cancelled = command_journal_cancel(environment, payload)
+                self.send_json(200 if bool(cancelled.get("cancelled")) else 409, cancelled)
                 return
             if self.path == "/v1/vehicles/command":
                 command_journal_key, replay = command_journal_begin(environment, payload)

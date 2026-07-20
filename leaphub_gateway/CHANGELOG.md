@@ -1,3 +1,10 @@
+## 1.12.00
+
+- Adiciona cancelamento protegido de comandos antes do envio à nuvem.
+- Cancela timers de retomada e filas de autenticação sem interromper ações já iniciadas.
+- Mantém o diário persistente com estado terminal `cancelled`.
+- A API informa quando o comando já passou do ponto seguro de cancelamento.
+
 ## 1.11.99
 
 - Mantém filas independentes por conta Leapmotor; uma conta não bloqueia as demais.
