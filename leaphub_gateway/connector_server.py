@@ -32,7 +32,7 @@ except ModuleNotFoundError as exc:
         "Módulo interno leaphub_connector ausente na imagem. Atualize o Leap Hub Gateway."
     ) from exc
 
-VERSION = "1.12.04"
+VERSION = "1.12.05"
 SERVICE = "Leap Hub Leapmotor Connector"
 MAX_BODY = 1024 * 1024
 WINDOW_SECONDS = 180
@@ -614,6 +614,13 @@ def command_journal_status(environment: str, payload: dict[str, Any]) -> dict[st
         }
         if status == "waiting_auth" and retry_at > 0:
             response["retry_after_seconds"] = max(0, int(retry_at - time.time()))
+        remaining = max(0, int(response.get("retry_after_seconds") or 0))
+        response["poll_after_seconds"] = (
+            max(15, min(120, remaining - 3)) if status == "waiting_auth" and remaining > 18 else
+            12 if status == "waiting_account" else
+            8 if status in {"waiting_slot", "waking", "vehicle_waking", "vehicle_awake", "reconnecting", "retry_wait", "climate_verifying", "verifying", "confirming"} else
+            5
+        )
         response.setdefault("message", messages.get(status, "Acompanhando a execução do comando."))
     elif status == "cancelled":
         response["ok"] = True
@@ -1121,6 +1128,9 @@ class Handler(BaseHTTPRequestHandler):
             if 'POST /v1/telemetry/subscriptions/boost ' in line and line.endswith(' 200 -'):
                 LOG.debug("local telemetry boost")
                 return
+            if 'POST /v1/vehicles/command/status ' in line and line.endswith(' 200 -'):
+                LOG.debug("local command status")
+                return
         LOG.info("%s - %s", self.address_string(), line)
 
     def send_json(self, status: int, payload: dict[str, Any]) -> bool:
@@ -1203,7 +1213,7 @@ class Handler(BaseHTTPRequestHandler):
         command_journal_key: str | None = None
 
         try:
-            if self.path in {"/v1/telemetry/subscriptions/boost", "/v1/telemetry/subscriptions/release"}:
+            if self.path in {"/v1/telemetry/subscriptions/boost", "/v1/telemetry/subscriptions/release", "/v1/vehicles/command/status"}:
                 LOG.debug("Action %s accepted for %s", self.path, environment)
             else:
                 LOG.info("Action %s accepted for %s", self.path, environment)

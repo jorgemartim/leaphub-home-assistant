@@ -24,7 +24,7 @@ from cryptography.fernet import Fernet, InvalidToken
 import leaphub_connector as connector
 
 LOG = logging.getLogger("leaphub.telemetry")
-ENGINE_VERSION = "1.12.04"
+ENGINE_VERSION = "1.12.05"
 
 
 def utc_iso() -> str:
@@ -113,9 +113,12 @@ class TelemetryEngine:
         # Janela curta após comandos remotos. É propositalmente separada da
         # navegação comum para confirmar rapidamente o novo estado sem manter
         # consultas agressivas à nuvem durante todo o dia.
-        self.command_seconds = self._bounded("telemetry_command_seconds", 3, 3, 10)
-        self.command_max_polls = self._bounded("telemetry_command_max_polls", 8, 4, 12)
-        self.command_cadence = (self.command_seconds, 6, 10, 15)
+        # A confirmação após comando usa poucas leituras espaçadas. O app
+        # mantém o último estado confirmado enquanto aguarda, portanto não há
+        # motivo para consultar a nuvem a cada três segundos.
+        self.command_seconds = self._bounded("telemetry_command_seconds", 12, 10, 60)
+        self.command_max_polls = self._bounded("telemetry_command_max_polls", 3, 2, 4)
+        self.command_cadence = (self.command_seconds, 20, 35, 60)
         self.charging_seconds = self._bounded("telemetry_charging_seconds", 30, 15, 600)
         self.parked_seconds = self._bounded("telemetry_parked_seconds", 300, 60, 3600)
         self.sleep_seconds = self._bounded("telemetry_sleep_seconds", 900, 300, 14400)
@@ -1464,7 +1467,7 @@ class TelemetryEngine:
             temp_dir = connector.secure_temp_directory()
             client = None
             try:
-                client = connector.create_client(credentials, temp_dir, None, request_timeout_seconds=10)
+                client = connector.create_client(credentials, temp_dir, None, request_timeout_seconds=8)
                 # Uma única tentativa de login. Falhas nunca geram uma sequência
                 # imediata de novas autenticações.
                 client.login()

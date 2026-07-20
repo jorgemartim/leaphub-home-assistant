@@ -1,3 +1,8 @@
+## 1.12.05
+
+- Contenção de requisições, telemetria pós-comando moderada e status com backoff explícito.
+- Removida a leitura extra anterior ao desligamento do clima.
+
 ## 1.12.04
 
 - Desligamento de clima com fechamento compatível com o modo ativo e confirmação por telemetria fresca.

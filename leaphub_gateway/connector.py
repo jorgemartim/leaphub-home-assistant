@@ -27,7 +27,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable
 
-CONNECTOR_VERSION = "1.12.04"
+CONNECTOR_VERSION = "1.12.05"
 MAX_INPUT_BYTES = 1024 * 1024
 logging.getLogger("leapmotor_api").setLevel(logging.WARNING)
 LOGGER = logging.getLogger("leaphub.connector")
@@ -2904,26 +2904,14 @@ def handle_command(
         is_climate_state_command = command in CLIMATE_VERIFY_COMMANDS
         can_safe_retry = command in SAFE_STATE_RETRY_COMMANDS
         if command == "climate_off":
-            try:
-                before_close = read_command_state(
-                    client,
-                    resolved_vehicle_id,
-                    command,
-                    parameters,
-                    resolved_list,
-                )
-                active_climate_profile = str(before_close.get("climate_profile") or "generic")
-                if isinstance(before_close.get("vehicles"), list):
-                    resolved_list = before_close.get("vehicles")
-            except Exception as exc:  # noqa: BLE001
-                # Reading the profile is an optimization. Never prevent a safe
-                # close request merely because telemetry is temporarily stale.
-                active_climate_profile = "generic"
-                report("preparing", "O modo atual do ar não pôde ser lido; usando encerramento compatível geral.", {
-                    "profile_read_failed": True,
-                    "error_type": type(exc).__name__,
-                })
-            climate_dispatch_strategy = f"mode_aware_close_{active_climate_profile}"
+            profile_hint = str(parameters.get("climate_profile") or "").strip().lower()
+            active_climate_profile = profile_hint if profile_hint in {"cooling", "heating", "generic"} else "generic"
+            climate_dispatch_strategy = f"single_mode_aware_close_{active_climate_profile}"
+            report(
+                "preparing",
+                "Preparando um único encerramento da climatização sem leitura adicional da nuvem.",
+                {"climate_profile": active_climate_profile, "single_delivery": True},
+            )
         first_error = dispatch_once(
             "executing",
             "Enviando encerramento compatível com o modo atual da climatização."
