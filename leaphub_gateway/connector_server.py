@@ -32,7 +32,7 @@ except ModuleNotFoundError as exc:
         "Módulo interno leaphub_connector ausente na imagem. Atualize o Leap Hub Gateway."
     ) from exc
 
-VERSION = "1.11.98"
+VERSION = "1.11.99"
 SERVICE = "Leap Hub Leapmotor Connector"
 MAX_BODY = 1024 * 1024
 WINDOW_SECONDS = 180
@@ -736,7 +736,7 @@ def run_command_job(
         command_journal_finish(request_hash, request_id, result)
         defer_seconds = 5 if bool(result.get("wake_attempted")) else 3
         LOG.info(
-            "Comando remoto %s finalizado no worker para %s; resultado=%s, espera_fila=%ss, tentativas=%s, despertar_real=%s, repetição_segura=%s, confirmado_direto=%s, confirmação_pendente=%s.",
+            "Comando remoto %s finalizado no worker para %s; resultado=%s, espera_fila=%ss, tentativas=%s, despertar_real=%s, repetição_segura=%s, estratégia=%s, confirmado_direto=%s, confirmação_pendente=%s.",
             str(payload.get("command") or "desconhecido")[:40],
             environment,
             str(result.get("final_outcome") or ("confirmed" if result.get("verified_by_gateway") else "confirmation_pending"))[:40],
@@ -744,6 +744,7 @@ def run_command_job(
             int(result.get("attempts") or 1),
             bool(result.get("wake_attempted")),
             bool(result.get("safe_retry_performed")),
+            str(result.get("safe_retry_strategy") or "none")[:48],
             bool(result.get("verified_by_gateway")),
             bool(result.get("confirmation_pending")),
         )

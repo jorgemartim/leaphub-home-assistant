@@ -27,7 +27,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable
 
-CONNECTOR_VERSION = "1.11.98"
+CONNECTOR_VERSION = "1.11.99"
 MAX_INPUT_BYTES = 1024 * 1024
 logging.getLogger("leapmotor_api").setLevel(logging.WARNING)
 LOGGER = logging.getLogger("leaphub.connector")
@@ -2482,6 +2482,63 @@ def _status_capture_epoch(status: Any) -> float:
     return 0.0
 
 
+def climate_profile_from_status(climate: Any) -> str:
+    """Return a non-sensitive HVAC profile used only for state reconciliation.
+
+    The provider exposes the current rapid mode through more than one field,
+    depending on model/firmware.  Keep the interpretation conservative and
+    fall back to the generic wind profile when no directional evidence exists.
+    """
+    if bool_or_none(attribute(climate, "rapid_cooling")) is True:
+        return "cooling"
+    if bool_or_none(attribute(climate, "rapid_heating")) is True:
+        return "heating"
+
+    mode_number = numeric(attribute(climate, "climate_mode"))
+    if mode_number == 1:
+        return "cooling"
+    if mode_number == 3:
+        return "heating"
+
+    direction_number = numeric(attribute(climate, "ac_cooling_and_heating"))
+    if direction_number == 1:
+        return "cooling"
+    if direction_number == 2:
+        return "heating"
+
+    text = " ".join(
+        str(enum_or_value(value) or "").strip().lower()
+        for value in (
+            attribute(climate, "climate_mode"),
+            attribute(climate, "ac_cooling_and_heating"),
+            attribute(climate, "ac_operate_mode"),
+        )
+    )
+    if any(token in text for token in ("fast_cool", "cool", "cold", "resfri")):
+        return "cooling"
+    if any(token in text for token in ("fast_heat", "heat", "hot", "aquec")):
+        return "heating"
+    return "generic"
+
+
+def climate_close_parameters(profile: str) -> dict[str, str]:
+    """Build the documented climate-switch close payload for the active mode."""
+    if profile == "cooling":
+        return {
+            "circle": "in", "mode": "cold", "operate": "close",
+            "position": "all", "temperature": "18", "windlevel": "7", "wshld": "0",
+        }
+    if profile == "heating":
+        return {
+            "circle": "in", "mode": "hot", "operate": "close",
+            "position": "all", "temperature": "32", "windlevel": "7", "wshld": "0",
+        }
+    return {
+        "circle": "out", "mode": "wind", "operate": "close",
+        "position": "all", "temperature": "26", "windlevel": "3", "wshld": "0",
+    }
+
+
 def read_command_state(
     client: Any,
     resolved_vehicle_id: str,
@@ -2510,12 +2567,14 @@ def read_command_state(
     status = client.get_vehicle_status(selected)
     captured_epoch = _status_capture_epoch(status)
     climate = attribute(status, "climate")
+    profile = climate_profile_from_status(climate)
     state = bool_or_none(attribute(climate, "ac_switch"))
     if state is None:
         return {
             "matched": False,
             "evaluable": False,
             "state": "climate_unknown",
+            "climate_profile": profile,
             "captured_epoch": captured_epoch,
             "vehicles": available,
         }
@@ -2524,6 +2583,7 @@ def read_command_state(
         "matched": state is expected,
         "evaluable": True,
         "state": "climate_on" if state else "climate_off",
+        "climate_profile": profile,
         "captured_epoch": captured_epoch,
         "vehicles": available,
     }
@@ -2696,6 +2756,7 @@ def handle_command(
     verification_state = "not_checked"
     verification_samples = 0
     execution_warning: str | None = None
+    safe_retry_strategy: str | None = None
     command_dispatched = False
     cloud_accepted = False
     command_started_at = time.time()
@@ -2884,16 +2945,35 @@ def handle_command(
                         "state_evaluable": bool(initial_sample.get("evaluable")),
                     },
                 )
+                active_profile = str(initial_sample.get("climate_profile") or "generic")
+                explicit_close = getattr(client, "ac_switch", None) if command == "climate_off" else None
+                use_mode_aware_close = command == "climate_off" and callable(explicit_close)
+                safe_retry_strategy = (
+                    f"mode_aware_close_{active_profile}" if use_mode_aware_close else "repeat_state_command"
+                )
                 report(
                     "climate_dispatching",
+                    "Enviando um encerramento compatível com o modo ativo da climatização."
+                    if use_mode_aware_close else
                     "Enviando a climatização uma segunda e última vez após o despertar.",
-                    {"safe_retry": True, "attempt": 2},
+                    {
+                        "safe_retry": True,
+                        "attempt": 2,
+                        "retry_strategy": safe_retry_strategy,
+                        "climate_profile": active_profile,
+                    },
                 )
                 command_attempts = 2
                 safe_retry_performed = True
                 retry_error: Exception | None = None
                 try:
-                    result = execute_vehicle_command(method, command, resolved_vehicle_id, parameters)
+                    if use_mode_aware_close:
+                        result = explicit_close(
+                            resolved_vehicle_id,
+                            params=climate_close_parameters(active_profile),
+                        )
+                    else:
+                        result = execute_vehicle_command(method, command, resolved_vehicle_id, parameters)
                     command_dispatched = True
                     cloud_accepted = True
                 except Exception as exc:  # noqa: BLE001
@@ -3007,6 +3087,7 @@ def handle_command(
             "applied": True if verified_by_gateway else (False if not_applied else None),
             "final_outcome": "confirmed" if verified_by_gateway else ("not_applied" if not_applied else "confirmation_pending"),
             "safe_retry_performed": safe_retry_performed,
+            "safe_retry_strategy": safe_retry_strategy,
             "verification_state": verification_state,
             "verification_samples": verification_samples,
             "execution_warning": execution_warning,
