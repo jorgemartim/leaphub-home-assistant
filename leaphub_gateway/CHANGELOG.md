@@ -1,3 +1,7 @@
+## 1.12.07
+
+- Prioridade manual antes do login automático e retomada idempotente após cooldown.
+
 ## 1.12.06
 
 - Compatibilidade de migração para opções persistidas pela 1.12.04.

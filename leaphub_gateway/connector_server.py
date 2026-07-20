@@ -32,7 +32,7 @@ except ModuleNotFoundError as exc:
         "Módulo interno leaphub_connector ausente na imagem. Atualize o Leap Hub Gateway."
     ) from exc
 
-VERSION = "1.12.06"
+VERSION = "1.12.07"
 SERVICE = "Leap Hub Leapmotor Connector"
 MAX_BODY = 1024 * 1024
 WINDOW_SECONDS = 180
@@ -325,7 +325,7 @@ def command_journal_begin(environment: str, payload: dict[str, Any]) -> tuple[st
                     response["request_id"] = request_id
                     return None, response
         if stale_waiting_auth:
-            LOG.warning("Descartando espera de autenticação inválida da versão anterior para o comando %s.", request_id[:12])
+            LOG.info("Retomando o comando %s após o prazo de autenticação, preservando o mesmo identificador idempotente.", request_id[:12])
             row["status"] = "queued"
             row["response_json"] = ""
         if str(row.get("status") or "") in active_states and now - float(row.get("updated_at") or 0) < 900 and not stale_waiting_auth:
@@ -447,6 +447,7 @@ def command_journal_wait_auth(request_hash: str | None, request_id: str, retry_a
         "status": "waiting_auth",
         "retry_after_seconds": delay,
         "retry_at": retry_at,
+        "resume_required": True,
         "confirmation_pending": True,
         "request_id": request_id,
         "message": "A Leapmotor limitou temporariamente novas autenticações. O comando continuará na fila e será enviado automaticamente.",
@@ -614,6 +615,7 @@ def command_journal_status(environment: str, payload: dict[str, Any]) -> dict[st
         }
         if status == "waiting_auth" and retry_at > 0:
             response["retry_after_seconds"] = max(0, int(retry_at - time.time()))
+            response["resume_required"] = True
         remaining = max(0, int(response.get("retry_after_seconds") or 0))
         response["poll_after_seconds"] = (
             max(15, min(120, remaining - 3)) if status == "waiting_auth" and remaining > 18 else

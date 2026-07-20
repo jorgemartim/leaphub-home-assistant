@@ -24,7 +24,7 @@ from cryptography.fernet import Fernet, InvalidToken
 import leaphub_connector as connector
 
 LOG = logging.getLogger("leaphub.telemetry")
-ENGINE_VERSION = "1.12.06"
+ENGINE_VERSION = "1.12.07"
 
 
 def utc_iso() -> str:
@@ -1464,10 +1464,18 @@ class TelemetryEngine:
             session = None
 
         if session is None:
+            # Verifique a prioridade manual antes de criar uma nova sessão e
+            # novamente imediatamente antes do login. Isso fecha a corrida em
+            # que a telemetria iniciava a autenticação no mesmo instante em que
+            # o usuário enviava um comando.
+            if manual_should_yield is not None and manual_should_yield():
+                raise TelemetryYieldForManual("Operação manual aguardando antes da autenticação automática.")
             temp_dir = connector.secure_temp_directory()
             client = None
             try:
                 client = connector.create_client(credentials, temp_dir, None, request_timeout_seconds=8)
+                if manual_should_yield is not None and manual_should_yield():
+                    raise TelemetryYieldForManual("Operação manual recebeu prioridade antes do login automático.")
                 # Uma única tentativa de login. Falhas nunca geram uma sequência
                 # imediata de novas autenticações.
                 client.login()
@@ -1478,6 +1486,8 @@ class TelemetryEngine:
                     except Exception:
                         pass
                 shutil.rmtree(temp_dir, ignore_errors=True)
+                if isinstance(exc, TelemetryYieldForManual):
+                    raise
                 delay = connector.login_cooldown_seconds(exc)
                 if delay > 0:
                     raise connector.ConnectorLoginCooldownError(
