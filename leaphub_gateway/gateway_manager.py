@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import hmac
 import json
 import logging
 import os
@@ -19,7 +20,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-VERSION = "1.12.00"
+VERSION = "1.12.04"
 OPTIONS_PATH = Path(os.getenv("LEAPHUB_OPTIONS_PATH", "/data/options.json"))
 RUNTIME = Path(os.getenv("LEAPHUB_RUNTIME_DIR", "/data/runtime"))
 LOG_DIR = Path(os.getenv("LEAPHUB_LOG_DIR", "/data/logs"))
@@ -252,24 +253,9 @@ def write_connector_options() -> Path:
     return path
 
 
-def ocpp_env(environment: str, port: int, internal_url: str, secret: str, maximum: int) -> dict[str, str]:
-    runtime = RUNTIME / f"ocpp-{environment}"
-    runtime.mkdir(parents=True, exist_ok=True)
-    return {
-        "LEAPHUB_INTERNAL_URL": internal_url,
-        "LEAPHUB_GATEWAY_SECRET": secret,
-        "LEAPHUB_ENVIRONMENT": environment,
-        "LEAPHUB_OCPP_PORT": str(port),
-        "LEAPHUB_RUNTIME_DIR": str(runtime),
-        "LEAPHUB_STATUS_FILE": str(runtime / "status.json"),
-        "LEAPHUB_PID_FILE": str(runtime / "gateway.pid"),
-        "LEAPHUB_LOG_FILE": str(runtime / "gateway.log"),
-        "LEAPHUB_SERVICE_NAME": f"leaphub-ocpp-{environment}",
-        "LEAPHUB_GATEWAY_MODE": "home_assistant_tunnel",
-        "LEAPHUB_GATEWAY_PROVIDER": "home_assistant_tunnel",
-        "LEAPHUB_OCPP_MAX_CONNECTIONS": str(maximum),
-        "LEAPHUB_OCPP_LOG_LEVEL": LOG_LEVEL,
-    }
+def ocpp_env(port: int, beta_url: str, production_url: str, beta_secret: str, production_secret: str, maximum: int) -> dict[str, str]:
+    runtime = RUNTIME / "ocpp-wallbox"; runtime.mkdir(parents=True, exist_ok=True)
+    return {"LEAPHUB_BETA_INTERNAL_URL":beta_url,"LEAPHUB_PRODUCTION_INTERNAL_URL":production_url,"LEAPHUB_BETA_GATEWAY_SECRET":beta_secret,"LEAPHUB_PRODUCTION_GATEWAY_SECRET":production_secret,"LEAPHUB_ENVIRONMENT":"unified","LEAPHUB_OCPP_PORT":str(port),"LEAPHUB_RUNTIME_DIR":str(runtime),"LEAPHUB_STATUS_FILE":str(runtime/"status.json"),"LEAPHUB_PID_FILE":str(runtime/"gateway.pid"),"LEAPHUB_LOG_FILE":str(runtime/"gateway.log"),"LEAPHUB_OCPP_STATE_DB":str(runtime/"ocpp-state.sqlite"),"LEAPHUB_SERVICE_NAME":"leaphub-ocpp-wallbox","LEAPHUB_GATEWAY_MODE":"home_assistant_tunnel","LEAPHUB_GATEWAY_PROVIDER":"home_assistant_tunnel","LEAPHUB_OCPP_MAX_CONNECTIONS":str(maximum),"LEAPHUB_OCPP_COMMAND_POLL":"2","LEAPHUB_OCPP_COMMAND_IDLE_POLL":"10","LEAPHUB_OCPP_LOG_LEVEL":LOG_LEVEL}
 
 
 APP_DIR = Path(__file__).resolve().parent
@@ -291,6 +277,14 @@ CONNECTOR_MODULE_AVAILABLE = connector_module_available()
 connector_options = write_connector_options()
 beta_secret = str(OPTIONS.get("ocpp_beta_secret") or "").strip()
 prod_secret = str(OPTIONS.get("ocpp_production_secret") or "").strip()
+# Desde o endpoint unificado, Beta e Produção usam a mesma chave HMAC. Mantém
+# compatibilidade com instalações em que a chave foi preenchida em um só campo.
+if secret_ok(beta_secret) and not secret_ok(prod_secret):
+    prod_secret = beta_secret
+elif secret_ok(prod_secret) and not secret_ok(beta_secret):
+    beta_secret = prod_secret
+elif secret_ok(beta_secret) and secret_ok(prod_secret) and not hmac.compare_digest(beta_secret, prod_secret):
+    LOG.warning("As chaves OCPP Beta e Produção são diferentes; use a chave compartilhada exibida no Leap Hub em ambos os campos.")
 tunnel_token = str(OPTIONS.get("tunnel_token") or "").strip()
 tunnel_protocol = str(OPTIONS.get("tunnel_protocol") or "http2").strip().lower()
 if tunnel_protocol not in {"auto", "http2", "quic"}:
@@ -303,17 +297,11 @@ SERVICES: dict[str, ManagedService] = {
         {"LEAPHUB_OPTIONS_PATH": str(connector_options)},
         "http://127.0.0.1:8094/health",
     ),
-    "ocpp_beta": ManagedService(
-        "ocpp_beta", "OCPP Beta", bool(OPTIONS.get("ocpp_beta_enabled", True)), secret_ok(beta_secret),
+    "ocpp_wallbox": ManagedService(
+        "ocpp_wallbox", "OCPP Wallbox", bool(OPTIONS.get("ocpp_beta_enabled", True) or OPTIONS.get("ocpp_production_enabled", False)), secret_ok(beta_secret) or secret_ok(prod_secret),
         [sys.executable, "-u", str(APP_DIR / "ocpp_gateway.py")],
-        ocpp_env("staging", 8092, str(OPTIONS.get("ocpp_beta_internal_url") or "").strip(), beta_secret, int(OPTIONS.get("ocpp_beta_max_connections") or 100)),
+        ocpp_env(8092, str(OPTIONS.get("ocpp_beta_internal_url") or "").strip(), str(OPTIONS.get("ocpp_production_internal_url") or "").strip(), beta_secret, prod_secret, max(int(OPTIONS.get("ocpp_beta_max_connections") or 100), int(OPTIONS.get("ocpp_production_max_connections") or 100))),
         "http://127.0.0.1:8092/health",
-    ),
-    "ocpp_production": ManagedService(
-        "ocpp_production", "OCPP Produção", bool(OPTIONS.get("ocpp_production_enabled", False)), secret_ok(prod_secret),
-        [sys.executable, "-u", str(APP_DIR / "ocpp_gateway.py")],
-        ocpp_env("production", 8093, str(OPTIONS.get("ocpp_production_internal_url") or "").strip(), prod_secret, int(OPTIONS.get("ocpp_production_max_connections") or 100)),
-        "http://127.0.0.1:8093/health",
     ),
     "tunnel": ManagedService(
         "tunnel", "Cloudflare Tunnel", bool(OPTIONS.get("tunnel_enabled", False)), secret_ok(tunnel_token, 40),
@@ -428,11 +416,11 @@ main{max-width:1180px;margin:auto;padding:24px}.hero{display:flex;gap:18px;align
 details{margin-top:12px}summary{cursor:pointer;color:var(--muted)}pre{white-space:pre-wrap;word-break:break-word;background:#050c15;border:1px solid var(--line);border-radius:12px;padding:12px;max-height:260px;overflow:auto;color:#bcd0e8;font-size:12px}.wide{grid-column:1/-1}.routes{display:grid;grid-template-columns:1fr auto;gap:8px}.routes code{background:#050c15;border:1px solid var(--line);border-radius:10px;padding:9px;overflow:auto}.notice{border-left:3px solid var(--blue);padding:10px 12px;background:rgba(85,167,255,.08);border-radius:10px;color:#cfe4ff}.foot{color:var(--muted);text-align:center;padding:20px}
 @media(max-width:760px){main{padding:14px}.grid{grid-template-columns:1fr}.hero{align-items:flex-start}.badge{display:none}.meta{grid-template-columns:1fr 1fr}.routes{grid-template-columns:1fr}}
 </style></head><body><main>
-<div class="hero"><div class="mark">LH</div><div><h1>Leap Hub Gateway</h1><p class="sub">Telemetria resiliente, Connector, OCPP e Cloudflare em um único App</p></div><span class="badge">v1.12.00</span></div>
+<div class="hero"><div class="mark">LH</div><div><h1>Leap Hub Gateway</h1><p class="sub">Telemetria resiliente, Connector, OCPP e Cloudflare em um único App</p></div><span class="badge">v1.12.04</span></div>
 <div class="grid" id="cards"></div>
-<section class="card wide" style="margin-top:16px"><div class="head"><div><h2>Rotas do Cloudflare Tunnel</h2><p>Como o Tunnel roda dentro do mesmo App, use 127.0.0.1 nas origens.</p></div></div><div class="routes"><code>connector.leaphub.com.br → http://127.0.0.1:8094</code><span>Connector</span><code>ocpp-beta.leaphub.com.br → http://127.0.0.1:8092</code><span>OCPP Beta</span><code>ocpp.leaphub.com.br → http://127.0.0.1:8093</code><span>Produção</span></div><p class="notice">A fila de telemetria sobrevive a reinícios do App. Uma queda do Home Assistant inteiro ainda cria uma lacuna real, que nunca será preenchida com dados inventados.</p></section>
+<section class="card wide" style="margin-top:16px"><div class="head"><div><h2>Rotas do Cloudflare Tunnel</h2><p>Como o Tunnel roda dentro do mesmo App, use 127.0.0.1 nas origens.</p></div></div><div class="routes"><code>connector.leaphub.com.br → http://127.0.0.1:8094</code><span>Connector</span><code>ocpp-wallbox.leaphub.com.br → http://127.0.0.1:8092</code><span>OCPP Wallbox · Beta e Produção</span></div><p class="notice">A fila de telemetria sobrevive a reinícios do App. Uma queda do Home Assistant inteiro ainda cria uma lacuna real, que nunca será preenchida com dados inventados.</p></section>
 <div class="foot">Tokens e chaves nunca são exibidos neste painel.</div></main><script>
-const token='__TOKEN__';const labels={connector:'Connector Leapmotor',ocpp_beta:'OCPP Beta',ocpp_production:'OCPP Produção',tunnel:'Cloudflare Tunnel'};
+const token='__TOKEN__';const labels={connector:'Connector Leapmotor',ocpp_wallbox:'OCPP Wallbox',tunnel:'Cloudflare Tunnel'};
 function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 async function action(name,kind){const b=document.querySelector(`[data-action="${name}-${kind}"]`);if(b)b.disabled=true;try{const r=await fetch(`api/services/${name}/${kind}`,{method:'POST',headers:{'X-LeapHub-UI-Token':token}});const j=await r.json();alert(j.message||'Concluído');await load()}catch(e){alert('Falha: '+e)}finally{if(b)b.disabled=false}}
 function card(name,s){const health=s.health||{};const logs=(s.logs||[]).join('\n');return `<article class="card"><div class="head"><div><h2>${esc(labels[name]||s.label)}</h2><p>${s.configured?'Configuração pronta':'Configuração pendente'}</p></div><span class="state ${esc(s.state)}">${esc(s.state.replaceAll('_',' '))}</span></div><div class="meta"><div>Saúde<strong>${health.ok?'OK':'Atenção'}</strong></div><div>PID<strong>${esc(s.pid||'—')}</strong></div><div>Reinícios<strong>${esc(s.restarts)}</strong></div></div><div class="actions"><button class="btn" data-action="${name}-test" onclick="action('${name}','test')">Testar</button><button class="btn secondary" data-action="${name}-restart" onclick="action('${name}','restart')" ${!s.enabled||!s.configured?'disabled':''}>Reiniciar serviço</button></div><details><summary>Logs recentes</summary><pre>${esc(logs||'Sem logs nesta inicialização.')}</pre></details></article>`}

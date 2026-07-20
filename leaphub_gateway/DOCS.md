@@ -109,7 +109,7 @@ No painel do Cloudflare Tunnel, altere apenas as origens internas:
 connector.leaphub.com.br
 → http://127.0.0.1:8094
 
-ocpp-beta.leaphub.com.br
+ocpp-wallbox.leaphub.com.br
 → http://127.0.0.1:8092
 ```
 
@@ -117,7 +117,7 @@ Depois abra:
 
 ```text
 https://connector.leaphub.com.br/health
-https://ocpp-beta.leaphub.com.br/health
+https://ocpp-wallbox.leaphub.com.br/health
 ```
 
 O retorno público esperado é:

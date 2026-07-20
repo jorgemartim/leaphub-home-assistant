@@ -25,7 +25,7 @@ Apps antigos:
 5. Abra o painel lateral e confirme Connector e OCPP Beta em execução.
 6. No Cloudflare Tunnel, altere uma rota por vez:
    - `connector.leaphub.com.br` → `http://127.0.0.1:8094`;
-   - `ocpp-beta.leaphub.com.br` → `http://127.0.0.1:8092`.
+   - `ocpp-wallbox.leaphub.com.br` → `http://127.0.0.1:8092`.
 7. Teste os endpoints públicos e o botão **Testar gateway** no Leap Hub Beta.
 8. Ative `tunnel_enabled` e reinicie o Gateway.
 9. Pare o Tunnel antigo.

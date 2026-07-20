@@ -1,4 +1,17 @@
-## 1.12.00
+## 1.12.04
+
+- Desligamento de clima com fechamento compatível com o modo ativo e confirmação por telemetria fresca.
+- Estado só é confirmado quando a leitura do veículo realmente muda.
+
+## 1.12.03
+
+- Corrige o diagnóstico privado OCPP, que podia falhar por chave indefinida.
+- Move filas persistentes de eventos e resultados de comandos junto com o Charge ID promovido.
+- Persiste resultados de comandos quando a API PHP está temporariamente indisponível.
+- Reduz para 15 segundos a aplicação de rotas promovidas e suporta até 10 mil overrides.
+- Reutiliza automaticamente a chave OCPP compartilhada quando preenchida em apenas um ambiente.
+
+## 1.12.02
 
 - Adiciona cancelamento protegido de comandos antes do envio à nuvem.
 - Cancela timers de retomada e filas de autenticação sem interromper ações já iniciadas.
