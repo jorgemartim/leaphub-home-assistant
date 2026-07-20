@@ -24,7 +24,7 @@ from cryptography.fernet import Fernet, InvalidToken
 import leaphub_connector as connector
 
 LOG = logging.getLogger("leaphub.telemetry")
-ENGINE_VERSION = "1.11.96"
+ENGINE_VERSION = "1.11.97"
 
 
 def utc_iso() -> str:
@@ -1464,7 +1464,7 @@ class TelemetryEngine:
             temp_dir = connector.secure_temp_directory()
             client = None
             try:
-                client = connector.create_client(credentials, temp_dir, None, request_timeout_seconds=20)
+                client = connector.create_client(credentials, temp_dir, None, request_timeout_seconds=10)
                 # Uma única tentativa de login. Falhas nunca geram uma sequência
                 # imediata de novas autenticações.
                 client.login()
@@ -1509,6 +1509,8 @@ class TelemetryEngine:
                 ]
             messages: list[Any] = []
             get_messages = getattr(client, "get_message_list", None)
+            if manual_should_yield is not None and manual_should_yield():
+                raise TelemetryYieldForManual("Operação manual aguardando a conta.")
             if not command_mode and callable(get_messages):
                 if manual_should_yield is not None and manual_should_yield():
                     raise TelemetryYieldForManual("Operação manual aguardando a conta.")

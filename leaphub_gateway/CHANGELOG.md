@@ -1,4 +1,4 @@
-## 1.11.96
+## 1.11.97
 
 - Mantém filas independentes por conta Leapmotor; uma conta não bloqueia as demais.
 - Dá prioridade global aos comandos manuais sobre leituras automáticas de telemetria.

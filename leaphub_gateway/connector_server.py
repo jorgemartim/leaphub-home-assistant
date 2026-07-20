@@ -32,7 +32,7 @@ except ModuleNotFoundError as exc:
         "Módulo interno leaphub_connector ausente na imagem. Atualize o Leap Hub Gateway."
     ) from exc
 
-VERSION = "1.11.96"
+VERSION = "1.11.97"
 SERVICE = "Leap Hub Leapmotor Connector"
 MAX_BODY = 1024 * 1024
 WINDOW_SECONDS = 180
@@ -669,7 +669,7 @@ def run_command_job(
             {"queue_wait_seconds": 0, "waiting_for": "telemetry_or_account_operation"},
         )
         TELEMETRY.wake_event.set()
-        while not account_lock.acquire(timeout=1.0):
+        while not account_lock.acquire(timeout=0.5):
             elapsed = time.monotonic() - queue_started
             TELEMETRY.wake_event.set()
             if elapsed >= next_progress_at:
@@ -681,7 +681,7 @@ def run_command_job(
                     "Aguardando a leitura atual terminar. O comando está na fila prioritária.",
                     {"queue_wait_seconds": int(elapsed), "waiting_for": waiting_for},
                 )
-                next_progress_at = elapsed + 4.0
+                next_progress_at = elapsed + 2.0
             if elapsed >= next_log_at:
                 holder = account_lock.snapshot()
                 LOG.info(
@@ -718,14 +718,15 @@ def run_command_job(
         command_journal_finish(request_hash, request_id, result)
         defer_seconds = 5 if bool(result.get("wake_attempted")) else 3
         LOG.info(
-            "Comando remoto %s finalizado no worker para %s; espera_fila=%ss, tentativas=%s, etapa_pós_despertar=%s, confirmado_direto=%s, confirmação_telemetria=%s.",
+            "Comando remoto %s finalizado no worker para %s; espera_fila=%ss, tentativas=%s, despertar_real=%s, repetição_segura=%s, confirmado_direto=%s, confirmação_pendente=%s.",
             str(payload.get("command") or "desconhecido")[:40],
             environment,
             int(result.get("queue_wait_seconds") or 0),
             int(result.get("attempts") or 1),
+            bool(result.get("wake_attempted")),
             bool(result.get("safe_retry_performed")),
             bool(result.get("verified_by_gateway")),
-            bool(result.get("confirmation_pending") or result.get("verification_requested")),
+            bool(result.get("confirmation_pending")),
         )
         if bool(result.get("session_recovered")):
             LOG.info("Comando %s exigiu uma nova sessão após cert/sync recusar o token anterior.", request_id[:12])

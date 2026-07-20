@@ -27,7 +27,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable
 
-CONNECTOR_VERSION = "1.11.96"
+CONNECTOR_VERSION = "1.11.97"
 MAX_INPUT_BYTES = 1024 * 1024
 logging.getLogger("leapmotor_api").setLevel(logging.WARNING)
 LOGGER = logging.getLogger("leaphub.connector")
@@ -41,6 +41,7 @@ def connector_log(level: int, message: str, *args: Any) -> None:
         pass
 
 
+CLIMATE_VERIFY_COMMANDS = {"climate_on", "climate_off", "quick_cool", "quick_heat"}
 SAFE_STATE_RETRY_COMMANDS = {"climate_on", "climate_off"}
 
 COMMAND_METHODS: dict[str, str] = {
@@ -2489,7 +2490,7 @@ def read_command_state(
     vehicles: list[Any] | None = None,
 ) -> dict[str, Any]:
     """Read one state sample and keep freshness separate from command acceptance."""
-    if command not in SAFE_STATE_RETRY_COMMANDS:
+    if command not in CLIMATE_VERIFY_COMMANDS:
         return {
             "matched": False,
             "evaluable": False,
@@ -2518,7 +2519,7 @@ def read_command_state(
             "captured_epoch": captured_epoch,
             "vehicles": available,
         }
-    expected = command == "climate_on"
+    expected = command != "climate_off"
     return {
         "matched": state is expected,
         "evaluable": True,
@@ -2799,7 +2800,8 @@ def handle_command(
         except Exception as exc:  # noqa: BLE001
             raise_classified(exc)
 
-        is_climate_state_command = command in SAFE_STATE_RETRY_COMMANDS
+        is_climate_state_command = command in CLIMATE_VERIFY_COMMANDS
+        can_safe_retry = command in SAFE_STATE_RETRY_COMMANDS
         first_error = dispatch_once(
             "executing",
             "Enviando a ação diretamente ao veículo.",
@@ -2841,7 +2843,7 @@ def handle_command(
                 safe_retry_performed = True
 
         if first_error is not None:
-            if is_climate_state_command and is_transient_cloud_error(first_error):
+            if can_safe_retry and is_transient_cloud_error(first_error):
                 # A timeout may have happened before or immediately after the
                 # write. Climate state is idempotent, so verify first and use the
                 # single protected second delivery only when still necessary.
@@ -2873,7 +2875,7 @@ def handle_command(
                 confirmation_pending = False
                 confirmation_reason = None
                 report("verifying", "Climatização confirmada por uma leitura nova do veículo.", {"verified_by_gateway": True})
-            elif command_attempts < 2:
+            elif can_safe_retry and command_attempts < 2:
                 report(
                     "vehicle_awake",
                     "O veículo já está disponível, mas a climatização ainda não mudou.",
@@ -2942,7 +2944,11 @@ def handle_command(
         if verified_by_gateway:
             message = "A ação foi executada e confirmada por uma leitura nova do veículo."
         elif execution_warning == "climate_not_applied_after_wake_retry":
-            message = "O veículo acordou e a climatização foi enviada novamente, mas uma leitura nova ainda mostrou o sistema desligado."
+            message = (
+                "A climatização foi enviada novamente, mas uma leitura nova ainda mostrou o sistema ligado."
+                if command == "climate_off" else
+                "A climatização foi enviada novamente, mas uma leitura nova ainda mostrou o sistema desligado."
+            )
         elif safe_retry_performed:
             message = "O veículo acordou e a climatização foi enviada na etapa pós-despertar. A telemetria continuará confirmando o estado."
         elif confirmation_pending:
@@ -2968,11 +2974,15 @@ def handle_command(
             "result_type": type(result).__name__,
             "connector_version": CONNECTOR_VERSION,
             "library_version": package_version(),
-            "wake_attempted": bool(wake_info.get("attempted")) or stale_snapshot or safe_retry_performed,
+            "wake_attempted": bool(wake_info.get("attempted")),
             "wake_method": wake_info.get("method"),
-            "wake_strategy": "staged_climate_after_wake" if is_climate_state_command else (
-                "fallback_after_explicit_sleep" if wake_info.get("attempted") else "command_direct"
+            "wake_strategy": (
+                "staged_climate_after_wake" if bool(wake_info.get("attempted")) and is_climate_state_command else
+                "fallback_after_explicit_sleep" if bool(wake_info.get("attempted")) else
+                "command_direct"
             ),
+            "stale_snapshot_received": stale_snapshot,
+            "intended_climate_on": (command != "climate_off") if is_climate_state_command else None,
             "attempts": command_attempts,
             "session_attempts": session_attempts,
             "verification_requested": bool(verify_after),
