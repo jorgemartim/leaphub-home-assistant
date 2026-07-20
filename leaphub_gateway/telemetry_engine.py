@@ -24,7 +24,7 @@ from cryptography.fernet import Fernet, InvalidToken
 import leaphub_connector as connector
 
 LOG = logging.getLogger("leaphub.telemetry")
-ENGINE_VERSION = "1.11.97"
+ENGINE_VERSION = "1.11.98"
 
 
 def utc_iso() -> str:

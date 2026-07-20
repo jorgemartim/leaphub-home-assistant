@@ -27,7 +27,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable
 
-CONNECTOR_VERSION = "1.11.97"
+CONNECTOR_VERSION = "1.11.98"
 MAX_INPUT_BYTES = 1024 * 1024
 logging.getLogger("leapmotor_api").setLevel(logging.WARNING)
 LOGGER = logging.getLogger("leaphub.connector")
@@ -2921,7 +2921,7 @@ def handle_command(
                 elif bool(final_sample.get("evaluable")) and bool(final_sample.get("fresh")):
                     confirmation_pending = True
                     confirmation_reason = "state_not_applied_after_wake_retry"
-                    execution_warning = "climate_not_applied_after_wake_retry"
+                    execution_warning = "climate_not_applied_after_safe_retry"
                 elif retry_error is not None:
                     raise_classified(retry_error)
                 else:
@@ -2931,7 +2931,7 @@ def handle_command(
                 confirmation_pending = True
                 if bool(initial_sample.get("evaluable")) and bool(initial_sample.get("fresh")):
                     confirmation_reason = "state_not_applied_after_wake_retry"
-                    execution_warning = "climate_not_applied_after_wake_retry"
+                    execution_warning = "climate_not_applied_after_safe_retry"
                 else:
                     confirmation_reason = confirmation_reason or "verification_unavailable"
         elif first_error is not None:
@@ -2941,13 +2941,22 @@ def handle_command(
             # Defensive invariant for non-idempotent actions.
             raise ConnectorTemporaryError("A ação não chegou à etapa de envio e foi encerrada sem repetição automática.")
 
+        not_applied = bool(
+            execution_warning == "climate_not_applied_after_safe_retry"
+            and confirmation_reason == "state_not_applied_after_wake_retry"
+        )
+        if not_applied:
+            # A fresh, evaluable sample contradicted the requested state. This is
+            # terminal for this request: do not pretend success and do not issue a
+            # third delivery. A later user action receives a new request id.
+            confirmation_pending = False
         if verified_by_gateway:
             message = "A ação foi executada e confirmada por uma leitura nova do veículo."
-        elif execution_warning == "climate_not_applied_after_wake_retry":
+        elif not_applied:
             message = (
-                "A climatização foi enviada novamente, mas uma leitura nova ainda mostrou o sistema ligado."
+                "A nuvem recebeu o comando, mas uma leitura nova confirmou que a climatização continuou ligada."
                 if command == "climate_off" else
-                "A climatização foi enviada novamente, mas uma leitura nova ainda mostrou o sistema desligado."
+                "A nuvem recebeu o comando, mas uma leitura nova confirmou que a climatização continuou desligada."
             )
         elif safe_retry_performed:
             message = "O veículo acordou e a climatização foi enviada na etapa pós-despertar. A telemetria continuará confirmando o estado."
@@ -2993,6 +3002,10 @@ def handle_command(
             "cloud_accepted": cloud_accepted,
             "session_reused": borrowed_client is not None,
             "verified_by_gateway": verified_by_gateway,
+            "vehicle_confirmed": verified_by_gateway,
+            "not_applied": not_applied,
+            "applied": True if verified_by_gateway else (False if not_applied else None),
+            "final_outcome": "confirmed" if verified_by_gateway else ("not_applied" if not_applied else "confirmation_pending"),
             "safe_retry_performed": safe_retry_performed,
             "verification_state": verification_state,
             "verification_samples": verification_samples,
