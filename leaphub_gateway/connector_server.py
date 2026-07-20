@@ -32,7 +32,7 @@ except ModuleNotFoundError as exc:
         "Módulo interno leaphub_connector ausente na imagem. Atualize o Leap Hub Gateway."
     ) from exc
 
-VERSION = "1.12.05"
+VERSION = "1.12.06"
 SERVICE = "Leap Hub Leapmotor Connector"
 MAX_BODY = 1024 * 1024
 WINDOW_SECONDS = 180

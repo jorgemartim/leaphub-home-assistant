@@ -1,3 +1,9 @@
+## 1.12.06
+
+- Compatibilidade de migração para opções persistidas pela 1.12.04.
+- O schema aceita os valores antigos para permitir a inicialização, enquanto o runtime limita a cadência aos valores seguros da 1.12.05.
+- Corrige o bloqueio do Supervisor com `value must be at least 10.0`.
+
 ## 1.12.05
 
 - Contenção de requisições, telemetria pós-comando moderada e status com backoff explícito.
