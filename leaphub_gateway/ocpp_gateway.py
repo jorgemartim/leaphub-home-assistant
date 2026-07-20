@@ -31,13 +31,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-GATEWAY_VERSION = "1.12.02"
+GATEWAY_VERSION = "1.12.03"
 IS_RAILWAY = bool(os.getenv("RAILWAY_ENVIRONMENT_NAME") or os.getenv("RAILWAY_SERVICE_ID"))
 RUNTIME_DIR = Path(os.getenv("LEAPHUB_RUNTIME_DIR", "/tmp/leaphub-ocpp" if IS_RAILWAY else "."))
 BIND = os.getenv("LEAPHUB_OCPP_BIND", "0.0.0.0")
 PORT = int(os.getenv("PORT") or os.getenv("LEAPHUB_OCPP_PORT", "8092"))
-BETA_INTERNAL_URL = os.getenv("LEAPHUB_BETA_INTERNAL_URL", os.getenv("LEAPHUB_INTERNAL_URL", "https://leaphub.com.br/beta/leap/api/internal/ocpp")).strip()
-PRODUCTION_INTERNAL_URL = os.getenv("LEAPHUB_PRODUCTION_INTERNAL_URL", "https://leaphub.com.br/leap/api/internal/ocpp").strip()
+LEGACY_INTERNAL_URL = os.getenv("LEAPHUB_INTERNAL_URL", "").strip()
+BETA_INTERNAL_URL = os.getenv("LEAPHUB_BETA_INTERNAL_URL", LEGACY_INTERNAL_URL or "https://leaphub.com.br/beta/leap/api/internal/ocpp").strip()
+PRODUCTION_INTERNAL_URL = os.getenv("LEAPHUB_PRODUCTION_INTERNAL_URL", LEGACY_INTERNAL_URL or "https://leaphub.com.br/leap/api/internal/ocpp").strip()
 SECRET_FILE = Path(os.getenv("LEAPHUB_GATEWAY_SECRET_FILE", str(RUNTIME_DIR / "ocpp-gateway-secret.txt")))
 STATUS_FILE = Path(os.getenv("LEAPHUB_STATUS_FILE", str(RUNTIME_DIR / "ocpp-gateway-status.json")))
 PID_FILE = Path(os.getenv("LEAPHUB_PID_FILE", str(RUNTIME_DIR / "ocpp-gateway.pid")))
@@ -79,6 +80,11 @@ def configured_secret(name: str) -> str:
     specific = os.getenv(f"LEAPHUB_{name.upper()}_GATEWAY_SECRET", "").strip()
     legacy = os.getenv("LEAPHUB_GATEWAY_SECRET", "").strip()
     secret = specific or legacy
+    if not secret:
+        try:
+            secret = SECRET_FILE.read_text(encoding="utf-8").strip()
+        except OSError:
+            secret = ""
     if secret and len(secret) < 32:
         raise RuntimeError(f"Gateway secret for {name} is invalid.")
     return secret
@@ -93,8 +99,15 @@ class ApiTarget:
 
 def configured_targets() -> list[ApiTarget]:
     targets: list[ApiTarget] = []
-    # Staging comes first only for a brand-new Charge ID. A cached route or a
-    # production route override always takes precedence after promotion.
+    # Em modo local legado cada processo atende somente seu ambiente. No Home
+    # Assistant o endpoint é unificado e resolve Beta/Produção pelo Charge ID.
+    if LEGACY_INTERNAL_URL and ENVIRONMENT_LABEL in {"staging", "production"}:
+        secret_name = "beta" if ENVIRONMENT_LABEL == "staging" else "production"
+        secret = configured_secret(secret_name)
+        if secret:
+            return [ApiTarget(ENVIRONMENT_LABEL, LEGACY_INTERNAL_URL, secret)]
+    # Staging vem primeiro somente para um Charge ID novo. Cache e override de
+    # Produção sempre ganham depois da promoção.
     definitions = (
         ("staging", BETA_INTERNAL_URL, configured_secret("beta")),
         ("production", PRODUCTION_INTERNAL_URL, configured_secret("production")),
@@ -142,6 +155,20 @@ def state_db() -> sqlite3.Connection:
         last_error TEXT NULL,
         UNIQUE(target_name, identity, message_id, ocpp_action)
     )""")
+    db.execute("""CREATE TABLE IF NOT EXISTS command_result_queue (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        target_name TEXT NOT NULL,
+        identity TEXT NOT NULL,
+        command_id INTEGER NOT NULL,
+        status TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        error_text TEXT NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        available_at REAL NOT NULL,
+        created_at REAL NOT NULL,
+        last_error TEXT NULL,
+        UNIQUE(target_name, identity, command_id)
+    )""")
     db.commit()
     return db
 
@@ -168,6 +195,23 @@ def remember_route(identity: str, target_name: str) -> None:
                 "ON CONFLICT(identity) DO UPDATE SET target_name=excluded.target_name, updated_at=excluded.updated_at",
                 (identity, target_name, time.time()),
             )
+            # Eventos e resultados gerados antes da promoção devem acompanhar
+            # a mesma identidade para o novo ambiente. INSERT OR IGNORE evita
+            # duplicar uma mensagem que já tenha sido reencaminhada.
+            db.execute(
+                "INSERT OR IGNORE INTO event_queue(target_name,identity,message_id,ocpp_action,payload_json,attempts,available_at,created_at,last_error) "
+                "SELECT ?,identity,message_id,ocpp_action,payload_json,attempts,available_at,created_at,last_error "
+                "FROM event_queue WHERE identity=? AND target_name<>?",
+                (target_name, identity, target_name),
+            )
+            db.execute("DELETE FROM event_queue WHERE identity=? AND target_name<>?", (identity, target_name))
+            db.execute(
+                "INSERT OR IGNORE INTO command_result_queue(target_name,identity,command_id,status,payload_json,error_text,attempts,available_at,created_at,last_error) "
+                "SELECT ?,identity,command_id,status,payload_json,error_text,attempts,available_at,created_at,last_error "
+                "FROM command_result_queue WHERE identity=? AND target_name<>?",
+                (target_name, identity, target_name),
+            )
+            db.execute("DELETE FROM command_result_queue WHERE identity=? AND target_name<>?", (identity, target_name))
             db.commit()
     except sqlite3.Error as exc:
         LOG.warning("Could not persist OCPP route for %s: %s", identity, exc)
@@ -186,14 +230,29 @@ def queue_event(target: ApiTarget, identity: str, message_id: str, action: str, 
         LOG.error("Could not queue OCPP event %s for %s: %s", action, identity, exc)
 
 
-def queue_counts() -> tuple[int, int]:
+def queue_command_result(target: ApiTarget, identity: str, command_id: int, status: str, payload: dict[str, Any], error: str, last_error: str) -> None:
+    try:
+        with state_db() as db:
+            db.execute(
+                "INSERT INTO command_result_queue(target_name,identity,command_id,status,payload_json,error_text,attempts,available_at,created_at,last_error) "
+                "VALUES(?,?,?,?,?,?,0,?,?,?) ON CONFLICT(target_name,identity,command_id) DO UPDATE SET "
+                "status=excluded.status,payload_json=excluded.payload_json,error_text=excluded.error_text,available_at=excluded.available_at,last_error=excluded.last_error",
+                (target.name, identity, command_id, status, json.dumps(payload, ensure_ascii=False, separators=(",", ":")), error[:500], time.time(), time.time(), last_error[:300]),
+            )
+            db.commit()
+    except sqlite3.Error as exc:
+        LOG.error("Could not queue OCPP command result %s for %s: %s", command_id, identity, exc)
+
+
+def queue_counts() -> tuple[int, int, int]:
     try:
         with state_db() as db:
             pending = int(db.execute("SELECT COUNT(*) FROM event_queue").fetchone()[0])
+            command_results = int(db.execute("SELECT COUNT(*) FROM command_result_queue").fetchone()[0])
             routes = int(db.execute("SELECT COUNT(*) FROM routes").fetchone()[0])
-        return pending, routes
+        return pending, command_results, routes
     except sqlite3.Error:
-        return 0, 0
+        return 0, 0, 0
 
 
 def local_response(action: str, authorization: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -365,7 +424,8 @@ def detailed_health_payload() -> dict[str, Any]:
         "started_at": STARTED_AT,
         "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "queued_events": queue_counts()[0],
-        "cached_routes": queue_counts()[1],
+        "queued_command_results": queue_counts()[1],
+        "cached_routes": queue_counts()[2],
     }
 
 
@@ -384,8 +444,16 @@ def verify_diagnostic_signature(method: str, path: str, headers: dict[str, str])
         raise PermissionError("Missing signature")
     body_hash = hashlib.sha256(b"").hexdigest()
     canonical = f"{method.upper()}\n{path}\n{timestamp}\n{nonce}\n{body_hash}".encode("utf-8")
-    expected = hmac.new(GATEWAY_SECRET.encode("utf-8"), canonical, hashlib.sha256).hexdigest()
-    if not hmac.compare_digest(expected, signature):
+    if environment == "unified":
+        secrets_to_try = [target.secret for target in API_TARGETS]
+    else:
+        target_name = "staging" if environment == "staging" else "production"
+        target = TARGETS_BY_NAME.get(target_name)
+        secrets_to_try = [target.secret] if target is not None else []
+    if not secrets_to_try or not any(
+        hmac.compare_digest(hmac.new(secret.encode("utf-8"), canonical, hashlib.sha256).hexdigest(), signature)
+        for secret in dict.fromkeys(secrets_to_try)
+    ):
         raise PermissionError("Invalid signature")
     now = time.time()
     expired = [key for key, created_at in DIAGNOSTIC_NONCES.items() if created_at < now - DIAGNOSTIC_WINDOW_SECONDS]
@@ -561,7 +629,8 @@ class ChargePointConnection:
                 },
             )
         except Exception as exc:  # noqa: BLE001
-            LOG.error("Could not report command %s result: %s", command_id, exc)
+            queue_command_result(self.target, self.identity, command_id, status, payload, error, str(exc))
+            LOG.error("Could not report command %s result; queued for replay: %s", command_id, exc)
 
     async def ping_loop(self) -> None:
         while not self.closed:
@@ -854,6 +923,37 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
             LOG.info("Charge point disconnected: %s", identity)
 
 
+def replay_command_results_once(limit: int = 25) -> int:
+    now = time.time()
+    try:
+        with state_db() as db:
+            rows = db.execute(
+                "SELECT id,target_name,identity,command_id,status,payload_json,error_text,attempts FROM command_result_queue WHERE available_at<=? ORDER BY id LIMIT ?",
+                (now, limit),
+            ).fetchall()
+    except sqlite3.Error as exc:
+        LOG.warning("OCPP command-result queue read failed: %s", exc)
+        return 0
+    delivered = 0
+    for row in rows:
+        result_id, target_name, identity, command_id, status, payload_json, error_text, attempts = row
+        target = TARGETS_BY_NAME.get(str(target_name))
+        if target is None:
+            continue
+        try:
+            payload = json.loads(str(payload_json))
+            api_call(target, {"action": "command_result", "identity": identity, "command_id": int(command_id), "status": status, "payload": payload, "error": str(error_text)}, 6.0)
+            with state_db() as db:
+                db.execute("DELETE FROM command_result_queue WHERE id=?", (result_id,)); db.commit()
+            delivered += 1
+        except Exception as exc:  # noqa: BLE001
+            attempt_count = int(attempts) + 1
+            delay = min(900.0, 5.0 * (2 ** min(attempt_count, 7)))
+            with state_db() as db:
+                db.execute("UPDATE command_result_queue SET attempts=?,available_at=?,last_error=? WHERE id=?", (attempt_count, time.time()+delay, str(exc)[:300], result_id)); db.commit()
+    return delivered
+
+
 def replay_queue_once(limit: int = 25) -> int:
     now = time.time()
     try:
@@ -888,8 +988,9 @@ def replay_queue_once(limit: int = 25) -> int:
 async def queue_loop() -> None:
     while not STOP_EVENT.is_set():
         try:
-            delivered = await asyncio.to_thread(replay_queue_once, 25)
-            wait = 2.0 if delivered else 10.0
+            delivered_events = await asyncio.to_thread(replay_queue_once, 25)
+            delivered_results = await asyncio.to_thread(replay_command_results_once, 25)
+            wait = 2.0 if delivered_events or delivered_results else 10.0
         except Exception as exc:  # noqa: BLE001
             LOG.warning("OCPP queue loop failed: %s", exc)
             wait = 30.0
@@ -905,7 +1006,7 @@ def apply_route_overrides(source: ApiTarget, result: dict[str, Any]) -> None:
     overrides = result.get("route_overrides")
     if not isinstance(overrides, list):
         return
-    for raw in overrides[:2000]:
+    for raw in overrides[:10000]:
         identity = str(raw).strip()
         if not identity:
             continue
@@ -923,7 +1024,7 @@ async def status_loop() -> None:
     last_errors: dict[str, str] = {}
     last_logged: dict[str, float] = {}
     while not STOP_EVENT.is_set():
-        pending_events, cached_routes = queue_counts()
+        pending_events, pending_command_results, cached_routes = queue_counts()
         status = {
             "pid": os.getpid(), "connections": len(CONNECTIONS),
             "connections_by_route": {target.name: sum(1 for connection in CONNECTIONS.values() if connection.target.name == target.name) for target in API_TARGETS},
@@ -931,7 +1032,7 @@ async def status_loop() -> None:
             "max_connections": MAX_CONNECTIONS, "port": PORT, "started_at": STARTED_AT, "gateway_mode": GATEWAY_MODE,
             "provider": GATEWAY_PROVIDER, "service_name": SERVICE_NAME, "deployment_id": DEPLOYMENT_ID,
             "railway_environment": RAILWAY_ENVIRONMENT, "public_domain": PUBLIC_DOMAIN, "version": GATEWAY_VERSION,
-            "unified_endpoint": True, "queued_events": pending_events, "cached_routes": cached_routes,
+            "unified_endpoint": True, "queued_events": pending_events, "queued_command_results": pending_command_results, "cached_routes": cached_routes,
             "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         }
         temporary = STATUS_FILE.with_suffix(STATUS_FILE.suffix + ".tmp")
@@ -944,7 +1045,7 @@ async def status_loop() -> None:
             try:
                 result = await asyncio.to_thread(api_call, target, {"action": "gateway_status", **status}, 4.0)
                 apply_route_overrides(target, result)
-                failures[target.name] = 0; next_attempt[target.name] = now + 60.0; last_errors.pop(target.name, None)
+                failures[target.name] = 0; next_attempt[target.name] = now + 15.0; last_errors.pop(target.name, None)
             except Exception as exc:  # noqa: BLE001
                 failures[target.name] = failures.get(target.name, 0) + 1
                 delay = min(900.0, 60.0 * (2 ** min(failures[target.name] - 1, 4)))
