@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import secrets
 import signal
 import subprocess
@@ -18,7 +19,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-VERSION = "1.11.76"
+VERSION = "1.12.01"
 OPTIONS_PATH = Path(os.getenv("LEAPHUB_OPTIONS_PATH", "/data/options.json"))
 RUNTIME = Path(os.getenv("LEAPHUB_RUNTIME_DIR", "/data/runtime"))
 LOG_DIR = Path(os.getenv("LEAPHUB_LOG_DIR", "/data/logs"))
@@ -55,6 +56,11 @@ def sanitize(line: str) -> str:
     text = str(line).replace("\x00", " ").rstrip()
     for key in ("tunnel_token", "gateway_secret", "staging_secret", "production_secret", "TUNNEL_TOKEN"):
         text = text.replace(key + "=", key + "=[protegido]")
+    text = re.sub(r"(?i)(operatePassword|operation_password|password|token|authorization)=([^&\s]+)", r"\1=[protegido]", text)
+    text = re.sub(r'(?i)("(?:operatePassword|operation_password|password|token|authorization)"\s*:\s*")[^"]+("?)', r'\1[protegido]\2', text)
+    text = re.sub(r"(?i)(vin)=([^&\s]+)", r"\1=[VIN protegido]", text)
+    text = re.sub(r'(?i)("vin"\s*:\s*")[^"]+("?)', r'\1[VIN protegido]\2', text)
+    text = re.sub(r"\b[A-HJ-NPR-Z0-9]{17}\b", "[VIN protegido]", text, flags=re.IGNORECASE)
     if "eyJ" in text and len(text) > 120:
         start = text.find("eyJ")
         end = text.find(" ", start)
@@ -62,6 +68,24 @@ def sanitize(line: str) -> str:
             end = len(text)
         text = text[:start] + "[token protegido]" + text[end:]
     return text[-4000:]
+
+
+def scrub_existing_logs() -> None:
+    """Remove segredos que versões antigas possam ter gravado em /data/logs."""
+    for path in LOG_DIR.glob("*.log"):
+        try:
+            if not path.is_file() or path.stat().st_size > 50 * 1024 * 1024:
+                continue
+            temp = path.with_suffix(path.suffix + ".scrub")
+            with path.open("r", encoding="utf-8", errors="replace") as source, temp.open("w", encoding="utf-8") as target:
+                for raw in source:
+                    target.write(sanitize(raw) + "\n")
+            os.replace(temp, path)
+        except OSError as exc:
+            LOG.warning("Não foi possível higienizar o log %s: %s", path.name, exc)
+
+
+scrub_existing_logs()
 
 
 @dataclass
@@ -201,16 +225,20 @@ def write_connector_options() -> Path:
         "staging_secret": str(OPTIONS.get("staging_secret") or "").strip(),
         "production_secret": str(OPTIONS.get("production_secret") or "").strip(),
         "max_parallel_requests": int(OPTIONS.get("connector_max_parallel") or 2),
-        "manual_wait_seconds": int(OPTIONS.get("connector_manual_wait_seconds") or 20),
+        "manual_wait_seconds": int(OPTIONS.get("connector_manual_wait_seconds") or 35),
         "telemetry_beta_enabled": bool(OPTIONS.get("telemetry_beta_enabled", True)),
         "telemetry_beta_internal_url": str(OPTIONS.get("telemetry_beta_internal_url") or ""),
         "telemetry_production_enabled": bool(OPTIONS.get("telemetry_production_enabled", False)),
         "telemetry_production_internal_url": str(OPTIONS.get("telemetry_production_internal_url") or ""),
-        "telemetry_active_seconds": int(OPTIONS.get("telemetry_active_seconds") or 5),
-        "telemetry_charging_seconds": int(OPTIONS.get("telemetry_charging_seconds") or 5),
-        "telemetry_parked_seconds": int(OPTIONS.get("telemetry_parked_seconds") or 30),
-        "telemetry_sleep_seconds": int(OPTIONS.get("telemetry_sleep_seconds") or 120),
-        "telemetry_rate_limit_cooldown_seconds": int(OPTIONS.get("telemetry_rate_limit_cooldown_seconds") or 1800),
+        "telemetry_active_seconds": int(OPTIONS.get("telemetry_active_seconds") or 30),
+        "telemetry_interactive_seconds": int(OPTIONS.get("telemetry_interactive_seconds") or 20),
+        "telemetry_command_seconds": int(OPTIONS.get("telemetry_command_seconds") or 3),
+        "telemetry_command_max_polls": int(OPTIONS.get("telemetry_command_max_polls") or 8),
+        "telemetry_charging_seconds": int(OPTIONS.get("telemetry_charging_seconds") or 30),
+        "telemetry_parked_seconds": int(OPTIONS.get("telemetry_parked_seconds") or 300),
+        "telemetry_sleep_seconds": int(OPTIONS.get("telemetry_sleep_seconds") or 900),
+        "telemetry_presence_window_seconds": int(OPTIONS.get("telemetry_presence_window_seconds") or 420),
+        "telemetry_rate_limit_cooldown_seconds": int(OPTIONS.get("telemetry_rate_limit_cooldown_seconds") or 900),
         "telemetry_batch_size": int(OPTIONS.get("telemetry_batch_size") or 25),
         "telemetry_retention_days": int(OPTIONS.get("telemetry_retention_days") or 7),
         "telemetry_queue_max_events": int(OPTIONS.get("telemetry_queue_max_events") or 10000),
@@ -224,24 +252,9 @@ def write_connector_options() -> Path:
     return path
 
 
-def ocpp_env(environment: str, port: int, internal_url: str, secret: str, maximum: int) -> dict[str, str]:
-    runtime = RUNTIME / f"ocpp-{environment}"
-    runtime.mkdir(parents=True, exist_ok=True)
-    return {
-        "LEAPHUB_INTERNAL_URL": internal_url,
-        "LEAPHUB_GATEWAY_SECRET": secret,
-        "LEAPHUB_ENVIRONMENT": environment,
-        "LEAPHUB_OCPP_PORT": str(port),
-        "LEAPHUB_RUNTIME_DIR": str(runtime),
-        "LEAPHUB_STATUS_FILE": str(runtime / "status.json"),
-        "LEAPHUB_PID_FILE": str(runtime / "gateway.pid"),
-        "LEAPHUB_LOG_FILE": str(runtime / "gateway.log"),
-        "LEAPHUB_SERVICE_NAME": f"leaphub-ocpp-{environment}",
-        "LEAPHUB_GATEWAY_MODE": "home_assistant_tunnel",
-        "LEAPHUB_GATEWAY_PROVIDER": "home_assistant_tunnel",
-        "LEAPHUB_OCPP_MAX_CONNECTIONS": str(maximum),
-        "LEAPHUB_OCPP_LOG_LEVEL": LOG_LEVEL,
-    }
+def ocpp_env(port: int, beta_url: str, production_url: str, secret: str, maximum: int) -> dict[str, str]:
+    runtime = RUNTIME / "ocpp-wallbox"; runtime.mkdir(parents=True, exist_ok=True)
+    return {"LEAPHUB_BETA_INTERNAL_URL":beta_url,"LEAPHUB_PRODUCTION_INTERNAL_URL":production_url,"LEAPHUB_GATEWAY_SECRET":secret,"LEAPHUB_ENVIRONMENT":"unified","LEAPHUB_OCPP_PORT":str(port),"LEAPHUB_RUNTIME_DIR":str(runtime),"LEAPHUB_STATUS_FILE":str(runtime/"status.json"),"LEAPHUB_PID_FILE":str(runtime/"gateway.pid"),"LEAPHUB_LOG_FILE":str(runtime/"gateway.log"),"LEAPHUB_SERVICE_NAME":"leaphub-ocpp-wallbox","LEAPHUB_GATEWAY_MODE":"home_assistant_tunnel","LEAPHUB_GATEWAY_PROVIDER":"home_assistant_tunnel","LEAPHUB_OCPP_MAX_CONNECTIONS":str(maximum),"LEAPHUB_OCPP_COMMAND_POLL":"2","LEAPHUB_OCPP_COMMAND_IDLE_POLL":"10","LEAPHUB_OCPP_LOG_LEVEL":LOG_LEVEL}
 
 
 APP_DIR = Path(__file__).resolve().parent
@@ -263,7 +276,11 @@ CONNECTOR_MODULE_AVAILABLE = connector_module_available()
 connector_options = write_connector_options()
 beta_secret = str(OPTIONS.get("ocpp_beta_secret") or "").strip()
 prod_secret = str(OPTIONS.get("ocpp_production_secret") or "").strip()
+wallbox_secret = beta_secret or prod_secret
 tunnel_token = str(OPTIONS.get("tunnel_token") or "").strip()
+tunnel_protocol = str(OPTIONS.get("tunnel_protocol") or "http2").strip().lower()
+if tunnel_protocol not in {"auto", "http2", "quic"}:
+    tunnel_protocol = "http2"
 SERVICES: dict[str, ManagedService] = {
     "connector": ManagedService(
         "connector", "Connector Leapmotor", bool(OPTIONS.get("connector_enabled", True)),
@@ -272,21 +289,15 @@ SERVICES: dict[str, ManagedService] = {
         {"LEAPHUB_OPTIONS_PATH": str(connector_options)},
         "http://127.0.0.1:8094/health",
     ),
-    "ocpp_beta": ManagedService(
-        "ocpp_beta", "OCPP Beta", bool(OPTIONS.get("ocpp_beta_enabled", True)), secret_ok(beta_secret),
+    "ocpp_wallbox": ManagedService(
+        "ocpp_wallbox", "OCPP Wallbox", bool(OPTIONS.get("ocpp_beta_enabled", True)), secret_ok(wallbox_secret),
         [sys.executable, "-u", str(APP_DIR / "ocpp_gateway.py")],
-        ocpp_env("staging", 8092, str(OPTIONS.get("ocpp_beta_internal_url") or "").strip(), beta_secret, int(OPTIONS.get("ocpp_beta_max_connections") or 100)),
+        ocpp_env(8092, str(OPTIONS.get("ocpp_beta_internal_url") or "").strip(), str(OPTIONS.get("ocpp_production_internal_url") or "").strip(), wallbox_secret, max(int(OPTIONS.get("ocpp_beta_max_connections") or 100), int(OPTIONS.get("ocpp_production_max_connections") or 100))),
         "http://127.0.0.1:8092/health",
-    ),
-    "ocpp_production": ManagedService(
-        "ocpp_production", "OCPP Produção", bool(OPTIONS.get("ocpp_production_enabled", False)), secret_ok(prod_secret),
-        [sys.executable, "-u", str(APP_DIR / "ocpp_gateway.py")],
-        ocpp_env("production", 8093, str(OPTIONS.get("ocpp_production_internal_url") or "").strip(), prod_secret, int(OPTIONS.get("ocpp_production_max_connections") or 100)),
-        "http://127.0.0.1:8093/health",
     ),
     "tunnel": ManagedService(
         "tunnel", "Cloudflare Tunnel", bool(OPTIONS.get("tunnel_enabled", False)), secret_ok(tunnel_token, 40),
-        [os.getenv("LEAPHUB_CLOUDFLARED", "/usr/local/bin/cloudflared"), "tunnel", "--no-autoupdate", "--loglevel", str(OPTIONS.get("tunnel_log_level") or "info"), "run"],
+        [os.getenv("LEAPHUB_CLOUDFLARED", "/usr/local/bin/cloudflared"), "tunnel", "--no-autoupdate", "--loglevel", str(OPTIONS.get("tunnel_log_level") or "info"), "--protocol", tunnel_protocol, "run"],
         {"TUNNEL_TOKEN": tunnel_token},
         None,
     ),
@@ -296,15 +307,38 @@ SERVICES: dict[str, ManagedService] = {
 
 def telemetry_summary() -> dict[str, Any]:
     db_path = Path("/data/telemetry/telemetry.sqlite")
+    migration_marker = db_path.parent / ".journal-migration.lock"
+    if migration_marker.exists():
+        try:
+            age = max(0.0, time.time() - migration_marker.stat().st_mtime)
+        except OSError:
+            age = 0.0
+        if age <= 180:
+            return {"subscriptions": 0, "pending_events": 0, "status": "initializing"}
+        try:
+            migration_marker.unlink(missing_ok=True)
+        except OSError:
+            pass
     if not db_path.is_file():
         return {"subscriptions": 0, "pending_events": 0, "status": "waiting"}
     try:
         import sqlite3
-        with sqlite3.connect(db_path, timeout=2) as db:
+        uri = f"file:{db_path.as_posix()}?mode=ro"
+        with sqlite3.connect(uri, uri=True, timeout=0.5) as db:
+            db.execute("PRAGMA query_only=ON")
+            db.execute("PRAGMA busy_timeout=500")
             subscriptions = int(db.execute("SELECT COUNT(*) FROM subscriptions WHERE enabled=1").fetchone()[0])
             pending = int(db.execute("SELECT COUNT(*) FROM events WHERE status='pending'").fetchone()[0])
             failed = int(db.execute("SELECT COUNT(*) FROM events WHERE status='failed'").fetchone()[0])
             last = db.execute("SELECT MAX(last_success_at) FROM subscriptions").fetchone()[0]
+            command_windows = 0
+            try:
+                command_windows = int(db.execute(
+                    "SELECT COUNT(*) FROM subscriptions WHERE enabled=1 AND command_until>?",
+                    (time.time(),),
+                ).fetchone()[0])
+            except sqlite3.DatabaseError:
+                pass
             tracked = 0
             deduplicated = 0
             try:
@@ -319,11 +353,15 @@ def telemetry_summary() -> dict[str, Any]:
             "failed_events": failed,
             "tracked_vehicles": tracked,
             "deduplicated_events": deduplicated,
+            "command_windows": command_windows,
             "last_success_at": last,
             "status": "active" if subscriptions else "waiting",
         }
     except Exception as exc:
-        return {"subscriptions": 0, "pending_events": 0, "status": "degraded", "message": str(exc)[:160]}
+        message = str(exc)[:160]
+        if "locked" in message.lower() or "busy" in message.lower():
+            return {"subscriptions": 0, "pending_events": 0, "status": "initializing", "message": message}
+        return {"subscriptions": 0, "pending_events": 0, "status": "degraded", "message": message}
 
 def status_payload(include_logs: bool = True) -> dict[str, Any]:
     result: dict[str, Any] = {
@@ -370,15 +408,15 @@ main{max-width:1180px;margin:auto;padding:24px}.hero{display:flex;gap:18px;align
 details{margin-top:12px}summary{cursor:pointer;color:var(--muted)}pre{white-space:pre-wrap;word-break:break-word;background:#050c15;border:1px solid var(--line);border-radius:12px;padding:12px;max-height:260px;overflow:auto;color:#bcd0e8;font-size:12px}.wide{grid-column:1/-1}.routes{display:grid;grid-template-columns:1fr auto;gap:8px}.routes code{background:#050c15;border:1px solid var(--line);border-radius:10px;padding:9px;overflow:auto}.notice{border-left:3px solid var(--blue);padding:10px 12px;background:rgba(85,167,255,.08);border-radius:10px;color:#cfe4ff}.foot{color:var(--muted);text-align:center;padding:20px}
 @media(max-width:760px){main{padding:14px}.grid{grid-template-columns:1fr}.hero{align-items:flex-start}.badge{display:none}.meta{grid-template-columns:1fr 1fr}.routes{grid-template-columns:1fr}}
 </style></head><body><main>
-<div class="hero"><div class="mark">LH</div><div><h1>Leap Hub Gateway</h1><p class="sub">Telemetria resiliente, Connector, OCPP e Cloudflare em um único App</p></div><span class="badge">v1.11.76</span></div>
+<div class="hero"><div class="mark">LH</div><div><h1>Leap Hub Gateway</h1><p class="sub">Telemetria resiliente, Connector, OCPP e Cloudflare em um único App</p></div><span class="badge">v1.12.01</span></div>
 <div class="grid" id="cards"></div>
-<section class="card wide" style="margin-top:16px"><div class="head"><div><h2>Rotas do Cloudflare Tunnel</h2><p>Como o Tunnel roda dentro do mesmo App, use 127.0.0.1 nas origens.</p></div></div><div class="routes"><code>connector.leaphub.com.br → http://127.0.0.1:8094</code><span>Connector</span><code>ocpp-beta.leaphub.com.br → http://127.0.0.1:8092</code><span>OCPP Beta</span><code>ocpp.leaphub.com.br → http://127.0.0.1:8093</code><span>Produção</span></div><p class="notice">A fila de telemetria sobrevive a reinícios do App. Uma queda do Home Assistant inteiro ainda cria uma lacuna real, que nunca será preenchida com dados inventados.</p></section>
+<section class="card wide" style="margin-top:16px"><div class="head"><div><h2>Rotas do Cloudflare Tunnel</h2><p>Como o Tunnel roda dentro do mesmo App, use 127.0.0.1 nas origens.</p></div></div><div class="routes"><code>connector.leaphub.com.br → http://127.0.0.1:8094</code><span>Connector</span><code>ocpp-wallbox.leaphub.com.br → http://127.0.0.1:8092</code><span>OCPP Wallbox · Beta e Produção</span></div><p class="notice">A fila de telemetria sobrevive a reinícios do App. Uma queda do Home Assistant inteiro ainda cria uma lacuna real, que nunca será preenchida com dados inventados.</p></section>
 <div class="foot">Tokens e chaves nunca são exibidos neste painel.</div></main><script>
-const token='__TOKEN__';const labels={connector:'Connector Leapmotor',ocpp_beta:'OCPP Beta',ocpp_production:'OCPP Produção',tunnel:'Cloudflare Tunnel'};
+const token='__TOKEN__';const labels={connector:'Connector Leapmotor',ocpp_wallbox:'OCPP Wallbox',tunnel:'Cloudflare Tunnel'};
 function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 async function action(name,kind){const b=document.querySelector(`[data-action="${name}-${kind}"]`);if(b)b.disabled=true;try{const r=await fetch(`api/services/${name}/${kind}`,{method:'POST',headers:{'X-LeapHub-UI-Token':token}});const j=await r.json();alert(j.message||'Concluído');await load()}catch(e){alert('Falha: '+e)}finally{if(b)b.disabled=false}}
 function card(name,s){const health=s.health||{};const logs=(s.logs||[]).join('\n');return `<article class="card"><div class="head"><div><h2>${esc(labels[name]||s.label)}</h2><p>${s.configured?'Configuração pronta':'Configuração pendente'}</p></div><span class="state ${esc(s.state)}">${esc(s.state.replaceAll('_',' '))}</span></div><div class="meta"><div>Saúde<strong>${health.ok?'OK':'Atenção'}</strong></div><div>PID<strong>${esc(s.pid||'—')}</strong></div><div>Reinícios<strong>${esc(s.restarts)}</strong></div></div><div class="actions"><button class="btn" data-action="${name}-test" onclick="action('${name}','test')">Testar</button><button class="btn secondary" data-action="${name}-restart" onclick="action('${name}','restart')" ${!s.enabled||!s.configured?'disabled':''}>Reiniciar serviço</button></div><details><summary>Logs recentes</summary><pre>${esc(logs||'Sem logs nesta inicialização.')}</pre></details></article>`}
-function telemetryCard(t){return `<article class="card"><div class="head"><div><h2>Telemetria contínua</h2><p>Sincronização ordenada, deduplicação e fila persistente</p></div><span class="state ${t.status==='active'?'running':'disabled'}">${esc(t.status||'waiting')}</span></div><div class="meta"><div>Veículos<strong>${esc(t.tracked_vehicles||0)}</strong></div><div>Pendentes<strong>${esc(t.pending_events||0)}</strong></div><div>Leituras repetidas evitadas<strong>${esc(t.deduplicated_events||0)}</strong></div></div><p class="notice">Última coleta: ${esc(t.last_success_at||'aguardando veículo')} · Falhas permanentes: ${esc(t.failed_events||0)}</p></article>`}
+function telemetryCard(t){return `<article class="card"><div class="head"><div><h2>Telemetria contínua</h2><p>Sincronização ordenada, deduplicação e fila persistente</p></div><span class="state ${t.status==='active'?'running':'disabled'}">${esc(t.status||'waiting')}</span></div><div class="meta"><div>Veículos<strong>${esc(t.tracked_vehicles||0)}</strong></div><div>Pendentes<strong>${esc(t.pending_events||0)}</strong></div><div>Confirmação de comando<strong>${esc(t.command_windows||0)}</strong></div></div><p class="notice">Última coleta: ${esc(t.last_success_at||'aguardando veículo')} · Leituras repetidas evitadas: ${esc(t.deduplicated_events||0)} · Falhas permanentes: ${esc(t.failed_events||0)}</p></article>`}
 async function load(){const r=await fetch('api/status',{cache:'no-store'});const j=await r.json();document.getElementById('cards').innerHTML=Object.entries(j.services).map(([n,s])=>card(n,s)).join('')+telemetryCard(j.telemetry||{})}
 load();setInterval(load,5000);
 </script></body></html>'''

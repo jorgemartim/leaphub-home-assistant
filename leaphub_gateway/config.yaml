@@ -1,5 +1,5 @@
 name: "Leap Hub Gateway"
-version: "1.11.76"
+version: "1.12.01"
 slug: "leaphub_gateway"
 description: "Gateway unificado com sincronização automática adaptativa, fila persistente, Leapmotor, OCPP e Cloudflare Tunnel."
 url: "https://github.com/jorgemartim/leaphub-home-assistant"
@@ -21,8 +21,8 @@ ports:
   8094/tcp: null
   8099/tcp: null
 ports_description:
-  8092/tcp: "OCPP Beta (origem do Cloudflare Tunnel)"
-  8093/tcp: "OCPP Produção (origem do Cloudflare Tunnel)"
+  8092/tcp: "OCPP Wallbox único (Beta e Produção)"
+  8093/tcp: "Porta legada OCPP (não usada em novas instalações)"
   8094/tcp: "Connector Leapmotor (origem do Cloudflare Tunnel)"
   8099/tcp: "Painel interno Ingress"
 watchdog: "http://[HOST]:[PORT:8099]/health"
@@ -31,18 +31,20 @@ options:
   staging_secret: ""
   production_secret: ""
   connector_max_parallel: 2
-  connector_manual_wait_seconds: 20
+  connector_manual_wait_seconds: 35
   telemetry_beta_enabled: true
   telemetry_beta_internal_url: "https://leaphub.com.br/beta/leap/api/internal/telemetry/events"
   telemetry_production_enabled: false
   telemetry_production_internal_url: "https://leaphub.com.br/leap/api/internal/telemetry/events"
   telemetry_active_seconds: 30
   telemetry_interactive_seconds: 20
+  telemetry_command_seconds: 3
+  telemetry_command_max_polls: 8
   telemetry_charging_seconds: 30
   telemetry_parked_seconds: 300
   telemetry_sleep_seconds: 900
   telemetry_presence_window_seconds: 420
-  telemetry_rate_limit_cooldown_seconds: 21600
+  telemetry_rate_limit_cooldown_seconds: 900
   telemetry_batch_size: 25
   telemetry_retention_days: 7
   telemetry_queue_max_events: 10000
@@ -57,6 +59,7 @@ options:
   tunnel_enabled: false
   tunnel_token: ""
   tunnel_log_level: "info"
+  tunnel_protocol: "http2"
   log_level: "INFO"
   dashboard_log_lines: 80
 schema:
@@ -71,11 +74,13 @@ schema:
   telemetry_production_internal_url: url
   telemetry_active_seconds: "int(15,300)"
   telemetry_interactive_seconds: "int(15,60)"
+  telemetry_command_seconds: "int(3,10)"
+  telemetry_command_max_polls: "int(4,12)"
   telemetry_charging_seconds: "int(15,600)"
   telemetry_parked_seconds: "int(60,3600)"
   telemetry_sleep_seconds: "int(300,14400)"
   telemetry_presence_window_seconds: "int(300,1800)"
-  telemetry_rate_limit_cooldown_seconds: "int(1800,86400)"
+  telemetry_rate_limit_cooldown_seconds: "int(300,21600)"
   telemetry_batch_size: "int(1,50)"
   telemetry_retention_days: "int(1,60)"
   telemetry_queue_max_events: "int(100,100000)"
@@ -90,5 +95,6 @@ schema:
   tunnel_enabled: bool
   tunnel_token: "password?"
   tunnel_log_level: "list(debug|info|warn|error|fatal)"
+  tunnel_protocol: "list(http2|auto|quic)"
   log_level: "list(DEBUG|INFO|WARNING|ERROR)"
   dashboard_log_lines: "int(20,300)"

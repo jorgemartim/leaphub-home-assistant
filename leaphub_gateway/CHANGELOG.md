@@ -1,3 +1,175 @@
+## 1.12.01
+
+- Adiciona cancelamento protegido de comandos antes do envio à nuvem.
+- Cancela timers de retomada e filas de autenticação sem interromper ações já iniciadas.
+- Mantém o diário persistente com estado terminal `cancelled`.
+- A API informa quando o comando já passou do ponto seguro de cancelamento.
+
+## 1.11.99
+
+- Mantém filas independentes por conta Leapmotor; uma conta não bloqueia as demais.
+- Dá prioridade global aos comandos manuais sobre leituras automáticas de telemetria.
+- Preserva o limite total configurado para proteger CPU, memória e a nuvem Leapmotor.
+- Aceita configurações antigas de cooldown de 21600 segundos e limita o valor internamente.
+- Expõe apenas contadores agregados do limitador no diagnóstico, sem e-mail, VIN ou credenciais.
+
+## 1.11.95
+
+- Reduz cooldown geral sem `Retry-After` de seis horas para quinze minutos, com limite máximo de uma hora.
+- Reavalia cooldowns antigos excessivos em cinco minutos após a atualização.
+- Mantém o bloqueio de login de dois minutos separado do limite geral da API.
+- Não repete autenticação ou comando durante a pausa.
+
+## 1.11.94
+
+- Climatização pós-despertar com verificação fresca e uma única repetição idempotente.
+- Estados de progresso não finalizam o comando antes do worker.
+- Timeout temporário é verificado antes de qualquer repetição.
+
+## 1.11.93
+
+- Corrige `try again in 2 minutes` para cerca de 135 segundos, nunca 30 minutos ou 6 horas.
+- Classifica o bloqueio diretamente no login da telemetria antes do limitador geral de API.
+- Limita cooldown de autenticação a cinco minutos e mantém limites gerais separados.
+- Limpa automaticamente cooldowns inválidos gravados pela 1.11.92.
+- Remove o cooldown assim que uma sessão ou comando autentica com sucesso.
+- Repara diários `waiting_auth` antigos para permitir retomada segura após atualização.
+- Mantém VIN, PIN, senha, token e certificados fora dos logs.
+
+## 1.11.92
+
+- Reconhece `Password error limit has reached maximum` como bloqueio temporário, não como senha inválida.
+- Extrai o prazo informado pela Leapmotor e impede qualquer novo login antes desse horário.
+- Mantém o comando no estado `waiting_auth` e o retoma automaticamente após o cooldown.
+- Compartilha a proteção com a telemetria para evitar logins concorrentes da mesma conta.
+- Preserva credenciais, fila e sessão válida; não desconecta a conta por limite temporário.
+- A resposta de status inclui contagem regressiva segura sem e-mail, VIN, PIN, token ou senha.
+
+## 1.11.91
+
+- Introduz o estado `sent`: a entrega termina quando a nuvem aceita a ação, enquanto a confirmação física continua separadamente.
+- Evita que a tela permaneça carregando até o carro travar novamente sozinho.
+- Mantém o diário idempotente: consultar `sent` nunca repete o comando.
+- Climatização faz uma última leitura depois da única repetição idempotente protegida.
+- Quando a nuvem aceita, mas o ar continua desligado, retorna o diagnóstico seguro `climate_not_applied_after_retry`.
+- Logs distinguem envio, confirmação e estado não aplicado sem expor conta, token, VIN ou PIN.
+
+## 1.11.90
+
+- Detecta expiração da sessão especificamente durante `cert/sync`, antes do envio da ação.
+- Descarta a sessão compartilhada inválida e faz uma única autenticação limpa para repetir o comando com segurança.
+- Não repete comandos quando o erro acontece depois do possível aceite pela nuvem.
+- Mantém fila prioritária e trava exclusiva por conta.
+- Expõe diagnóstico seguro de recuperação de sessão sem tokens, PIN, VIN ou credenciais.
+
+## 1.11.89
+
+- Comandos manuais entram em fila prioritária por conta antes de aguardar a telemetria.
+- Uma leitura já iniciada pode terminar, mas nenhuma nova leitura da mesma conta começa enquanto houver comando pendente.
+- O comando não falha mais após 60 segundos: aguarda a conta por uma janela protegida de até 180 segundos.
+- A vaga global do Connector só é ocupada depois que a conta fica livre, evitando bloquear outras contas.
+- Logs registram tempo de fila e tipo seguro do ocupante da conta, sem e-mail, VIN, PIN ou credenciais.
+- Novos estados `waiting_account` e `waiting_slot` distinguem fila da conta e fila global.
+
+## 1.11.88
+
+- Corrigido logger indefinido no caminho de verificação do comando remoto.
+- O tratamento de erro de confirmação não pode mais gerar uma segunda exceção.
+- Climatização repete uma única vez a ação idempotente quando o carro acorda, mas a leitura direta falha.
+- Logs preservam o erro original sem expor credenciais, VIN ou PIN.
+
+## 1.11.87
+
+- Sessão Leapmotor reutilizada entre telemetria e comandos sob trava por conta.
+- Removido o encerramento preventivo que provocava nova validação antes do comando.
+- Cache da última lista válida de veículos para resolver o VIN sem chamada adicional.
+- Estado `cloud_accepted` somente após a ação realmente ser enviada.
+- Persistência de nonce com WAL, busy timeout e novas tentativas limitadas.
+
+## 1.11.86
+
+- climatização verifica uma leitura fresca e pode repetir uma única vez somente `climate_on`/`climate_off`;
+- comandos confirmados diretamente passam a `completed`;
+- janela de telemetria de comando ampliada para 180 segundos;
+- logs distinguem envio, retry idempotente, confirmação direta e confirmação por telemetria;
+- telemetria registra quando o veículo-alvo não aparece na assinatura.
+
+## 1.11.85
+
+- elimina a disputa de SQLite causada por `PRAGMA journal_mode` e criação de tabelas em cada consulta de comando;
+- adiciona cache idempotente em memória com persistência best-effort para status de comandos;
+- impede `BrokenPipeError` de virar falso HTTP 500 quando o Cloudflare encerra uma conexão;
+- reduz a latência da proteção anti-replay e mantém segurança em memória durante lock temporário;
+- usa resumo de saúde não bloqueante para não derrubar o watchdog durante uma coleta;
+- adiciona protocolo configurável do Cloudflare Tunnel e usa HTTP/2 por padrão em redes com QUIC instável.
+
+## 1.11.84
+
+- Corrigida concorrência do SQLite durante a inicialização do Connector.
+- Painel passa a respeitar a janela de migração e usa conexão somente leitura.
+- Migração de journal agora é idempotente e tolera travas curtas.
+
+## 1.11.83
+
+- Corrige `sqlite3.OperationalError: unable to open database file` na fila persistente.
+- Migra o SQLite de WAL para journal tradicional, adequado ao acesso serializado do Gateway.
+- Valida escrita e permissões em `/data/telemetry` antes de iniciar.
+- Adiciona recuperação automática e recuo progressivo, eliminando tempestade de logs.
+- Expõe saúde do armazenamento no diagnóstico do Connector.
+- Repassa `telemetry_command_max_polls` e corrige o padrão estacionado para 300 segundos.
+
+## 1.11.82
+
+- Comando direto primeiro: o próprio endpoint remoto tenta acordar e executar, como no aplicativo oficial.
+- Despertar separado somente após resposta explícita de veículo dormindo ou offline.
+- Sessão limpa entre o despertar e a ação para evitar que o token de wake invalide o comando.
+- Estados persistentes de fila, preparação, despertar, reconexão, execução e confirmação.
+- Telemetria pós-comando liberada poucos segundos após a ação, sem esperar o ciclo normal.
+- Nenhum comando ambíguo é reenviado automaticamente.
+
+## 1.11.81
+
+- Comandos remotos entram em fila prioritária e retornam imediatamente ao Leap Hub.
+- Execução continua em segundo plano com trava por conta, idempotência e diário persistente.
+- Novo endpoint protegido permite acompanhar processamento, sucesso ou falha sem reenviar a ação.
+- Telemetria cede a conta enquanto houver comando pendente e retoma após estabilização.
+- Reinício do App não autoriza repetição automática de um comando ainda indefinido.
+
+## 1.11.80
+
+- Trata perda de token somente na consulta do resultado como comando já aceito, sem reenviar a ação.
+- Aguarda a estabilização da sessão antes de retomar telemetria após comandos remotos.
+- Telemetria cede a conta em pontos seguros quando existe comando manual aguardando.
+- Reduz o timeout das leituras automáticas e amplia a espera do comando manual.
+- Remove VIN e valores criptográficos dos logs e higieniza registros antigos.
+- Adiciona diário persistente por identificador de solicitação para impedir repetição após perda da resposta HTTP.
+
+## 1.11.79
+
+- Corrige comandos remotos que recebiam `car_id` no lugar do VIN e terminavam em HTTP 422.
+- Aceita VIN protegido enviado pelo Leap Hub e mantém compatibilidade com instalações antigas resolvendo `car_id` internamente.
+- Encerra a sessão automática antes do login manual, evitando dois tokens sobrepostos e respostas `Information verification failed`.
+- Registra a causa sanitizada de erros 422 sem expor VIN, PIN, senha, certificados ou chaves.
+- Mantém confirmação adaptativa e proteção contra comandos duplicados.
+
+## 1.11.78
+
+- Confirmação de comandos com cadência adaptativa em 3, 6, 10 e 15 segundos.
+- Encerra a janela rápida quando o estado esperado é confirmado ou quando o orçamento seguro é atingido.
+- Comandos manuais recebem prioridade sobre telemetria automática.
+- Consultas de confirmação ficam limitadas ao veículo afetado e não carregam mensagens da conta.
+- A sessão automática é renovada de forma controlada após um login manual, evitando conflito de token.
+
+## 1.11.77
+
+- Comandos remotos tentam acordar o veículo antes da execução quando a biblioteca instalada oferece essa função.
+- O próprio comando continua sendo enviado quando não existe um método de despertar separado, porque a nuvem pode acordar e executar na mesma chamada.
+- Repete apenas respostas explícitas de veículo dormindo, offline ou ainda não pronto; timeouts ambíguos não são repetidos para evitar comandos duplicados.
+- Cria uma janela de confirmação de 90 segundos com leitura a cada 3 segundos após um comando remoto.
+- Corrige o repasse das opções de janela interativa, presença e confirmação de comando ao processo de telemetria.
+- A janela de confirmação continua ativa mesmo quando o usuário fecha ou troca de tela.
+- Mantém os intervalos adaptativos normais fora dessa janela para reduzir risco de limitação da conta.
+
 ## Hotfix de sessão e OCPP 1.11.75
 
 - Corrige status OCPP e reduz recriações de sessão durante navegação.
