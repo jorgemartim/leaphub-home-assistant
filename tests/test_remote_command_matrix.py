@@ -33,6 +33,10 @@ expected_methods = {
     "unlock_charger": "unlock_charger",
     "set_charge_limit": "set_charge_limit",
     "send_destination": "send_destination",
+    "steering_wheel_heat_on": "steering_wheel_heat_on",
+    "steering_wheel_heat_off": "steering_wheel_heat_off",
+    "rearview_mirror_heat_on": "rearview_mirror_heat_on",
+    "rearview_mirror_heat_off": "rearview_mirror_heat_off",
 }
 
 failures: list[str] = []
@@ -41,9 +45,9 @@ def check(condition: bool, message: str) -> None:
     if not condition:
         failures.append(message)
 
-check(connector.CONNECTOR_VERSION == "1.12.10", "Versão do Connector divergente")
+check(connector.CONNECTOR_VERSION == "1.12.11", "Versão do Connector divergente")
 check(connector.COMMAND_METHODS == expected_methods, "Matriz COMMAND_METHODS divergente")
-check(len(connector.COMMAND_METHODS) == 21, "A matriz precisa conter 21 comandos")
+check(len(connector.COMMAND_METHODS) == 25, "A matriz precisa conter 25 comandos")
 check(connector.CLIMATE_VERIFY_COMMANDS == {"climate_on", "climate_off", "quick_cool", "quick_heat"}, "Conjunto de confirmação climática divergente")
 check(connector.SAFE_STATE_RETRY_COMMANDS == {"climate_on", "climate_off"}, "Retry seguro climático divergente")
 
@@ -55,6 +59,8 @@ pairs = [
     ("battery_preheat_on", "battery_preheat_off"),
     ("start_charging", "stop_charging"),
     ("climate_on", "climate_off"),
+    ("steering_wheel_heat_on", "steering_wheel_heat_off"),
+    ("rearview_mirror_heat_on", "rearview_mirror_heat_off"),
 ]
 for left, right in pairs:
     check(left in connector.COMMAND_METHODS and right in connector.COMMAND_METHODS, f"Par ausente: {left}/{right}")

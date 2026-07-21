@@ -27,7 +27,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable
 
-CONNECTOR_VERSION = "1.12.10"
+CONNECTOR_VERSION = "1.12.11"
 MAX_INPUT_BYTES = 1024 * 1024
 logging.getLogger("leapmotor_api").setLevel(logging.WARNING)
 LOGGER = logging.getLogger("leaphub.connector")
@@ -66,6 +66,10 @@ COMMAND_METHODS: dict[str, str] = {
     "unlock_charger": "unlock_charger",
     "set_charge_limit": "set_charge_limit",
     "send_destination": "send_destination",
+    "steering_wheel_heat_on": "steering_wheel_heat_on",
+    "steering_wheel_heat_off": "steering_wheel_heat_off",
+    "rearview_mirror_heat_on": "rearview_mirror_heat_on",
+    "rearview_mirror_heat_off": "rearview_mirror_heat_off",
 }
 
 
@@ -1685,9 +1689,23 @@ def serialize_vehicle(
     raw_abilities = attribute(vehicle, "abilities", []) or []
     raw_rights = attribute(vehicle, "rights", []) or []
     raw_module_rights = attribute(vehicle, "module_rights", []) or []
-    abilities = [str(value_of(item)) for item in raw_abilities]
-    rights = [str(value_of(item)) for item in raw_rights]
-    module_rights = [str(value_of(item)) for item in raw_module_rights]
+
+    def capability_label(item: Any) -> str:
+        parts: list[str] = []
+        for candidate in (
+            value_of(item),
+            attribute(item, "name"),
+            attribute(item, "description"),
+            str(item),
+        ):
+            value = " ".join(str(candidate or "").split()).strip()
+            if value and value not in parts:
+                parts.append(value[:120])
+        return " | ".join(parts)[:240]
+
+    abilities = [label for item in raw_abilities if (label := capability_label(item))]
+    rights = [label for item in raw_rights if (label := capability_label(item))]
+    module_rights = [label for item in raw_module_rights if (label := capability_label(item))]
     vehicle_scalars = object_scalar_map(vehicle)
     exterior_color = first_text(
         attribute(vehicle, "out_color"),

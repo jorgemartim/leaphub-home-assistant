@@ -1,3 +1,9 @@
+## 1.12.11
+
+- Volante e retrovisores aquecidos orientados por capacidade.
+- Metadados completos de permissões e confirmação por telemetria.
+- Sem alteração em fila, cooldown ou OCPP.
+
 ## 1.12.10
 
 - Contrato automatizado para todos os comandos remotos.

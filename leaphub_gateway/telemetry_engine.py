@@ -24,7 +24,7 @@ from cryptography.fernet import Fernet, InvalidToken
 import leaphub_connector as connector
 
 LOG = logging.getLogger("leaphub.telemetry")
-ENGINE_VERSION = "1.12.10"
+ENGINE_VERSION = "1.12.11"
 
 
 def utc_iso() -> str:
@@ -1732,6 +1732,20 @@ class TelemetryEngine:
             state = self._command_bool(details.get("battery_preheat"))
             expected = command == "battery_preheat_on"
             return (state is expected, state is not None)
+        if command in {"steering_wheel_heat_on", "steering_wheel_heat_off"}:
+            seat = telemetry.get("seat_comfort") if isinstance(telemetry.get("seat_comfort"), dict) else {}
+            state = self._command_bool(seat.get("steering_wheel_heating"))
+            expected = command == "steering_wheel_heat_on"
+            return (state is expected, state is not None)
+        if command in {"rearview_mirror_heat_on", "rearview_mirror_heat_off"}:
+            mirrors = telemetry.get("mirrors") if isinstance(telemetry.get("mirrors"), dict) else {}
+            known = [self._command_bool(mirrors.get(key)) for key in ("left_heating", "right_heating") if key in mirrors]
+            known = [value for value in known if value is not None]
+            if not known:
+                return False, False
+            active = any(known)
+            expected = command == "rearview_mirror_heat_on"
+            return (active is expected, True)
         if command in {"trunk_open", "trunk_close"}:
             doors = telemetry.get("doors") if isinstance(telemetry.get("doors"), dict) else {}
             state = self._command_bool(doors.get("trunk"))
