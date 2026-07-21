@@ -1,3 +1,7 @@
+## 1.12.08
+
+- Telemetria opcional de temperatura por pneu, sem estimativas.
+
 ## 1.12.07
 
 - Prioridade manual antes do login automático e retomada idempotente após cooldown.

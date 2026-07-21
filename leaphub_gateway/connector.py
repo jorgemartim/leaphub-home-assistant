@@ -27,7 +27,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable
 
-CONNECTOR_VERSION = "1.12.07"
+CONNECTOR_VERSION = "1.12.08"
 MAX_INPUT_BYTES = 1024 * 1024
 logging.getLogger("leapmotor_api").setLevel(logging.WARNING)
 LOGGER = logging.getLogger("leaphub.connector")
@@ -573,6 +573,39 @@ def scalar_map(data: Any, depth: int = 0) -> dict[str, Any]:
             for child_key, child_value in scalar_map(value, depth + 1).items():
                 result.setdefault(child_key, child_value)
     return result
+
+
+def tire_temperature_c(value: Any) -> float | None:
+    """Normalize a temperature only when the vehicle actually reports one."""
+    parsed = numeric(value)
+    if parsed is None:
+        return None
+    if abs(parsed) > 200 and abs(parsed) <= 2000:
+        parsed /= 10
+    return round(parsed, 1) if -60 <= parsed <= 150 else None
+
+
+def tire_metrics(tires: Any, status: Any) -> tuple[dict[str, float | None], dict[str, float]]:
+    """Keep pressure compatibility and publish optional per-wheel temperature."""
+    pressures = attribute(tires, "all_bar", {})
+    if not isinstance(pressures, dict):
+        pressures = {}
+    scalars = object_scalar_map(tires)
+    for key, value in object_scalar_map(attribute(status, "raw", {})).items():
+        scalars.setdefault(key, value)
+    aliases = {
+        "front_left": ("leftFrontTireTemperature", "frontLeftTireTemperature", "leftFrontTireTemp", "frontLeftTireTemp", "lfTireTemperature", "lfTireTemp"),
+        "front_right": ("rightFrontTireTemperature", "frontRightTireTemperature", "rightFrontTireTemp", "frontRightTireTemp", "rfTireTemperature", "rfTireTemp"),
+        "rear_left": ("leftRearTireTemperature", "rearLeftTireTemperature", "leftRearTireTemp", "rearLeftTireTemp", "lrTireTemperature", "rlTireTemp"),
+        "rear_right": ("rightRearTireTemperature", "rearRightTireTemperature", "rightRearTireTemp", "rearRightTireTemp", "rrTireTemperature", "rrTireTemp"),
+    }
+    temperatures: dict[str, float] = {}
+    for position, names in aliases.items():
+        direct = first_numeric(*(attribute(tires, name, None) for name in names))
+        value = tire_temperature_c(direct if direct is not None else mapping_pick(scalars, names))
+        if value is not None:
+            temperatures[position] = value
+    return {key: numeric(value) for key, value in pressures.items()}, temperatures
 
 
 def maintenance_item(data: dict[str, Any], kind: str, source: str) -> dict[str, Any] | None:
@@ -1704,9 +1737,7 @@ def serialize_vehicle(
     security = attribute(status, "security")
     ignition = attribute(status, "ignition")
 
-    tire_data = attribute(tires, "all_bar", {})
-    if not isinstance(tire_data, dict):
-        tire_data = {}
+    tire_data, tire_temperature_data = tire_metrics(tires, status)
 
     speed_value = numeric(attribute(driving, "speed"))
     parked_value = bool_or_none(attribute(status, "is_parked")) if attribute(status, "is_parked") is not None else bool_or_none(attribute(driving, "is_parked"))
@@ -2136,7 +2167,8 @@ def serialize_vehicle(
             "climate": climate_state,
             "charging": charge_state_details,
         },
-        "tire_data": {key: numeric(value) for key, value in tire_data.items()},
+        "tire_data": tire_data,
+        "tire_temperature_data": tire_temperature_data,
         "captured_at": captured_at,
         "cloud_raw_redacted": redacted_cloud_raw({
             "vehicle": attribute(vehicle, "raw", {}),
