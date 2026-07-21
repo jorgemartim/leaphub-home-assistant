@@ -1,3 +1,9 @@
+## 1.12.10
+
+- Contrato automatizado para todos os comandos remotos.
+- Testes de cooldown, redaction e pares de ações opostas.
+- Sem alteração no comportamento operacional do Gateway.
+
 ## 1.12.09
 
 - Contrato versionado, rastreabilidade e diagnóstico de compatibilidade Hub ↔ Gateway.
