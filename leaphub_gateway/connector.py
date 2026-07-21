@@ -27,7 +27,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable
 
-CONNECTOR_VERSION = "1.12.03"
+CONNECTOR_VERSION = "1.12.09"
 MAX_INPUT_BYTES = 1024 * 1024
 logging.getLogger("leapmotor_api").setLevel(logging.WARNING)
 LOGGER = logging.getLogger("leaphub.connector")
@@ -573,6 +573,39 @@ def scalar_map(data: Any, depth: int = 0) -> dict[str, Any]:
             for child_key, child_value in scalar_map(value, depth + 1).items():
                 result.setdefault(child_key, child_value)
     return result
+
+
+def tire_temperature_c(value: Any) -> float | None:
+    """Normalize a temperature only when the vehicle actually reports one."""
+    parsed = numeric(value)
+    if parsed is None:
+        return None
+    if abs(parsed) > 200 and abs(parsed) <= 2000:
+        parsed /= 10
+    return round(parsed, 1) if -60 <= parsed <= 150 else None
+
+
+def tire_metrics(tires: Any, status: Any) -> tuple[dict[str, float | None], dict[str, float]]:
+    """Keep pressure compatibility and publish optional per-wheel temperature."""
+    pressures = attribute(tires, "all_bar", {})
+    if not isinstance(pressures, dict):
+        pressures = {}
+    scalars = object_scalar_map(tires)
+    for key, value in object_scalar_map(attribute(status, "raw", {})).items():
+        scalars.setdefault(key, value)
+    aliases = {
+        "front_left": ("leftFrontTireTemperature", "frontLeftTireTemperature", "leftFrontTireTemp", "frontLeftTireTemp", "lfTireTemperature", "lfTireTemp"),
+        "front_right": ("rightFrontTireTemperature", "frontRightTireTemperature", "rightFrontTireTemp", "frontRightTireTemp", "rfTireTemperature", "rfTireTemp"),
+        "rear_left": ("leftRearTireTemperature", "rearLeftTireTemperature", "leftRearTireTemp", "rearLeftTireTemp", "lrTireTemperature", "rlTireTemp"),
+        "rear_right": ("rightRearTireTemperature", "rearRightTireTemperature", "rightRearTireTemp", "rearRightTireTemp", "rrTireTemperature", "rrTireTemp"),
+    }
+    temperatures: dict[str, float] = {}
+    for position, names in aliases.items():
+        direct = first_numeric(*(attribute(tires, name, None) for name in names))
+        value = tire_temperature_c(direct if direct is not None else mapping_pick(scalars, names))
+        if value is not None:
+            temperatures[position] = value
+    return {key: numeric(value) for key, value in pressures.items()}, temperatures
 
 
 def maintenance_item(data: dict[str, Any], kind: str, source: str) -> dict[str, Any] | None:
@@ -1704,9 +1737,7 @@ def serialize_vehicle(
     security = attribute(status, "security")
     ignition = attribute(status, "ignition")
 
-    tire_data = attribute(tires, "all_bar", {})
-    if not isinstance(tire_data, dict):
-        tire_data = {}
+    tire_data, tire_temperature_data = tire_metrics(tires, status)
 
     speed_value = numeric(attribute(driving, "speed"))
     parked_value = bool_or_none(attribute(status, "is_parked")) if attribute(status, "is_parked") is not None else bool_or_none(attribute(driving, "is_parked"))
@@ -2136,7 +2167,8 @@ def serialize_vehicle(
             "climate": climate_state,
             "charging": charge_state_details,
         },
-        "tire_data": {key: numeric(value) for key, value in tire_data.items()},
+        "tire_data": tire_data,
+        "tire_temperature_data": tire_temperature_data,
         "captured_at": captured_at,
         "cloud_raw_redacted": redacted_cloud_raw({
             "vehicle": attribute(vehicle, "raw", {}),
@@ -2430,7 +2462,24 @@ def resolve_command_vehicle(
     return resolved_vin, vehicles, source
 
 
-def execute_vehicle_command(method: Any, command: str, vehicle_id: str, parameters: dict[str, Any]) -> Any:
+def execute_vehicle_command(
+    method: Any,
+    command: str,
+    vehicle_id: str,
+    parameters: dict[str, Any],
+    climate_profile: str = "generic",
+) -> Any:
+    # climate_off is dispatched through ac_switch whenever the installed
+    # library supports it.  The C10 can keep a rapid cooling/heating profile
+    # active when the generic ac_off mapping is used, even though the cloud
+    # acknowledges the request.  Sending operate=close with the active profile
+    # mirrors the current HVAC mode and is still state-idempotent.
+    if command == "climate_off":
+        try:
+            return method(vehicle_id, params=climate_close_parameters(climate_profile))
+        except TypeError:
+            # Compatibility with older libraries that expose only ac_off(vin).
+            return method(vehicle_id)
     if command == "set_charge_limit":
         value = int(parameters.get("charge_limit_percent", 80))
         if value < 50 or value > 100 or value % 5 != 0:
@@ -2492,6 +2541,11 @@ def climate_profile_from_status(climate: Any) -> str:
     if bool_or_none(attribute(climate, "rapid_cooling")) is True:
         return "cooling"
     if bool_or_none(attribute(climate, "rapid_heating")) is True:
+        return "heating"
+    if bool_or_none(attribute(climate, "is_windshield_defrost_active")) is True:
+        return "heating"
+    windshield = numeric(attribute(climate, "windshield_defrost"))
+    if windshield in (1, 2):
         return "heating"
 
     mode_number = numeric(attribute(climate, "climate_mode"))
@@ -2757,6 +2811,8 @@ def handle_command(
     verification_samples = 0
     execution_warning: str | None = None
     safe_retry_strategy: str | None = None
+    active_climate_profile = "generic"
+    climate_dispatch_strategy: str | None = None
     command_dispatched = False
     cloud_accepted = False
     command_started_at = time.time()
@@ -2792,6 +2848,12 @@ def handle_command(
             resolved_id, vehicles, source = resolve_command_vehicle(client, vehicle_id, vehicle_vin)
         method_name = COMMAND_METHODS[command]
         selected_method = getattr(client, method_name, None)
+        if command == "climate_off":
+            # Prefer the explicit climate switch endpoint because it accepts a
+            # mode-aware close payload.  Keep ac_off as compatibility fallback.
+            mode_aware_method = getattr(client, "ac_switch", None)
+            if callable(mode_aware_method):
+                selected_method = mode_aware_method
         if not callable(selected_method):
             raise RuntimeError("A versão instalada da biblioteca não possui este comando.")
         if vehicles is not None and callable(getattr(client, "get_vehicle_list", None)):
@@ -2832,10 +2894,20 @@ def handle_command(
 
     def dispatch_once(stage: str, message: str, attempt: int) -> Exception | None:
         nonlocal result, command_attempts, command_dispatched, cloud_accepted
-        report(stage, message, {"attempt": attempt})
+        report(stage, message, {
+            "attempt": attempt,
+            "climate_profile": active_climate_profile if command == "climate_off" else None,
+            "dispatch_strategy": climate_dispatch_strategy if command == "climate_off" else None,
+        })
         command_attempts = max(command_attempts, attempt)
         try:
-            result = execute_vehicle_command(method, command, resolved_vehicle_id, parameters)
+            result = execute_vehicle_command(
+                method,
+                command,
+                resolved_vehicle_id,
+                parameters,
+                active_climate_profile,
+            )
             command_dispatched = True
             cloud_accepted = True
             return None
@@ -2863,8 +2935,19 @@ def handle_command(
 
         is_climate_state_command = command in CLIMATE_VERIFY_COMMANDS
         can_safe_retry = command in SAFE_STATE_RETRY_COMMANDS
+        if command == "climate_off":
+            profile_hint = str(parameters.get("climate_profile") or "").strip().lower()
+            active_climate_profile = profile_hint if profile_hint in {"cooling", "heating", "generic"} else "generic"
+            climate_dispatch_strategy = f"single_mode_aware_close_{active_climate_profile}"
+            report(
+                "preparing",
+                "Preparando um único encerramento da climatização sem leitura adicional da nuvem.",
+                {"climate_profile": active_climate_profile, "single_delivery": True},
+            )
         first_error = dispatch_once(
             "executing",
+            "Enviando encerramento compatível com o modo atual da climatização."
+            if command == "climate_off" else
             "Enviando a ação diretamente ao veículo.",
             1,
         )
@@ -2945,11 +3028,19 @@ def handle_command(
                         "state_evaluable": bool(initial_sample.get("evaluable")),
                     },
                 )
-                active_profile = str(initial_sample.get("climate_profile") or "generic")
+                active_profile = str(initial_sample.get("climate_profile") or active_climate_profile or "generic")
                 explicit_close = getattr(client, "ac_switch", None) if command == "climate_off" else None
                 use_mode_aware_close = command == "climate_off" and callable(explicit_close)
+                # If the first close used a generic profile and the vehicle is
+                # still on, use the directional state from the fresh sample.
+                # When the cloud still reports generic, cooling is the safest
+                # alternate for the common C10 remote-climate path; every
+                # payload remains operate=close and cannot turn HVAC on.
+                retry_profile = active_profile
+                if use_mode_aware_close and retry_profile == active_climate_profile:
+                    retry_profile = "cooling" if active_profile == "generic" else "generic"
                 safe_retry_strategy = (
-                    f"mode_aware_close_{active_profile}" if use_mode_aware_close else "repeat_state_command"
+                    f"alternate_mode_close_{retry_profile}" if use_mode_aware_close else "repeat_state_command"
                 )
                 report(
                     "climate_dispatching",
@@ -2961,6 +3052,7 @@ def handle_command(
                         "attempt": 2,
                         "retry_strategy": safe_retry_strategy,
                         "climate_profile": active_profile,
+                        "retry_profile": retry_profile if use_mode_aware_close else None,
                     },
                 )
                 command_attempts = 2
@@ -2970,10 +3062,16 @@ def handle_command(
                     if use_mode_aware_close:
                         result = explicit_close(
                             resolved_vehicle_id,
-                            params=climate_close_parameters(active_profile),
+                            params=climate_close_parameters(retry_profile),
                         )
                     else:
-                        result = execute_vehicle_command(method, command, resolved_vehicle_id, parameters)
+                        result = execute_vehicle_command(
+                            method,
+                            command,
+                            resolved_vehicle_id,
+                            parameters,
+                            active_climate_profile,
+                        )
                     command_dispatched = True
                     cloud_accepted = True
                 except Exception as exc:  # noqa: BLE001
@@ -3088,6 +3186,8 @@ def handle_command(
             "final_outcome": "confirmed" if verified_by_gateway else ("not_applied" if not_applied else "confirmation_pending"),
             "safe_retry_performed": safe_retry_performed,
             "safe_retry_strategy": safe_retry_strategy,
+            "climate_dispatch_strategy": climate_dispatch_strategy,
+            "climate_profile_used": active_climate_profile if command == "climate_off" else None,
             "verification_state": verification_state,
             "verification_samples": verification_samples,
             "execution_warning": execution_warning,

@@ -32,7 +32,10 @@ except ModuleNotFoundError as exc:
         "Módulo interno leaphub_connector ausente na imagem. Atualize o Leap Hub Gateway."
     ) from exc
 
-VERSION = "1.12.03"
+VERSION = "1.12.09"
+API_VERSION = 2
+CAPABILITY_SCHEMA_VERSION = 1
+MIN_SUPPORTED_CLIENT_API_VERSION = 1
 SERVICE = "Leap Hub Leapmotor Connector"
 MAX_BODY = 1024 * 1024
 WINDOW_SECONDS = 180
@@ -184,6 +187,21 @@ def json_bytes(payload: dict[str, Any]) -> bytes:
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"), default=connector.json_default).encode("utf-8")
 
 
+def trace_identifier(value: Any) -> str:
+    candidate = str(value or "").strip().lower()
+    if re.fullmatch(r"[a-z0-9][a-z0-9._:-]{7,95}", candidate):
+        return candidate
+    return hashlib.sha256(f"{time.time_ns()}:{threading.get_ident()}".encode("utf-8")).hexdigest()[:24]
+
+
+def client_api_version(headers: Any) -> int:
+    raw = str(headers.get("X-LeapHub-API-Version") or "1").strip()
+    try:
+        return int(raw)
+    except ValueError:
+        return 0
+
+
 def request_identifier(payload: dict[str, Any]) -> str:
     value = str(payload.get("request_id") or "").strip().lower()
     return value if re.fullmatch(r"[a-z0-9][a-z0-9._:-]{15,95}", value) else ""
@@ -325,7 +343,7 @@ def command_journal_begin(environment: str, payload: dict[str, Any]) -> tuple[st
                     response["request_id"] = request_id
                     return None, response
         if stale_waiting_auth:
-            LOG.warning("Descartando espera de autenticação inválida da versão anterior para o comando %s.", request_id[:12])
+            LOG.info("Retomando o comando %s após o prazo de autenticação, preservando o mesmo identificador idempotente.", request_id[:12])
             row["status"] = "queued"
             row["response_json"] = ""
         if str(row.get("status") or "") in active_states and now - float(row.get("updated_at") or 0) < 900 and not stale_waiting_auth:
@@ -447,6 +465,7 @@ def command_journal_wait_auth(request_hash: str | None, request_id: str, retry_a
         "status": "waiting_auth",
         "retry_after_seconds": delay,
         "retry_at": retry_at,
+        "resume_required": True,
         "confirmation_pending": True,
         "request_id": request_id,
         "message": "A Leapmotor limitou temporariamente novas autenticações. O comando continuará na fila e será enviado automaticamente.",
@@ -614,6 +633,14 @@ def command_journal_status(environment: str, payload: dict[str, Any]) -> dict[st
         }
         if status == "waiting_auth" and retry_at > 0:
             response["retry_after_seconds"] = max(0, int(retry_at - time.time()))
+            response["resume_required"] = True
+        remaining = max(0, int(response.get("retry_after_seconds") or 0))
+        response["poll_after_seconds"] = (
+            max(15, min(120, remaining - 3)) if status == "waiting_auth" and remaining > 18 else
+            12 if status == "waiting_account" else
+            8 if status in {"waiting_slot", "waking", "vehicle_waking", "vehicle_awake", "reconnecting", "retry_wait", "climate_verifying", "verifying", "confirming"} else
+            5
+        )
         response.setdefault("message", messages.get(status, "Acompanhando a execução do comando."))
     elif status == "cancelled":
         response["ok"] = True
@@ -1082,7 +1109,12 @@ def connector_ready() -> bool:
 
 
 def public_health_payload() -> dict[str, Any]:
-    return {"ok": connector_ready()}
+    return {
+        "ok": connector_ready(),
+        "version": VERSION,
+        "api_version": API_VERSION,
+        "capability_schema_version": CAPABILITY_SCHEMA_VERSION,
+    }
 
 
 def detailed_health_payload(environment: str) -> dict[str, Any]:
@@ -1093,6 +1125,9 @@ def detailed_health_payload(environment: str) -> dict[str, Any]:
         "service": SERVICE,
         "message": "Conector remoto pronto." if library is not None and environment in configured else "Confira a chave do ambiente e a biblioteca leapmotor-api.",
         "version": VERSION,
+        "api_version": API_VERSION,
+        "capability_schema_version": CAPABILITY_SCHEMA_VERSION,
+        "minimum_client_api_version": MIN_SUPPORTED_CLIENT_API_VERSION,
         "connector_version": connector.CONNECTOR_VERSION,
         "library_version": library,
         "operation_limiter": SEMAPHORE.snapshot(),
@@ -1111,6 +1146,13 @@ class Handler(BaseHTTPRequestHandler):
     def setup(self) -> None:
         super().setup()
         self.connection.settimeout(15.0)
+        self.trace_id = trace_identifier("")
+
+    def parse_request(self) -> bool:
+        parsed = super().parse_request()
+        if parsed:
+            self.trace_id = trace_identifier(self.headers.get("X-Request-ID"))
+        return parsed
 
     def log_message(self, fmt: str, *args: Any) -> None:
         line = fmt % args
@@ -1121,20 +1163,30 @@ class Handler(BaseHTTPRequestHandler):
             if 'POST /v1/telemetry/subscriptions/boost ' in line and line.endswith(' 200 -'):
                 LOG.debug("local telemetry boost")
                 return
+            if 'POST /v1/vehicles/command/status ' in line and line.endswith(' 200 -'):
+                LOG.debug("local command status")
+                return
         LOG.info("%s - %s", self.address_string(), line)
 
     def send_json(self, status: int, payload: dict[str, Any]) -> bool:
-        body = json_bytes(payload)
+        response = dict(payload)
+        response.setdefault("trace_id", self.trace_id)
+        response.setdefault("gateway_version", VERSION)
+        response.setdefault("api_version", API_VERSION)
+        body = json_bytes(response)
         try:
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
             self.send_header("Pragma", "no-cache")
             self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("X-Request-ID", self.trace_id)
+            self.send_header("X-LeapHub-Gateway-Version", VERSION)
+            self.send_header("X-LeapHub-API-Version", str(API_VERSION))
             self.send_header("X-Robots-Tag", "noindex, nofollow, noarchive")
             self.send_header("Referrer-Policy", "no-referrer")
             self.send_header("Connection", "close")
-            retry_after = int(payload.get("retry_after_seconds") or 0) if isinstance(payload, dict) else 0
+            retry_after = int(response.get("retry_after_seconds") or 0)
             if retry_after > 0:
                 self.send_header("Retry-After", str(min(86400, retry_after)))
             self.send_header("Content-Length", str(len(body)))
@@ -1175,6 +1227,16 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json(404, {"ok": False, "message": "Página não encontrada."})
 
     def do_POST(self) -> None:
+        requested_api = client_api_version(self.headers)
+        if requested_api < MIN_SUPPORTED_CLIENT_API_VERSION or requested_api > API_VERSION:
+            self.send_json(409, {
+                "ok": False,
+                "incompatible_api": True,
+                "message": "Versão de integração incompatível. Atualize o Leap Hub ou o Gateway.",
+                "requested_api_version": requested_api,
+                "supported_api_version": API_VERSION,
+            })
+            return
         if self.path not in {"/v1/accounts/test", "/v1/vehicles/sync", "/v1/vehicles/command", "/v1/vehicles/command/status", "/v1/vehicles/command/cancel", "/v1/telemetry/subscriptions/upsert", "/v1/telemetry/subscriptions/remove", "/v1/telemetry/subscriptions/boost", "/v1/telemetry/subscriptions/release"}:
             self.send_json(404, {"ok": False, "message": "Página não encontrada."})
             return
@@ -1203,10 +1265,10 @@ class Handler(BaseHTTPRequestHandler):
         command_journal_key: str | None = None
 
         try:
-            if self.path in {"/v1/telemetry/subscriptions/boost", "/v1/telemetry/subscriptions/release"}:
-                LOG.debug("Action %s accepted for %s", self.path, environment)
+            if self.path in {"/v1/telemetry/subscriptions/boost", "/v1/telemetry/subscriptions/release", "/v1/vehicles/command/status"}:
+                LOG.debug("Action %s accepted for %s trace=%s", self.path, environment, self.trace_id)
             else:
-                LOG.info("Action %s accepted for %s", self.path, environment)
+                LOG.info("Action %s accepted for %s trace=%s", self.path, environment, self.trace_id)
             if self.path == "/v1/telemetry/subscriptions/upsert":
                 self.send_json(200, TELEMETRY.upsert(environment, payload))
                 return

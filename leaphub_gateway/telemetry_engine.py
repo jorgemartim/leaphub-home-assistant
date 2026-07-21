@@ -24,7 +24,7 @@ from cryptography.fernet import Fernet, InvalidToken
 import leaphub_connector as connector
 
 LOG = logging.getLogger("leaphub.telemetry")
-ENGINE_VERSION = "1.12.03"
+ENGINE_VERSION = "1.12.09"
 
 
 def utc_iso() -> str:
@@ -113,9 +113,12 @@ class TelemetryEngine:
         # Janela curta após comandos remotos. É propositalmente separada da
         # navegação comum para confirmar rapidamente o novo estado sem manter
         # consultas agressivas à nuvem durante todo o dia.
-        self.command_seconds = self._bounded("telemetry_command_seconds", 3, 3, 10)
-        self.command_max_polls = self._bounded("telemetry_command_max_polls", 8, 4, 12)
-        self.command_cadence = (self.command_seconds, 6, 10, 15)
+        # A confirmação após comando usa poucas leituras espaçadas. O app
+        # mantém o último estado confirmado enquanto aguarda, portanto não há
+        # motivo para consultar a nuvem a cada três segundos.
+        self.command_seconds = self._bounded("telemetry_command_seconds", 12, 10, 60)
+        self.command_max_polls = self._bounded("telemetry_command_max_polls", 3, 2, 4)
+        self.command_cadence = (self.command_seconds, 20, 35, 60)
         self.charging_seconds = self._bounded("telemetry_charging_seconds", 30, 15, 600)
         self.parked_seconds = self._bounded("telemetry_parked_seconds", 300, 60, 3600)
         self.sleep_seconds = self._bounded("telemetry_sleep_seconds", 900, 300, 14400)
@@ -1461,10 +1464,18 @@ class TelemetryEngine:
             session = None
 
         if session is None:
+            # Verifique a prioridade manual antes de criar uma nova sessão e
+            # novamente imediatamente antes do login. Isso fecha a corrida em
+            # que a telemetria iniciava a autenticação no mesmo instante em que
+            # o usuário enviava um comando.
+            if manual_should_yield is not None and manual_should_yield():
+                raise TelemetryYieldForManual("Operação manual aguardando antes da autenticação automática.")
             temp_dir = connector.secure_temp_directory()
             client = None
             try:
-                client = connector.create_client(credentials, temp_dir, None, request_timeout_seconds=10)
+                client = connector.create_client(credentials, temp_dir, None, request_timeout_seconds=8)
+                if manual_should_yield is not None and manual_should_yield():
+                    raise TelemetryYieldForManual("Operação manual recebeu prioridade antes do login automático.")
                 # Uma única tentativa de login. Falhas nunca geram uma sequência
                 # imediata de novas autenticações.
                 client.login()
@@ -1475,6 +1486,8 @@ class TelemetryEngine:
                     except Exception:
                         pass
                 shutil.rmtree(temp_dir, ignore_errors=True)
+                if isinstance(exc, TelemetryYieldForManual):
+                    raise
                 delay = connector.login_cooldown_seconds(exc)
                 if delay > 0:
                     raise connector.ConnectorLoginCooldownError(

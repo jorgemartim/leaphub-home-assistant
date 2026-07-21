@@ -1,3 +1,31 @@
+## 1.12.09
+
+- Contrato versionado, rastreabilidade e diagnóstico de compatibilidade Hub ↔ Gateway.
+
+## 1.12.08
+
+- Telemetria opcional de temperatura por pneu, sem estimativas.
+
+## 1.12.07
+
+- Prioridade manual antes do login automático e retomada idempotente após cooldown.
+
+## 1.12.06
+
+- Compatibilidade de migração para opções persistidas pela 1.12.04.
+- O schema aceita os valores antigos para permitir a inicialização, enquanto o runtime limita a cadência aos valores seguros da 1.12.05.
+- Corrige o bloqueio do Supervisor com `value must be at least 10.0`.
+
+## 1.12.05
+
+- Contenção de requisições, telemetria pós-comando moderada e status com backoff explícito.
+- Removida a leitura extra anterior ao desligamento do clima.
+
+## 1.12.04
+
+- Desligamento de clima com fechamento compatível com o modo ativo e confirmação por telemetria fresca.
+- Estado só é confirmado quando a leitura do veículo realmente muda.
+
 ## 1.12.03
 
 - Corrige o diagnóstico privado OCPP, que podia falhar por chave indefinida.
