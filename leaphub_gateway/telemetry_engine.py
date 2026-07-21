@@ -24,7 +24,7 @@ from cryptography.fernet import Fernet, InvalidToken
 import leaphub_connector as connector
 
 LOG = logging.getLogger("leaphub.telemetry")
-ENGINE_VERSION = "1.12.11"
+ENGINE_VERSION = "1.12.12"
 
 
 def utc_iso() -> str:
@@ -125,6 +125,11 @@ class TelemetryEngine:
         self.presence_window_seconds = self._bounded("telemetry_presence_window_seconds", 420, 300, 1800)
         self.rate_limit_cooldown_seconds = self._bounded("telemetry_rate_limit_cooldown_seconds", 900, 300, 3600)
         self.login_cooldown_max_seconds = 300
+        # Evita que reinícios, várias abas ou reativações próximas iniciem novos
+        # logins antes do intervalo seguro. O marcador fica no SQLite e, por
+        # isso, continua válido mesmo após reiniciar o App.
+        self.auth_attempt_min_interval_seconds = 150
+        self.started_at = time.time()
         self.charge_watch_seconds = max(5, min(15, self.charging_seconds * 2))
         self.batch_size = self._bounded("telemetry_batch_size", 25, 1, 50)
         self.retention_days = self._bounded("telemetry_retention_days", 7, 1, 60)
@@ -351,6 +356,9 @@ class TelemetryEngine:
                         last_presence_at TEXT NULL,
                         auth_required INTEGER NOT NULL DEFAULT 0,
                         credential_hash TEXT NULL,
+                        cooldown_reason TEXT NULL,
+                        last_auth_attempt_at REAL NOT NULL DEFAULT 0,
+                        last_auth_success_at REAL NOT NULL DEFAULT 0,
                         created_at TEXT NOT NULL,
                         updated_at TEXT NOT NULL
                     );
@@ -401,6 +409,12 @@ class TelemetryEngine:
                     db.execute("ALTER TABLE subscriptions ADD COLUMN auth_required INTEGER NOT NULL DEFAULT 0")
                 if "credential_hash" not in columns:
                     db.execute("ALTER TABLE subscriptions ADD COLUMN credential_hash TEXT NULL")
+                if "cooldown_reason" not in columns:
+                    db.execute("ALTER TABLE subscriptions ADD COLUMN cooldown_reason TEXT NULL")
+                if "last_auth_attempt_at" not in columns:
+                    db.execute("ALTER TABLE subscriptions ADD COLUMN last_auth_attempt_at REAL NOT NULL DEFAULT 0")
+                if "last_auth_success_at" not in columns:
+                    db.execute("ALTER TABLE subscriptions ADD COLUMN last_auth_success_at REAL NOT NULL DEFAULT 0")
                 event_columns = {str(row[1]) for row in db.execute("PRAGMA table_info(events)").fetchall()}
                 if "sequence" not in event_columns:
                     db.execute("ALTER TABLE events ADD COLUMN sequence INTEGER NOT NULL DEFAULT 0")
@@ -662,7 +676,7 @@ class TelemetryEngine:
         credential_hash = hashlib.sha256(canonical_json(credentials)).hexdigest()
         with self.lock, self._db() as db:
             existing = db.execute(
-                "SELECT credential_hash, credentials_encrypted, auth_required, cooldown_until, active_until, interactive_until, command_until, next_run_at, status, enabled "
+                "SELECT credential_hash, credentials_encrypted, auth_required, cooldown_until, cooldown_reason, active_until, interactive_until, command_until, next_run_at, status, enabled "
                 "FROM subscriptions WHERE subscription_id=? LIMIT 1",
                 (subscription_id,),
             ).fetchone()
@@ -769,7 +783,12 @@ class TelemetryEngine:
                 "protected": True,
                 "credentials_changed": False,
                 "retry_after_seconds": max(1, int(existing_cooldown_until - now_epoch)),
-                "message": "Proteção contra limite de requisições ainda está ativa.",
+                "cooldown_reason": str(existing["cooldown_reason"] or "rate_limit") if existing is not None else "rate_limit",
+                "message": (
+                    "A Leapmotor ainda não liberou uma nova autenticação. O Gateway aguardará automaticamente."
+                    if existing is not None and str(existing["cooldown_reason"] or "") == "login"
+                    else "Proteção contra limite de requisições ainda está ativa."
+                ),
             }
         return {
             "ok": True,
@@ -865,7 +884,7 @@ class TelemetryEngine:
         now_iso = utc_iso()
         with self.lock, self._db() as db:
             row = db.execute(
-                "SELECT auth_required, cooldown_until, enabled, next_run_at, status FROM subscriptions WHERE subscription_id=? LIMIT 1",
+                "SELECT auth_required, cooldown_until, cooldown_reason, enabled, next_run_at, status FROM subscriptions WHERE subscription_id=? LIMIT 1",
                 (subscription_id,),
             ).fetchone()
             if row is None or int(row["enabled"] or 0) != 1:
@@ -879,7 +898,12 @@ class TelemetryEngine:
                     "subscription_id": subscription_id,
                     "cooldown": True,
                     "retry_after_seconds": int(cooldown_until - now_epoch),
-                    "message": "Proteção contra limite de requisições ainda está ativa.",
+                    "cooldown_reason": str(row["cooldown_reason"] or "rate_limit"),
+                    "message": (
+                        "A Leapmotor ainda não liberou uma nova autenticação. O Gateway aguardará automaticamente."
+                        if str(row["cooldown_reason"] or "") == "login"
+                        else "Proteção contra limite de requisições ainda está ativa."
+                    ),
                 }
             current_next = float(row["next_run_at"] or 0)
             current_status = str(row["status"] or "").strip().lower()
@@ -1015,7 +1039,7 @@ class TelemetryEngine:
                 ).fetchone()
                 recent = [dict(row) for row in db.execute(
                     "SELECT subscription_id, environment, account_id, status, last_run_at, last_success_at, last_delivery_at, "
-                    "last_error, last_state, next_run_at, active_until, interactive_until, command_until, command_key, command_vehicle_id, command_poll_count, command_started_at, last_presence_at, auth_required, cooldown_until "
+                    "last_error, last_state, next_run_at, active_until, interactive_until, command_until, command_key, command_vehicle_id, command_poll_count, command_started_at, last_presence_at, auth_required, cooldown_until, cooldown_reason, last_auth_attempt_at, last_auth_success_at "
                     "FROM subscriptions ORDER BY updated_at DESC LIMIT 20"
                 ).fetchall()]
                 dedupe = db.execute(
@@ -1045,6 +1069,9 @@ class TelemetryEngine:
             item["command_for_seconds"] = max(0, int(float(item.pop("command_until") or 0) - now_epoch))
             item["command_started_seconds_ago"] = max(0, int(now_epoch - float(item.pop("command_started_at") or now_epoch)))
             item["cooldown_seconds"] = max(0, int(float(item.pop("cooldown_until") or 0) - now_epoch))
+            item["last_auth_attempt_seconds_ago"] = max(0, int(now_epoch - float(item.pop("last_auth_attempt_at") or now_epoch)))
+            last_auth_success = float(item.pop("last_auth_success_at") or 0)
+            item["last_auth_success_seconds_ago"] = max(0, int(now_epoch - last_auth_success)) if last_auth_success > 0 else None
             item["session_reused"] = self._has_session(str(item.get("subscription_id") or ""))
             if item.get("last_error"):
                 item["last_error"] = str(item["last_error"])[:240]
@@ -1075,6 +1102,7 @@ class TelemetryEngine:
                 "parked_seconds": self.parked_seconds,
                 "sleep_seconds": self.sleep_seconds,
                 "rate_limit_cooldown_seconds": self.rate_limit_cooldown_seconds,
+                "auth_attempt_min_interval_seconds": self.auth_attempt_min_interval_seconds,
                 "presence_window_seconds": self.presence_window_seconds,
                 "presence_driven": True,
                 "session_reuse": True,
@@ -1211,6 +1239,23 @@ class TelemetryEngine:
             "account_id": int(subscription["account_id"] or 0),
             "credentials": credentials,
         }
+        # Uma leitura automática nunca abre outra autenticação poucos segundos
+        # depois da anterior. Isso vale inclusive após reiniciar o App, pois o
+        # horário fica persistido na assinatura. Comandos manuais continuam com
+        # prioridade e usam o fluxo próprio.
+        last_auth_attempt_at = float(subscription["last_auth_attempt_at"] or 0) if "last_auth_attempt_at" in subscription.keys() else 0.0
+        if not command_mode and not self._has_session(sid) and last_auth_attempt_at > 0:
+            remaining = self.auth_attempt_min_interval_seconds - int(now_epoch - last_auth_attempt_at)
+            if remaining > 0:
+                credentials.clear()
+                self._reschedule(
+                    sid,
+                    max(5, remaining),
+                    "waiting_auth",
+                    "Aguardando o intervalo seguro antes de uma nova autenticação automática.",
+                    failed=False,
+                )
+                return
         if self.manual_pending_provider is not None and self.manual_pending_provider(environment, operation_payload):
             credentials.clear()
             self._reschedule(sid, 2, "waiting", "Comando do usuário tem prioridade sobre a telemetria automática.", failed=False)
@@ -1269,14 +1314,18 @@ class TelemetryEngine:
                 self._close_session(sid)
             if isinstance(exc, connector.ConnectorLoginCooldownError):
                 self._close_session(sid)
-                delay = max(30, min(self.login_cooldown_max_seconds, int(exc.retry_after_seconds or 135)))
+                cloud_delay = max(30, min(self.login_cooldown_max_seconds, int(exc.retry_after_seconds or 135)))
+                # Após reincidência, aguarde mais que o mínimo informado pela
+                # nuvem. Isso evita ciclos de 135s que continuam renovando o
+                # bloqueio quando a conta ainda não foi totalmente liberada.
+                delay = max(cloud_delay, 300 if failures >= 2 else cloud_delay)
                 now = utc_iso()
                 with self.lock, self._db() as db:
                     db.execute(
-                        "UPDATE subscriptions SET status='cooldown',cooldown_until=?,next_run_at=?,last_run_at=?,last_error=?,consecutive_failures=consecutive_failures+1,updated_at=? WHERE subscription_id=?",
+                        "UPDATE subscriptions SET status='cooldown',cooldown_until=?,cooldown_reason='login',next_run_at=?,last_run_at=?,last_error=?,consecutive_failures=consecutive_failures+1,updated_at=? WHERE subscription_id=?",
                         (time.time() + delay, time.time() + delay, now, message[:500], now, sid),
                     )
-                LOG.warning("Autenticação de %s aguardará %ss antes da próxima tentativa; credenciais permanecem protegidas.", sid, delay)
+                LOG.warning("Autenticação de %s aguardará %ss antes da próxima tentativa automática; credenciais permanecem protegidas.", sid, delay)
             elif self._looks_rate_limited(message):
                 self._close_session(sid)
                 delay = connector.rate_limit_cooldown_seconds(message, self.rate_limit_cooldown_seconds)
@@ -1285,7 +1334,7 @@ class TelemetryEngine:
                 now = utc_iso()
                 with self.lock, self._db() as db:
                     db.execute(
-                        "UPDATE subscriptions SET status='cooldown', cooldown_until=?, active_until=0, interactive_until=0, command_until=0, command_key=NULL, command_vehicle_id=NULL, command_context_json=NULL, command_poll_count=0, command_started_at=0, next_run_at=?, last_run_at=?, last_error=?, consecutive_failures=consecutive_failures+1, updated_at=? WHERE subscription_id=?",
+                        "UPDATE subscriptions SET status='cooldown', cooldown_until=?, cooldown_reason='rate_limit', active_until=0, interactive_until=0, command_until=0, command_key=NULL, command_vehicle_id=NULL, command_context_json=NULL, command_poll_count=0, command_started_at=0, next_run_at=?, last_run_at=?, last_error=?, consecutive_failures=consecutive_failures+1, updated_at=? WHERE subscription_id=?",
                         (time.time() + delay, time.time() + delay, now, message[:500], now, sid),
                     )
                 LOG.warning("Proteção contra limite ativada para %s por %ss: %s", sid, delay, message)
@@ -1390,12 +1439,12 @@ class TelemetryEngine:
         with self.lock, self._db() as db:
             if clear_command:
                 db.execute(
-                    "UPDATE subscriptions SET status='active', next_run_at=?, last_run_at=?, last_success_at=?, last_error=NULL, last_state=?, parked_streak=?, consecutive_failures=0, cooldown_until=0, command_until=0, command_key=NULL, command_vehicle_id=NULL, command_context_json=NULL, command_poll_count=0, command_started_at=0, updated_at=? WHERE subscription_id=?",
+                    "UPDATE subscriptions SET status='active', next_run_at=?, last_run_at=?, last_success_at=?, last_error=NULL, last_state=?, parked_streak=?, consecutive_failures=0, cooldown_until=0, cooldown_reason=NULL, command_until=0, command_key=NULL, command_vehicle_id=NULL, command_context_json=NULL, command_poll_count=0, command_started_at=0, updated_at=? WHERE subscription_id=?",
                     (next_run, now, now, aggregate_state, parked_streak, now, sid),
                 )
             else:
                 db.execute(
-                    "UPDATE subscriptions SET status='active', next_run_at=?, last_run_at=?, last_success_at=?, last_error=NULL, last_state=?, parked_streak=?, consecutive_failures=0, cooldown_until=0, command_poll_count=?, updated_at=? WHERE subscription_id=?",
+                    "UPDATE subscriptions SET status='active', next_run_at=?, last_run_at=?, last_success_at=?, last_error=NULL, last_state=?, parked_streak=?, consecutive_failures=0, cooldown_until=0, cooldown_reason=NULL, command_poll_count=?, updated_at=? WHERE subscription_id=?",
                     (next_run, now, now, aggregate_state, parked_streak, next_command_poll, now, sid),
                 )
         if command_confirmed:
@@ -1476,9 +1525,19 @@ class TelemetryEngine:
                 client = connector.create_client(credentials, temp_dir, None, request_timeout_seconds=8)
                 if manual_should_yield is not None and manual_should_yield():
                     raise TelemetryYieldForManual("Operação manual recebeu prioridade antes do login automático.")
-                # Uma única tentativa de login. Falhas nunca geram uma sequência
-                # imediata de novas autenticações.
+                # Uma única tentativa de login. O horário é persistido antes
+                # da chamada para impedir repetição após reinício ou queda.
+                with self.lock, self._db() as db:
+                    db.execute(
+                        "UPDATE subscriptions SET last_auth_attempt_at=?,updated_at=? WHERE subscription_id=?",
+                        (time.time(), utc_iso(), subscription_id),
+                    )
                 client.login()
+                with self.lock, self._db() as db:
+                    db.execute(
+                        "UPDATE subscriptions SET last_auth_success_at=?,cooldown_reason=NULL,updated_at=? WHERE subscription_id=?",
+                        (time.time(), utc_iso(), subscription_id),
+                    )
             except Exception as exc:
                 if client is not None:
                     try:

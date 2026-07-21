@@ -1,3 +1,9 @@
+## 1.12.12
+
+- Classificação de cooldown e trava persistente contra logins automáticos repetidos.
+- Recuperação automática moderada após bloqueio curto da nuvem.
+- Sem mudança em comandos físicos ou OCPP.
+
 ## 1.12.11
 
 - Volante e retrovisores aquecidos orientados por capacidade.
