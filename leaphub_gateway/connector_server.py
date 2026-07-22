@@ -37,7 +37,7 @@ try:
 except ModuleNotFoundError:
     from privacy import install_logging_privacy_filter
 
-VERSION = "1.12.13"
+VERSION = "1.12.14"
 API_VERSION = 2
 CAPABILITY_SCHEMA_VERSION = 1
 MIN_SUPPORTED_CLIENT_API_VERSION = 1

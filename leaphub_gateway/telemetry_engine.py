@@ -24,7 +24,7 @@ from cryptography.fernet import Fernet, InvalidToken
 import leaphub_connector as connector
 
 LOG = logging.getLogger("leaphub.telemetry")
-ENGINE_VERSION = "1.12.13"
+ENGINE_VERSION = "1.12.14"
 
 
 def utc_iso() -> str:
@@ -151,7 +151,13 @@ class TelemetryEngine:
         self.session_locks_guard = threading.RLock()
         self.session_locks: dict[str, threading.RLock] = {}
         self.session_max_age_seconds = 0
-        self.session_idle_seconds = 0
+        # Uma janela de telemetria encerrada não invalida o token. Preserve o
+        # cliente por algumas horas e descarte somente por inatividade real,
+        # credencial alterada, expiração confirmada ou desligamento do Gateway.
+        self.session_idle_seconds = self._bounded("telemetry_session_idle_seconds", 21600, 1800, 86400)
+        self.vehicle_list_cache_seconds = self._bounded("telemetry_vehicle_list_cache_seconds", 1800, 300, 7200)
+        self.message_cache_seconds = self._bounded("telemetry_message_cache_seconds", 1800, 300, 14400)
+        self.request_timeout_seconds = self._bounded("telemetry_request_timeout_seconds", 15, 10, 30)
         self._init_db()
         self.storage_healthy = True
 
@@ -723,9 +729,15 @@ class TelemetryEngine:
                     and session.get("credential_hash") == expected_hash
                 ):
                     try:
+                        cached_for_operation = None
+                        if sync and str(payload.get("vehicle_id") or "").strip():
+                            cached_value = session.get("vehicles")
+                            cached_at = float(session.get("vehicles_cached_at") or 0)
+                            if isinstance(cached_value, list) and cached_value and time.time() - cached_at < self.vehicle_list_cache_seconds:
+                                cached_for_operation = cached_value
                         result = connector.handle_account(
                             payload, sync=sync, borrowed_client=session["client"],
-                            borrowed_vehicles=None,
+                            borrowed_vehicles=cached_for_operation,
                         )
                         session["last_used_at"] = time.time()
                         if isinstance(result.get("vehicles"), list):
@@ -737,9 +749,15 @@ class TelemetryEngine:
                     except connector.ConnectorAuthenticationError:
                         if self._try_refresh_client_session(session["client"]):
                             try:
+                                cached_for_operation = None
+                                if sync and str(payload.get("vehicle_id") or "").strip():
+                                    cached_value = session.get("vehicles")
+                                    cached_at = float(session.get("vehicles_cached_at") or 0)
+                                    if isinstance(cached_value, list) and cached_value and time.time() - cached_at < self.vehicle_list_cache_seconds:
+                                        cached_for_operation = cached_value
                                 result = connector.handle_account(
                                     payload, sync=sync, borrowed_client=session["client"],
-                                    borrowed_vehicles=None,
+                                    borrowed_vehicles=cached_for_operation,
                                 )
                                 session["last_used_at"] = time.time()
                                 self.record_account_auth_success(environment, payload, origin + "_refresh")
@@ -1546,7 +1564,8 @@ class TelemetryEngine:
         command_mode = float(subscription["command_until"] or 0) > now_epoch
         fast_mode = interactive or command_mode
         if active_until <= now_epoch:
-            self._close_session(sid)
+            # O fim da janela ativa pausa novas leituras, mas não encerra uma
+            # sessão saudável. Fechar aqui obrigava um novo login a cada janela.
             with self.lock, self._db() as db:
                 db.execute(
                     "UPDATE subscriptions SET status='idle', next_run_at=?, interactive_until=0, command_until=0, command_key=NULL, command_vehicle_id=NULL, command_context_json=NULL, command_poll_count=0, command_started_at=0, last_error=NULL, updated_at=? WHERE subscription_id=?",
@@ -1675,6 +1694,17 @@ class TelemetryEngine:
             transient = connector.is_transient_cloud_error(exc) or isinstance(exc, connector.ConnectorTemporaryError)
             if not transient or failures >= 3:
                 self._close_session(sid)
+            if isinstance(exc, connector.ConnectorSessionExpiredError):
+                delay = 20
+                self._reschedule(
+                    sid,
+                    delay,
+                    "waiting_auth",
+                    "Sessão expirada; uma única reconexão protegida foi agendada.",
+                    failed=False,
+                )
+                LOG.info("Sessão de %s expirou; uma reconexão coordenada ocorrerá em %ss.", sid, delay)
+                return
             if isinstance(exc, connector.ConnectorLoginCooldownError):
                 delay = max(30, min(self.login_cooldown_max_seconds, int(exc.retry_after_seconds or 300)))
                 self._apply_account_subscription_cooldown(
@@ -1899,7 +1929,7 @@ class TelemetryEngine:
             temp_dir = connector.secure_temp_directory()
             client = None
             try:
-                client = connector.create_client(credentials, temp_dir, None, request_timeout_seconds=8)
+                client = connector.create_client(credentials, temp_dir, None, request_timeout_seconds=self.request_timeout_seconds)
                 if manual_should_yield is not None and manual_should_yield():
                     raise TelemetryYieldForManual("Operação manual recebeu prioridade antes do login automático.")
                 # Uma única tentativa de login. O horário é persistido antes
@@ -1946,6 +1976,10 @@ class TelemetryEngine:
                 "credential_hash": credential_hash,
                 "created_at": now_epoch,
                 "last_used_at": now_epoch,
+                "vehicles": [],
+                "vehicles_cached_at": 0.0,
+                "messages": [],
+                "messages_cached_at": 0.0,
             }
             with self.session_lock:
                 self.sessions[subscription_id] = session
@@ -1955,15 +1989,36 @@ class TelemetryEngine:
         try:
             if manual_should_yield is not None and manual_should_yield():
                 raise TelemetryYieldForManual("Operação manual aguardando a conta.")
-            try:
-                vehicles_value = client.get_vehicle_list()
-            except Exception as exc:  # noqa: BLE001
-                if connector.is_authentication_error(exc) and self._try_refresh_client_session(client):
-                    LOG.info("Sessão de %s renovada por refresh antes de considerar novo login.", subscription_id)
+            cached_vehicles = session.get("vehicles") if isinstance(session.get("vehicles"), list) else []
+            vehicles_cached_at = float(session.get("vehicles_cached_at") or 0)
+            cache_fresh = bool(cached_vehicles) and now_epoch - vehicles_cached_at < self.vehicle_list_cache_seconds
+            selected_ids_present = not vehicle_ids or all(
+                any(
+                    str(connector.attribute(item, "car_id", "") or connector.attribute(item, "vin", "")) == vehicle_id
+                    for item in cached_vehicles
+                )
+                for vehicle_id in vehicle_ids
+            )
+            if cache_fresh and selected_ids_present:
+                vehicles = cached_vehicles
+            else:
+                try:
                     vehicles_value = client.get_vehicle_list()
-                else:
-                    raise
-            vehicles = vehicles_value if isinstance(vehicles_value, list) else list(vehicles_value or [])
+                except Exception as exc:  # noqa: BLE001
+                    if connector.is_session_expired_error(exc):
+                        if self._try_refresh_client_session(client):
+                            LOG.info("Sessão de %s renovada por refresh antes de considerar novo login.", subscription_id)
+                            vehicles_value = client.get_vehicle_list()
+                        else:
+                            self._close_session_locked(subscription_id)
+                            raise connector.ConnectorSessionExpiredError(
+                                "A sessão Leapmotor expirou e será recriada uma única vez no próximo ciclo protegido."
+                            ) from exc
+                    else:
+                        raise
+                vehicles = vehicles_value if isinstance(vehicles_value, list) else list(vehicles_value or [])
+                session["vehicles"] = vehicles
+                session["vehicles_cached_at"] = time.time()
             if manual_should_yield is not None and manual_should_yield():
                 raise TelemetryYieldForManual("Operação manual aguardando a conta.")
             selected = vehicles
@@ -1977,13 +2032,25 @@ class TelemetryEngine:
             if manual_should_yield is not None and manual_should_yield():
                 raise TelemetryYieldForManual("Operação manual aguardando a conta.")
             if not command_mode and callable(get_messages):
-                if manual_should_yield is not None and manual_should_yield():
-                    raise TelemetryYieldForManual("Operação manual aguardando a conta.")
-                try:
-                    message_page = get_messages(page_no=1, page_size=100)
-                    messages = list(connector.attribute(message_page, "messages", []) or [])
-                except Exception:
-                    messages = []
+                cached_messages = session.get("messages") if isinstance(session.get("messages"), list) else []
+                messages_cached_at = float(session.get("messages_cached_at") or 0)
+                if messages_cached_at > 0 and now_epoch - messages_cached_at < self.message_cache_seconds:
+                    messages = cached_messages
+                else:
+                    if manual_should_yield is not None and manual_should_yield():
+                        raise TelemetryYieldForManual("Operação manual aguardando a conta.")
+                    try:
+                        message_page = get_messages(page_no=1, page_size=100)
+                        messages = list(connector.attribute(message_page, "messages", []) or [])
+                        session["messages"] = messages
+                        session["messages_cached_at"] = time.time()
+                    except Exception as exc:  # noqa: BLE001
+                        if connector.is_session_expired_error(exc):
+                            self._close_session_locked(subscription_id)
+                            raise connector.ConnectorSessionExpiredError(
+                                "A sessão Leapmotor expirou durante a leitura de mensagens."
+                            ) from exc
+                        messages = cached_messages
             serialized: list[dict[str, Any]] = []
             for item in selected:
                 if manual_should_yield is not None and manual_should_yield():
@@ -2013,6 +2080,11 @@ class TelemetryEngine:
             session["last_used_at"] = time.time()
             raise
         except Exception as exc:
+            if connector.is_session_expired_error(exc) or isinstance(exc, connector.ConnectorSessionExpiredError):
+                self._close_session_locked(subscription_id)
+                raise connector.ConnectorSessionExpiredError(
+                    "A sessão Leapmotor expirou; o próximo ciclo fará uma única autenticação coordenada."
+                ) from exc
             if connector.is_transient_cloud_error(exc) or isinstance(exc, connector.ConnectorTemporaryError):
                 # Um timeout de transporte não prova que o token morreu. A
                 # sessão é mantida nas primeiras falhas para evitar novo login.
@@ -2508,17 +2580,17 @@ class TelemetryEngine:
         # Executada de forma barata; o SQLite ignora as remoções quando não há registros antigos.
         cutoff = time.time() - self.retention_days * 86400
         cutoff_iso = datetime.fromtimestamp(cutoff, timezone.utc).isoformat().replace("+00:00", "Z")
-        expired_sessions: list[str] = []
+        expired_windows: list[str] = []
         with self.lock, self._db() as db:
-            expired_sessions = [str(row[0]) for row in db.execute(
+            expired_windows = [str(row[0]) for row in db.execute(
                 "SELECT subscription_id FROM subscriptions WHERE enabled=1 AND active_until<=? AND status NOT IN ('idle','disabled','auth_required','cooldown')",
                 (now_epoch,),
             ).fetchall()]
-            if expired_sessions:
-                placeholders = ",".join("?" for _ in expired_sessions)
+            if expired_windows:
+                placeholders = ",".join("?" for _ in expired_windows)
                 db.execute(
                     f"UPDATE subscriptions SET status='idle', interactive_until=0, command_until=0, last_error=NULL, updated_at=? WHERE subscription_id IN ({placeholders})",
-                    (utc_iso(), *expired_sessions),
+                    (utc_iso(), *expired_windows),
                 )
             db.execute("DELETE FROM events WHERE status='delivered' AND delivered_at<?", (cutoff_iso,))
             total = int(db.execute("SELECT COUNT(*) FROM events").fetchone()[0])
@@ -2528,5 +2600,12 @@ class TelemetryEngine:
                     "DELETE FROM events WHERE event_id IN (SELECT event_id FROM events WHERE status='delivered' ORDER BY delivered_at ASC LIMIT ?)",
                     (excess,),
                 )
-        for subscription_id in expired_sessions:
+        # Sessões são descartadas somente por inatividade real, não pelo fim
+        # da janela de coleta. Isso evita relogins periódicos desnecessários.
+        with self.session_lock:
+            stale_sessions = [
+                sid for sid, session in self.sessions.items()
+                if now_epoch - float(session.get("last_used_at") or 0) >= self.session_idle_seconds
+            ]
+        for subscription_id in stale_sessions:
             self._close_session(subscription_id)

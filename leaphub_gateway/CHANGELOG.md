@@ -1,3 +1,11 @@
+## 1.12.14
+
+- Mantém sessões Leapmotor saudáveis após o fim da janela ativa.
+- Reduz chamadas repetidas de lista de veículos e mensagens.
+- Trata expiração real de sessão com uma única reconexão coordenada.
+- Detecta conexões OCPP mortas, acelera falha de comandos e aplica graça de reconexão.
+- Preserva ordem e limita retenção da fila OCPP.
+
 ## 1.12.13
 
 - Mantém integralmente os contratos, comandos, OCPP e recursos da 1.12.12.

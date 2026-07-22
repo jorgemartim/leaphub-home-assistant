@@ -135,7 +135,8 @@ for test_file in (
     ROOT / "tests" / "test_remote_command_matrix.py",
     ROOT / "tests" / "test_comfort_contract.py",
     ROOT / "tests" / "test_auth_recovery_contract.py",
-    ROOT / "tests" / "test_gateway_1_12_13.py",
+    ROOT / "tests" / "test_gateway_1_12_14.py",
+    ROOT / "tests" / "test_resilience_1_12_14.py",
 ):
     subprocess.run([sys.executable, str(test_file)], cwd=ROOT, check=True)
 

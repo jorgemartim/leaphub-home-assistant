@@ -1,5 +1,5 @@
 name: "Leap Hub Gateway"
-version: "1.12.13"
+version: "1.12.14"
 slug: "leaphub_gateway"
 description: "Gateway unificado com sincronização automática adaptativa, fila persistente, Leapmotor, OCPP e Cloudflare Tunnel."
 url: "https://github.com/jorgemartim/leaphub-home-assistant"
@@ -45,6 +45,10 @@ options:
   telemetry_sleep_seconds: 600
   telemetry_presence_window_seconds: 420
   telemetry_rate_limit_cooldown_seconds: 900
+  telemetry_request_timeout_seconds: 15
+  telemetry_session_idle_seconds: 21600
+  telemetry_vehicle_list_cache_seconds: 1800
+  telemetry_message_cache_seconds: 1800
   telemetry_batch_size: 25
   telemetry_retention_days: 7
   telemetry_queue_max_events: 10000
@@ -56,6 +60,11 @@ options:
   ocpp_production_internal_url: "https://leaphub.com.br/leap/api/internal/ocpp"
   ocpp_production_secret: ""
   ocpp_production_max_connections: 100
+  ocpp_ping_interval_seconds: 30
+  ocpp_liveness_timeout_seconds: 120
+  ocpp_disconnect_grace_seconds: 8
+  ocpp_queue_max_events: 10000
+  ocpp_queue_retention_days: 7
   tunnel_enabled: false
   tunnel_token: ""
   tunnel_log_level: "info"
@@ -81,6 +90,10 @@ schema:
   telemetry_sleep_seconds: "int(300,14400)"
   telemetry_presence_window_seconds: "int(300,1800)"
   telemetry_rate_limit_cooldown_seconds: "int(300,21600)"
+  telemetry_request_timeout_seconds: "int(10,30)"
+  telemetry_session_idle_seconds: "int(1800,86400)"
+  telemetry_vehicle_list_cache_seconds: "int(300,7200)"
+  telemetry_message_cache_seconds: "int(300,14400)"
   telemetry_batch_size: "int(1,50)"
   telemetry_retention_days: "int(1,60)"
   telemetry_queue_max_events: "int(100,100000)"
@@ -92,6 +105,11 @@ schema:
   ocpp_production_internal_url: url
   ocpp_production_secret: "password?"
   ocpp_production_max_connections: "int(1,1000)"
+  ocpp_ping_interval_seconds: "int(15,120)"
+  ocpp_liveness_timeout_seconds: "int(60,600)"
+  ocpp_disconnect_grace_seconds: "int(0,30)"
+  ocpp_queue_max_events: "int(100,100000)"
+  ocpp_queue_retention_days: "int(1,30)"
   tunnel_enabled: bool
   tunnel_token: "password?"
   tunnel_log_level: "list(debug|info|warn|error|fatal)"
