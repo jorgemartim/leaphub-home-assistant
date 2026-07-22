@@ -24,7 +24,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-VERSION = "1.12.14"
+VERSION = "1.12.13"
 OPTIONS_PATH = Path(os.getenv("LEAPHUB_OPTIONS_PATH", "/data/options.json"))
 RUNTIME = Path(os.getenv("LEAPHUB_RUNTIME_DIR", "/data/runtime"))
 LOG_DIR = Path(os.getenv("LEAPHUB_LOG_DIR", "/data/logs"))
@@ -231,10 +231,6 @@ def write_connector_options() -> Path:
         "telemetry_sleep_seconds": int(OPTIONS.get("telemetry_sleep_seconds") or 900),
         "telemetry_presence_window_seconds": int(OPTIONS.get("telemetry_presence_window_seconds") or 420),
         "telemetry_rate_limit_cooldown_seconds": int(OPTIONS.get("telemetry_rate_limit_cooldown_seconds") or 900),
-        "telemetry_request_timeout_seconds": int(OPTIONS.get("telemetry_request_timeout_seconds") or 15),
-        "telemetry_session_idle_seconds": int(OPTIONS.get("telemetry_session_idle_seconds") or 21600),
-        "telemetry_vehicle_list_cache_seconds": int(OPTIONS.get("telemetry_vehicle_list_cache_seconds") or 1800),
-        "telemetry_message_cache_seconds": int(OPTIONS.get("telemetry_message_cache_seconds") or 1800),
         "telemetry_batch_size": int(OPTIONS.get("telemetry_batch_size") or 25),
         "telemetry_retention_days": int(OPTIONS.get("telemetry_retention_days") or 7),
         "telemetry_queue_max_events": int(OPTIONS.get("telemetry_queue_max_events") or 10000),
@@ -250,7 +246,7 @@ def write_connector_options() -> Path:
 
 def ocpp_env(port: int, beta_url: str, production_url: str, beta_secret: str, production_secret: str, maximum: int) -> dict[str, str]:
     runtime = RUNTIME / "ocpp-wallbox"; runtime.mkdir(parents=True, exist_ok=True)
-    return {"LEAPHUB_BETA_INTERNAL_URL":beta_url,"LEAPHUB_PRODUCTION_INTERNAL_URL":production_url,"LEAPHUB_BETA_GATEWAY_SECRET":beta_secret,"LEAPHUB_PRODUCTION_GATEWAY_SECRET":production_secret,"LEAPHUB_ENVIRONMENT":"unified","LEAPHUB_OCPP_PORT":str(port),"LEAPHUB_RUNTIME_DIR":str(runtime),"LEAPHUB_STATUS_FILE":str(runtime/"status.json"),"LEAPHUB_PID_FILE":str(runtime/"gateway.pid"),"LEAPHUB_LOG_FILE":str(runtime/"gateway.log"),"LEAPHUB_OCPP_STATE_DB":str(runtime/"ocpp-state.sqlite"),"LEAPHUB_SERVICE_NAME":"leaphub-ocpp-wallbox","LEAPHUB_GATEWAY_MODE":"home_assistant_tunnel","LEAPHUB_GATEWAY_PROVIDER":"home_assistant_tunnel","LEAPHUB_OCPP_MAX_CONNECTIONS":str(maximum),"LEAPHUB_OCPP_COMMAND_POLL":"2","LEAPHUB_OCPP_COMMAND_IDLE_POLL":"10","LEAPHUB_OCPP_PING_INTERVAL":str(int(OPTIONS.get("ocpp_ping_interval_seconds") or 30)),"LEAPHUB_OCPP_LIVENESS_TIMEOUT":str(int(OPTIONS.get("ocpp_liveness_timeout_seconds") or 120)),"LEAPHUB_OCPP_DISCONNECT_GRACE":str(int(OPTIONS.get("ocpp_disconnect_grace_seconds") or 8)),"LEAPHUB_OCPP_QUEUE_MAX":str(int(OPTIONS.get("ocpp_queue_max_events") or 10000)),"LEAPHUB_OCPP_QUEUE_RETENTION_SECONDS":str(int(OPTIONS.get("ocpp_queue_retention_days") or 7) * 86400),"LEAPHUB_OCPP_LOG_LEVEL":LOG_LEVEL}
+    return {"LEAPHUB_BETA_INTERNAL_URL":beta_url,"LEAPHUB_PRODUCTION_INTERNAL_URL":production_url,"LEAPHUB_BETA_GATEWAY_SECRET":beta_secret,"LEAPHUB_PRODUCTION_GATEWAY_SECRET":production_secret,"LEAPHUB_ENVIRONMENT":"unified","LEAPHUB_OCPP_PORT":str(port),"LEAPHUB_RUNTIME_DIR":str(runtime),"LEAPHUB_STATUS_FILE":str(runtime/"status.json"),"LEAPHUB_PID_FILE":str(runtime/"gateway.pid"),"LEAPHUB_LOG_FILE":str(runtime/"gateway.log"),"LEAPHUB_OCPP_STATE_DB":str(runtime/"ocpp-state.sqlite"),"LEAPHUB_SERVICE_NAME":"leaphub-ocpp-wallbox","LEAPHUB_GATEWAY_MODE":"home_assistant_tunnel","LEAPHUB_GATEWAY_PROVIDER":"home_assistant_tunnel","LEAPHUB_OCPP_MAX_CONNECTIONS":str(maximum),"LEAPHUB_OCPP_COMMAND_POLL":"2","LEAPHUB_OCPP_COMMAND_IDLE_POLL":"10","LEAPHUB_OCPP_LOG_LEVEL":LOG_LEVEL}
 
 
 APP_DIR = Path(__file__).resolve().parent
@@ -413,7 +409,7 @@ main{max-width:1180px;margin:auto;padding:24px}.hero{display:flex;gap:18px;align
 details{margin-top:12px}summary{cursor:pointer;color:var(--muted)}pre{white-space:pre-wrap;word-break:break-word;background:#050c15;border:1px solid var(--line);border-radius:12px;padding:12px;max-height:260px;overflow:auto;color:#bcd0e8;font-size:12px}.wide{grid-column:1/-1}.routes{display:grid;grid-template-columns:1fr auto;gap:8px}.routes code{background:#050c15;border:1px solid var(--line);border-radius:10px;padding:9px;overflow:auto}.notice{border-left:3px solid var(--blue);padding:10px 12px;background:rgba(85,167,255,.08);border-radius:10px;color:#cfe4ff}.foot{color:var(--muted);text-align:center;padding:20px}
 @media(max-width:760px){main{padding:14px}.grid{grid-template-columns:1fr}.hero{align-items:flex-start}.badge{display:none}.meta{grid-template-columns:1fr 1fr}.routes{grid-template-columns:1fr}}
 </style></head><body><main>
-<div class="hero"><div class="mark">LH</div><div><h1>Leap Hub Gateway</h1><p class="sub">Telemetria resiliente, Connector, OCPP e Cloudflare em um único App</p></div><span class="badge">v1.12.14</span></div>
+<div class="hero"><div class="mark">LH</div><div><h1>Leap Hub Gateway</h1><p class="sub">Telemetria resiliente, Connector, OCPP e Cloudflare em um único App</p></div><span class="badge">v1.12.13</span></div>
 <div class="grid" id="cards"></div>
 <section class="card wide" style="margin-top:16px"><div class="head"><div><h2>Rotas do Cloudflare Tunnel</h2><p>Como o Tunnel roda dentro do mesmo App, use 127.0.0.1 nas origens.</p></div></div><div class="routes"><code>connector.leaphub.com.br → http://127.0.0.1:8094</code><span>Connector</span><code>ocpp-wallbox.leaphub.com.br → http://127.0.0.1:8092</code><span>OCPP Wallbox · Beta e Produção</span></div><p class="notice">A fila de telemetria sobrevive a reinícios do App. Uma queda do Home Assistant inteiro ainda cria uma lacuna real, que nunca será preenchida com dados inventados.</p></section>
 <div class="foot">Tokens e chaves nunca são exibidos neste painel.</div></main><script>

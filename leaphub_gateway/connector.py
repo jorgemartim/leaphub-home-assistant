@@ -42,7 +42,7 @@ except ImportError:
         _privacy_spec.loader.exec_module(_privacy_module)
         sanitize_log = _privacy_module.sanitize_log
 
-CONNECTOR_VERSION = "1.12.14"
+CONNECTOR_VERSION = "1.12.13"
 MAX_INPUT_BYTES = 1024 * 1024
 logging.getLogger("leapmotor_api").setLevel(logging.WARNING)
 LOGGER = logging.getLogger("leaphub.connector")
@@ -113,10 +113,6 @@ class ConnectorTemporaryError(RuntimeError):
 
 class ConnectorAuthenticationError(RuntimeError):
     """Credencial realmente recusada depois das tentativas de reautenticação."""
-
-
-class ConnectorSessionExpiredError(ConnectorTemporaryError):
-    """A sessão/token expirou, mas as credenciais não foram recusadas."""
 
 
 class ConnectorLoginCooldownError(ConnectorTemporaryError):
@@ -244,14 +240,6 @@ AUTHENTICATION_MARKERS = (
 def is_transient_cloud_error(value: Any) -> bool:
     message = clean_message(str(value)).lower()
     return any(marker in message for marker in TRANSIENT_CLOUD_MARKERS)
-
-
-def is_session_expired_error(value: Any) -> bool:
-    message = clean_message(str(value)).lower()
-    return any(marker in message for marker in (
-        "token expired", "session expired", "login expired", "invalid token",
-        "token is invalid", "expired token", "authentication token expired",
-    ))
 
 
 def is_authentication_error(value: Any) -> bool:
