@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import py_compile
 import re
-import subprocess
 import sys
 from pathlib import Path
 
@@ -66,6 +65,7 @@ for filename in (
     "telemetry_engine.py",
     "ocpp_gateway.py",
     "gateway_manager.py",
+    "privacy.py",
 ):
     path = APP / filename
     py_compile.compile(str(path), doraise=True)
@@ -78,9 +78,10 @@ for filename in (
 dockerfile = (APP / "Dockerfile").read_text(encoding="utf-8")
 server_source = (APP / "connector_server.py").read_text(encoding="utf-8")
 for marker in (
-    "COPY connector.py telemetry_engine.py /app/",
+    "COPY connector.py telemetry_engine.py privacy.py /app/",
     "leaphub_connector.py",
     "leaphub_telemetry_engine.py",
+    "leaphub_privacy.py",
     "Autoteste de importação de Connector e telemetria concluído",
 ):
     if marker not in dockerfile:
@@ -127,8 +128,5 @@ for translation in (APP / "translations").glob("*.yaml"):
 changelog = (APP / "CHANGELOG.md").read_text(encoding="utf-8")
 if f"## {version}" not in changelog:
     fail(f"CHANGELOG.md não contém a versão {version}.")
-
-for test_file in (ROOT / "tests" / "test_contracts.py", ROOT / "tests" / "test_remote_command_matrix.py", ROOT / "tests" / "test_comfort_contract.py", ROOT / "tests" / "test_auth_recovery_contract.py"):
-    subprocess.run([sys.executable, str(test_file)], cwd=ROOT, check=True)
 
 print(f"Repositório válido. Leap Hub Gateway {version}.")

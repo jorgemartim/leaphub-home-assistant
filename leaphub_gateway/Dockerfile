@@ -37,7 +37,7 @@ RUN python3 -m pip install --requirement /app/requirements.txt
 
 # Os módulos críticos ficam em /app e também em site-packages com nomes exclusivos.
 # Isso evita falhas de importação mesmo que o diretório de trabalho mude em runtime.
-COPY connector.py telemetry_engine.py /app/
+COPY connector.py telemetry_engine.py privacy.py /app/
 RUN python3 - <<'PY'
 from pathlib import Path
 import shutil
@@ -47,6 +47,7 @@ target_dir = Path(site.getsitepackages()[0])
 modules = {
     'connector.py': 'leaphub_connector.py',
     'telemetry_engine.py': 'leaphub_telemetry_engine.py',
+    'privacy.py': 'leaphub_privacy.py',
 }
 for source_name, target_name in modules.items():
     source = base / source_name
@@ -65,11 +66,13 @@ from pathlib import Path
 import importlib.util
 import leaphub_connector
 import leaphub_telemetry_engine
+import leaphub_privacy
 from leaphub_telemetry_engine import TelemetryEngine
 assert Path('/app/connector.py').is_file()
 assert Path('/app/telemetry_engine.py').is_file()
 assert leaphub_connector.CONNECTOR_VERSION
 assert leaphub_telemetry_engine.ENGINE_VERSION
+assert callable(leaphub_privacy.sanitize_log)
 assert TelemetryEngine is not None
 import os
 import sqlite3

@@ -20,7 +20,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-VERSION = "1.12.12"
+try:
+    from leaphub_privacy import install_logging_privacy_filter, sanitize_log
+except ImportError:
+    from privacy import install_logging_privacy_filter, sanitize_log
+
+VERSION = "1.12.13"
 OPTIONS_PATH = Path(os.getenv("LEAPHUB_OPTIONS_PATH", "/data/options.json"))
 RUNTIME = Path(os.getenv("LEAPHUB_RUNTIME_DIR", "/data/runtime"))
 LOG_DIR = Path(os.getenv("LEAPHUB_LOG_DIR", "/data/logs"))
@@ -44,6 +49,7 @@ def load_options() -> dict[str, Any]:
 OPTIONS = load_options()
 LOG_LEVEL = str(OPTIONS.get("log_level") or "INFO").upper()
 logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO), format="%(asctime)s %(levelname)s %(message)s")
+install_logging_privacy_filter()
 LOG = logging.getLogger("leaphub.gateway")
 STOP = threading.Event()
 UI_TOKEN = secrets.token_hex(24)
@@ -54,21 +60,7 @@ def secret_ok(value: Any, minimum: int = 32) -> bool:
 
 
 def sanitize(line: str) -> str:
-    text = str(line).replace("\x00", " ").rstrip()
-    for key in ("tunnel_token", "gateway_secret", "staging_secret", "production_secret", "TUNNEL_TOKEN"):
-        text = text.replace(key + "=", key + "=[protegido]")
-    text = re.sub(r"(?i)(operatePassword|operation_password|password|token|authorization)=([^&\s]+)", r"\1=[protegido]", text)
-    text = re.sub(r'(?i)("(?:operatePassword|operation_password|password|token|authorization)"\s*:\s*")[^"]+("?)', r'\1[protegido]\2', text)
-    text = re.sub(r"(?i)(vin)=([^&\s]+)", r"\1=[VIN protegido]", text)
-    text = re.sub(r'(?i)("vin"\s*:\s*")[^"]+("?)', r'\1[VIN protegido]\2', text)
-    text = re.sub(r"\b[A-HJ-NPR-Z0-9]{17}\b", "[VIN protegido]", text, flags=re.IGNORECASE)
-    if "eyJ" in text and len(text) > 120:
-        start = text.find("eyJ")
-        end = text.find(" ", start)
-        if end < 0:
-            end = len(text)
-        text = text[:start] + "[token protegido]" + text[end:]
-    return text[-4000:]
+    return sanitize_log(line, 4000)
 
 
 def scrub_existing_logs() -> None:
@@ -231,13 +223,13 @@ def write_connector_options() -> Path:
         "telemetry_beta_internal_url": str(OPTIONS.get("telemetry_beta_internal_url") or ""),
         "telemetry_production_enabled": bool(OPTIONS.get("telemetry_production_enabled", False)),
         "telemetry_production_internal_url": str(OPTIONS.get("telemetry_production_internal_url") or ""),
-        "telemetry_active_seconds": int(OPTIONS.get("telemetry_active_seconds") or 30),
+        "telemetry_active_seconds": int(OPTIONS.get("telemetry_active_seconds") or 20),
         "telemetry_interactive_seconds": int(OPTIONS.get("telemetry_interactive_seconds") or 20),
         "telemetry_command_seconds": max(10, min(60, int(OPTIONS.get("telemetry_command_seconds") or 12))),
         "telemetry_command_max_polls": max(2, min(4, int(OPTIONS.get("telemetry_command_max_polls") or 3))),
-        "telemetry_charging_seconds": int(OPTIONS.get("telemetry_charging_seconds") or 30),
-        "telemetry_parked_seconds": int(OPTIONS.get("telemetry_parked_seconds") or 300),
-        "telemetry_sleep_seconds": int(OPTIONS.get("telemetry_sleep_seconds") or 900),
+        "telemetry_charging_seconds": int(OPTIONS.get("telemetry_charging_seconds") or 25),
+        "telemetry_parked_seconds": int(OPTIONS.get("telemetry_parked_seconds") or 90),
+        "telemetry_sleep_seconds": int(OPTIONS.get("telemetry_sleep_seconds") or 600),
         "telemetry_presence_window_seconds": int(OPTIONS.get("telemetry_presence_window_seconds") or 420),
         "telemetry_rate_limit_cooldown_seconds": int(OPTIONS.get("telemetry_rate_limit_cooldown_seconds") or 900),
         "telemetry_batch_size": int(OPTIONS.get("telemetry_batch_size") or 25),
@@ -375,8 +367,6 @@ def status_payload(include_logs: bool = True) -> dict[str, Any]:
     result: dict[str, Any] = {
         "ok": True,
         "version": VERSION,
-        "connector_api_version": 2,
-        "capability_schema_version": 1,
         "updated_at": utc_now(),
         "hostname_for_tunnel": "local-leaphub-gateway",
         "services": {},
@@ -418,7 +408,7 @@ main{max-width:1180px;margin:auto;padding:24px}.hero{display:flex;gap:18px;align
 details{margin-top:12px}summary{cursor:pointer;color:var(--muted)}pre{white-space:pre-wrap;word-break:break-word;background:#050c15;border:1px solid var(--line);border-radius:12px;padding:12px;max-height:260px;overflow:auto;color:#bcd0e8;font-size:12px}.wide{grid-column:1/-1}.routes{display:grid;grid-template-columns:1fr auto;gap:8px}.routes code{background:#050c15;border:1px solid var(--line);border-radius:10px;padding:9px;overflow:auto}.notice{border-left:3px solid var(--blue);padding:10px 12px;background:rgba(85,167,255,.08);border-radius:10px;color:#cfe4ff}.foot{color:var(--muted);text-align:center;padding:20px}
 @media(max-width:760px){main{padding:14px}.grid{grid-template-columns:1fr}.hero{align-items:flex-start}.badge{display:none}.meta{grid-template-columns:1fr 1fr}.routes{grid-template-columns:1fr}}
 </style></head><body><main>
-<div class="hero"><div class="mark">LH</div><div><h1>Leap Hub Gateway</h1><p class="sub">Telemetria resiliente, Connector, OCPP e Cloudflare em um único App</p></div><span class="badge">v1.12.12</span></div>
+<div class="hero"><div class="mark">LH</div><div><h1>Leap Hub Gateway</h1><p class="sub">Telemetria resiliente, Connector, OCPP e Cloudflare em um único App</p></div><span class="badge">v1.12.13</span></div>
 <div class="grid" id="cards"></div>
 <section class="card wide" style="margin-top:16px"><div class="head"><div><h2>Rotas do Cloudflare Tunnel</h2><p>Como o Tunnel roda dentro do mesmo App, use 127.0.0.1 nas origens.</p></div></div><div class="routes"><code>connector.leaphub.com.br → http://127.0.0.1:8094</code><span>Connector</span><code>ocpp-wallbox.leaphub.com.br → http://127.0.0.1:8092</code><span>OCPP Wallbox · Beta e Produção</span></div><p class="notice">A fila de telemetria sobrevive a reinícios do App. Uma queda do Home Assistant inteiro ainda cria uma lacuna real, que nunca será preenchida com dados inventados.</p></section>
 <div class="foot">Tokens e chaves nunca são exibidos neste painel.</div></main><script>

@@ -10,6 +10,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import io
+import inspect
 import json
 import logging
 import os
@@ -27,7 +28,12 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable
 
-CONNECTOR_VERSION = "1.12.12"
+try:
+    from leaphub_privacy import sanitize_log
+except ImportError:
+    from privacy import sanitize_log
+
+CONNECTOR_VERSION = "1.12.13"
 MAX_INPUT_BYTES = 1024 * 1024
 logging.getLogger("leapmotor_api").setLevel(logging.WARNING)
 LOGGER = logging.getLogger("leaphub.connector")
@@ -66,10 +72,6 @@ COMMAND_METHODS: dict[str, str] = {
     "unlock_charger": "unlock_charger",
     "set_charge_limit": "set_charge_limit",
     "send_destination": "send_destination",
-    "steering_wheel_heat_on": "steering_wheel_heat_on",
-    "steering_wheel_heat_off": "steering_wheel_heat_off",
-    "rearview_mirror_heat_on": "rearview_mirror_heat_on",
-    "rearview_mirror_heat_off": "rearview_mirror_heat_off",
 }
 
 
@@ -89,17 +91,7 @@ def json_default(value: Any) -> Any:
 
 
 def clean_message(message: str) -> str:
-    text = " ".join(str(message).replace("\x00", " ").split())
-    for marker in ("-----BEGIN", "-----END"):
-        if marker in text:
-            return "Falha de autenticação ou certificado inválido."
-    # Nunca exponha VIN, tokens ou valores criptográficos de comando.
-    text = re.sub(r"(?i)(operatePassword|operation_password|password|token|authorization)=([^&\s]+)", r"\1=[protegido]", text)
-    text = re.sub(r'(?i)("(?:operatePassword|operation_password|password|token|authorization)"\s*:\s*")[^"]+("?)', r'\1[protegido]\2', text)
-    text = re.sub(r"(?i)(vin)=([^&\s]+)", r"\1=[VIN protegido]", text)
-    text = re.sub(r'(?i)("vin"\s*:\s*")[^"]+("?)', r'\1[VIN protegido]\2', text)
-    text = re.sub(r"\b[A-HJ-NPR-Z0-9]{17}\b", "[VIN protegido]", text, flags=re.IGNORECASE)
-    return text[:900] or "Falha desconhecida no conector."
+    return sanitize_log(message, 900)
 
 
 class ConnectorTemporaryError(RuntimeError):
@@ -115,9 +107,10 @@ class ConnectorLoginCooldownError(ConnectorTemporaryError):
 
     def __init__(self, message: str, retry_after_seconds: int = 135) -> None:
         super().__init__(message)
-        # Bloqueios de login informados pela Leapmotor são curtos. Nunca deixe
-        # uma mensagem de 2 minutos virar 30 minutos ou 6 horas localmente.
-        self.retry_after_seconds = max(30, min(300, int(retry_after_seconds or 135)))
+        # A nuvem costuma informar 135–300s; o gerenciador global pode elevar
+        # para 5/10/20/30 minutos após bloqueios consecutivos. O erro precisa
+        # transportar o prazo real sem reduzi-lo para cinco minutos.
+        self.retry_after_seconds = max(30, min(1800, int(retry_after_seconds or 135)))
 
 
 LOGIN_COOLDOWN_MARKERS = (
@@ -1689,23 +1682,9 @@ def serialize_vehicle(
     raw_abilities = attribute(vehicle, "abilities", []) or []
     raw_rights = attribute(vehicle, "rights", []) or []
     raw_module_rights = attribute(vehicle, "module_rights", []) or []
-
-    def capability_label(item: Any) -> str:
-        parts: list[str] = []
-        for candidate in (
-            value_of(item),
-            attribute(item, "name"),
-            attribute(item, "description"),
-            str(item),
-        ):
-            value = " ".join(str(candidate or "").split()).strip()
-            if value and value not in parts:
-                parts.append(value[:120])
-        return " | ".join(parts)[:240]
-
-    abilities = [label for item in raw_abilities if (label := capability_label(item))]
-    rights = [label for item in raw_rights if (label := capability_label(item))]
-    module_rights = [label for item in raw_module_rights if (label := capability_label(item))]
+    abilities = [str(value_of(item)) for item in raw_abilities]
+    rights = [str(value_of(item)) for item in raw_rights]
+    module_rights = [str(value_of(item)) for item in raw_module_rights]
     vehicle_scalars = object_scalar_map(vehicle)
     exterior_color = first_text(
         attribute(vehicle, "out_color"),
@@ -2510,7 +2489,54 @@ def execute_vehicle_command(
         longitude = float(parameters.get("longitude"))
         if latitude < -90 or latitude > 90 or longitude < -180 or longitude > 180:
             raise ValueError("Coordenadas inválidas.")
-        return method(vehicle_id, name=name, address=address, latitude=latitude, longitude=longitude)
+        # leapmotor-api 0.3.x changed the destination signature between builds.
+        # Build exactly one compatible call instead of blindly sending `name=`,
+        # which is rejected by versions that expose only address/lat/lon.
+        values = {
+            "name": name,
+            "title": name,
+            "poi_name": name,
+            "destination_name": name,
+            "address": address,
+            "addr": address,
+            "latitude": latitude,
+            "lat": latitude,
+            "longitude": longitude,
+            "lon": longitude,
+            "lng": longitude,
+        }
+        try:
+            signature = inspect.signature(method)
+        except (TypeError, ValueError):
+            return method(vehicle_id, address=address, latitude=latitude, longitude=longitude)
+
+        positional: list[Any] = [vehicle_id]
+        keyword: dict[str, Any] = {}
+        parameters_by_name = list(signature.parameters.values())
+        # Bound methods normally omit self. The first exposed argument is the
+        # vehicle identifier already supplied above.
+        remaining = parameters_by_name[1:] if parameters_by_name else []
+        accepts_var_keyword = any(item.kind == inspect.Parameter.VAR_KEYWORD for item in remaining)
+        for item in remaining:
+            if item.kind in {inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD}:
+                continue
+            if item.name not in values:
+                if item.default is inspect.Parameter.empty:
+                    raise RuntimeError(
+                        "A biblioteca Leapmotor exige um parâmetro de destino ainda não suportado: "
+                        + item.name
+                    )
+                continue
+            if item.kind == inspect.Parameter.POSITIONAL_ONLY:
+                positional.append(values[item.name])
+            else:
+                keyword[item.name] = values[item.name]
+        if accepts_var_keyword:
+            keyword.setdefault("address", address)
+            keyword.setdefault("latitude", latitude)
+            keyword.setdefault("longitude", longitude)
+        signature.bind(*positional, **keyword)
+        return method(*positional, **keyword)
     return method(vehicle_id)
 
 
