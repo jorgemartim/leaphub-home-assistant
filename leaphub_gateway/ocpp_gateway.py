@@ -38,7 +38,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-GATEWAY_VERSION = "1.12.16"
+GATEWAY_VERSION = "1.12.17"
 IS_RAILWAY = bool(os.getenv("RAILWAY_ENVIRONMENT_NAME") or os.getenv("RAILWAY_SERVICE_ID"))
 RUNTIME_DIR = Path(os.getenv("LEAPHUB_RUNTIME_DIR", "/tmp/leaphub-ocpp" if IS_RAILWAY else "."))
 BIND = os.getenv("LEAPHUB_OCPP_BIND", "0.0.0.0")
@@ -60,6 +60,7 @@ GATEWAY_PROVIDER = os.getenv("LEAPHUB_GATEWAY_PROVIDER", "home_assistant_tunnel"
 MAX_FRAME_BYTES = int(os.getenv("LEAPHUB_OCPP_MAX_FRAME_BYTES", str(1024 * 1024)))
 COMMAND_POLL_SECONDS = float(os.getenv("LEAPHUB_OCPP_COMMAND_POLL", "2.0"))
 COMMAND_IDLE_POLL_SECONDS = float(os.getenv("LEAPHUB_OCPP_COMMAND_IDLE_POLL", "10.0"))
+STATUS_REPORT_SECONDS = max(15.0, float(os.getenv("LEAPHUB_OCPP_STATUS_INTERVAL", "30")))
 MAX_CONNECTIONS = max(1, int(os.getenv("LEAPHUB_OCPP_MAX_CONNECTIONS", "1000")))
 MAX_CONNECTIONS_PER_IP = max(1, int(os.getenv("LEAPHUB_OCPP_MAX_CONNECTIONS_PER_IP", "50")))
 AUTH_FAILURE_WINDOW_SECONDS = max(60, int(os.getenv("LEAPHUB_OCPP_AUTH_WINDOW", "300")))
@@ -114,24 +115,29 @@ class ApiTarget:
 
 
 def configured_targets() -> list[ApiTarget]:
-    targets: list[ApiTarget] = []
-    # Em modo local legado cada processo atende somente seu ambiente. No Home
-    # Assistant o endpoint é unificado e resolve Beta/Produção pelo Charge ID.
-    if LEGACY_INTERNAL_URL and ENVIRONMENT_LABEL in {"staging", "production"}:
-        secret_name = "beta" if ENVIRONMENT_LABEL == "staging" else "production"
+    """Carrega exatamente um destino OCPP por processo.
+
+    A porta pública continua única. O ambiente proprietário é escolhido pelo
+    manager e nunca é descoberto consultando Beta e Produção em paralelo.
+    """
+    environment = ENVIRONMENT_LABEL if ENVIRONMENT_LABEL in {"staging", "production"} else ""
+    if environment:
+        name = "beta" if environment == "staging" else "production"
+        selected_url = LEGACY_INTERNAL_URL or (BETA_INTERNAL_URL if environment == "staging" else PRODUCTION_INTERNAL_URL)
+        secret = configured_secret(name)
+        return [ApiTarget(environment, selected_url, secret)] if selected_url and secret else []
+
+    candidates: list[ApiTarget] = []
+    for name, url, secret_name in (
+        ("staging", BETA_INTERNAL_URL, "beta"),
+        ("production", PRODUCTION_INTERNAL_URL, "production"),
+    ):
         secret = configured_secret(secret_name)
-        if secret:
-            return [ApiTarget(ENVIRONMENT_LABEL, LEGACY_INTERNAL_URL, secret)]
-    # Staging vem primeiro somente para um Charge ID novo. Cache e override de
-    # Produção sempre ganham depois da promoção.
-    definitions = (
-        ("staging", BETA_INTERNAL_URL, configured_secret("beta")),
-        ("production", PRODUCTION_INTERNAL_URL, configured_secret("production")),
-    )
-    for name, url, secret in definitions:
-        if url and secret and all(existing.url != url for existing in targets):
-            targets.append(ApiTarget(name, url, secret))
-    return targets
+        if url and secret and all(existing.url != url for existing in candidates):
+            candidates.append(ApiTarget(name, url, secret))
+    if len(candidates) > 1:
+        raise RuntimeError("OCPP ambíguo: defina LEAPHUB_ENVIRONMENT como staging ou production.")
+    return candidates
 
 
 API_TARGETS = configured_targets()
@@ -772,7 +778,8 @@ class ChargePointConnection:
             await self.send_json([3, message_id, response_payload if isinstance(response_payload, dict) else {}])
 
     async def command_loop(self) -> None:
-        delay = COMMAND_POLL_SECONDS
+        identity_jitter = (int(hashlib.sha256(self.identity.encode("utf-8")).hexdigest()[:8], 16) % 1500) / 1000.0
+        delay = COMMAND_POLL_SECONDS + identity_jitter
         while not self.closed:
             await asyncio.sleep(delay)
             try:
@@ -780,10 +787,10 @@ class ChargePointConnection:
                 commands = result.get("commands")
                 if not isinstance(commands, list): delay = COMMAND_IDLE_POLL_SECONDS; continue
                 if commands:
-                    delay = COMMAND_POLL_SECONDS
+                    delay = COMMAND_POLL_SECONDS + identity_jitter
                     for command in commands:
                         if isinstance(command, dict): await self.execute_command(command)
-                else: delay = min(COMMAND_IDLE_POLL_SECONDS, max(COMMAND_POLL_SECONDS, delay * 1.6))
+                else: delay = min(COMMAND_IDLE_POLL_SECONDS + identity_jitter, max(COMMAND_POLL_SECONDS + identity_jitter, delay * 1.6))
             except asyncio.CancelledError: raise
             except Exception as exc:
                 delay = min(60.0, max(COMMAND_IDLE_POLL_SECONDS, delay * 2.0))
@@ -964,12 +971,19 @@ STOP_EVENT = asyncio.Event()
 
 
 def normalize_remote_ip(headers: dict[str, str], peer_ip: str) -> str:
-    candidates = [
-        headers.get("cf-connecting-ip", ""),
-        headers.get("x-real-ip", ""),
-        headers.get("x-forwarded-for", "").split(",", 1)[0].strip(),
-        peer_ip,
-    ]
+    """Aceita cabeçalhos de proxy somente de um peer local/privado confiável."""
+    try:
+        peer = ipaddress.ip_address(str(peer_ip).strip())
+    except ValueError:
+        peer = None
+    candidates: list[str] = []
+    if peer is not None and (peer.is_loopback or peer.is_private):
+        candidates.extend([
+            headers.get("cf-connecting-ip", ""),
+            headers.get("x-real-ip", ""),
+            headers.get("x-forwarded-for", "").split(",", 1)[0].strip(),
+        ])
+    candidates.append(peer_ip)
     for candidate in candidates:
         candidate = candidate.strip()
         if not candidate:
@@ -1283,7 +1297,8 @@ async def status_loop() -> None:
             "max_connections": MAX_CONNECTIONS, "port": PORT, "started_at": STARTED_AT, "gateway_mode": GATEWAY_MODE,
             "provider": GATEWAY_PROVIDER, "service_name": SERVICE_NAME, "deployment_id": DEPLOYMENT_ID,
             "railway_environment": RAILWAY_ENVIRONMENT, "public_domain": PUBLIC_DOMAIN, "version": GATEWAY_VERSION,
-            "unified_endpoint": True, "queued_events": pending_events, "queued_command_results": pending_command_results, "cached_routes": cached_routes,
+            "unified_endpoint": True, "active_environment": ENVIRONMENT_LABEL, "target_count": len(API_TARGETS),
+            "queued_events": pending_events, "queued_command_results": pending_command_results, "cached_routes": cached_routes,
             "connection_liveness": {
                 "oldest_rx_age_seconds": max([int(now_mono - c.last_rx_at) for c in CONNECTIONS.values()] or [0]),
                 "pending_calls": sum(len(c.pending_calls) for c in CONNECTIONS.values()),
@@ -1303,7 +1318,7 @@ async def status_loop() -> None:
             try:
                 result = await asyncio.to_thread(api_call, target, {"action": "gateway_status", **status}, 4.0)
                 apply_route_overrides(target, result)
-                failures[target.name] = 0; next_attempt[target.name] = now + 15.0; last_errors.pop(target.name, None)
+                failures[target.name] = 0; next_attempt[target.name] = now + STATUS_REPORT_SECONDS; last_errors.pop(target.name, None)
             except Exception as exc:  # noqa: BLE001
                 failures[target.name] = failures.get(target.name, 0) + 1
                 delay = min(900.0, 60.0 * (2 ** min(failures[target.name] - 1, 4)))
@@ -1312,7 +1327,7 @@ async def status_loop() -> None:
                     LOG.warning("Gateway status API %s failed; retry in %.0fs: %s", target.name, delay, message)
                     last_errors[target.name] = message; last_logged[target.name] = now
         try:
-            await asyncio.wait_for(STOP_EVENT.wait(), timeout=15)
+            await asyncio.wait_for(STOP_EVENT.wait(), timeout=STATUS_REPORT_SECONDS)
         except asyncio.TimeoutError:
             pass
 

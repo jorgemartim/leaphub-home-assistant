@@ -1,5 +1,5 @@
 name: "Leap Hub Gateway"
-version: "1.12.16"
+version: "1.12.17"
 slug: "leaphub_gateway"
 description: "Gateway unificado com sincronização automática adaptativa, fila persistente, Leapmotor, OCPP e Cloudflare Tunnel."
 url: "https://github.com/jorgemartim/leaphub-home-assistant"
@@ -54,11 +54,11 @@ options:
   ocpp_beta_enabled: true
   ocpp_beta_internal_url: "https://leaphub.com.br/beta/leap/api/internal/ocpp"
   ocpp_beta_secret: ""
-  ocpp_beta_max_connections: 100
+  ocpp_beta_max_connections: 20
   ocpp_production_enabled: false
   ocpp_production_internal_url: "https://leaphub.com.br/leap/api/internal/ocpp"
   ocpp_production_secret: ""
-  ocpp_production_max_connections: 100
+  ocpp_production_max_connections: 20
   ocpp_ping_interval_seconds: 30
   ocpp_liveness_timeout_seconds: 120
   ocpp_disconnect_grace_seconds: 8

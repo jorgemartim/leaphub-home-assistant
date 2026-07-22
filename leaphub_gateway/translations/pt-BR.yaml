@@ -64,7 +64,7 @@ configuration:
     description: Máximo de conexões OCPP simultâneas.
   ocpp_production_enabled:
     name: Ativar OCPP Produção
-    description: Inicia o gateway OCPP Produção na porta 8093.
+    description: Seleciona Produção como único ambiente proprietário do OCPP. Não ative junto com o Beta.
   ocpp_production_internal_url:
     name: URL interna OCPP Produção
     description: Endpoint HTTPS do Leap Hub Produção.

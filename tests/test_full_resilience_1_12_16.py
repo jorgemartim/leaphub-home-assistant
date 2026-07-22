@@ -68,6 +68,7 @@ with tempfile.TemporaryDirectory(prefix="leaphub-1-12-16-") as tmp:
     os.environ["LEAPHUB_PRODUCTION_GATEWAY_SECRET"] = "p" * 32
     os.environ["LEAPHUB_BETA_INTERNAL_URL"] = "http://127.0.0.1:9/beta"
     os.environ["LEAPHUB_PRODUCTION_INTERNAL_URL"] = "http://127.0.0.1:9/prod"
+    os.environ["LEAPHUB_ENVIRONMENT"] = "staging"
     privacy = load_module("leaphub_privacy", APP / "privacy.py")
     ocpp = load_module("leaphub_ocpp_1_12_16", APP / "ocpp_gateway.py")
 
@@ -107,8 +108,8 @@ with tempfile.TemporaryDirectory(prefix="leaphub-1-12-16-") as tmp:
     check("if streak >= 6:" in telemetry, "Repouso ainda demora consultas demais")
     check("renovada por refresh durante a leitura de mensagens" in telemetry, "Mensagens ainda forçam relogin direto")
     check('required = ("name", "version", "slug", "description", "arch")' in validator, "Validador ainda exige imagem GHCR")
-    check('version: "1.12.16"' in (APP / "config.yaml").read_text(), "Versão do App divergente")
+    check('version: "1.12.17"' in (APP / "config.yaml").read_text(), "Versão do App divergente")
 
 if failures:
-    raise SystemExit("full resilience 1.12.16 failed:\n- " + "\n- ".join(failures))
-print({"ok": True, "checks": 12, "version": "1.12.16"})
+    raise SystemExit("full resilience 1.12.17 failed:\n- " + "\n- ".join(failures))
+print({"ok": True, "checks": 12, "version": "1.12.17"})
