@@ -24,7 +24,7 @@ from cryptography.fernet import Fernet, InvalidToken
 import leaphub_connector as connector
 
 LOG = logging.getLogger("leaphub.telemetry")
-ENGINE_VERSION = "1.12.15.1"
+ENGINE_VERSION = "1.12.16"
 
 
 def utc_iso() -> str:
@@ -2088,11 +2088,19 @@ class TelemetryEngine:
                         session["messages_cached_at"] = time.time()
                     except Exception as exc:  # noqa: BLE001
                         if connector.is_session_expired_error(exc):
-                            self._close_session_locked(subscription_id)
-                            raise connector.ConnectorSessionExpiredError(
-                                "A sessão Leapmotor expirou durante a leitura de mensagens."
-                            ) from exc
-                        messages = cached_messages
+                            if self._try_refresh_client_session(client):
+                                LOG.info("Sessão de %s renovada por refresh durante a leitura de mensagens.", subscription_id)
+                                message_page = get_messages(page_no=1, page_size=100)
+                                messages = list(connector.attribute(message_page, "messages", []) or [])
+                                session["messages"] = messages
+                                session["messages_cached_at"] = time.time()
+                            else:
+                                self._close_session_locked(subscription_id)
+                                raise connector.ConnectorSessionExpiredError(
+                                    "A sessão Leapmotor expirou durante a leitura de mensagens."
+                                ) from exc
+                        else:
+                            messages = cached_messages
             serialized: list[dict[str, Any]] = []
             for item in selected:
                 if manual_should_yield is not None and manual_should_yield():
@@ -2263,7 +2271,7 @@ class TelemetryEngine:
             return self.charge_watch_seconds, "charge_watch", 0
         if "parked" in states:
             streak = previous_parked_streak + 1
-            if streak >= 20:
+            if streak >= 6:
                 return self.sleep_seconds, "sleep", streak
             return self.parked_seconds, "parked", streak
         return self.sleep_seconds, "sleep", previous_parked_streak + 1

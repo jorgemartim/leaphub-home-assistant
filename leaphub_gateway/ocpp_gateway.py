@@ -12,6 +12,7 @@ import asyncio
 import base64
 import hashlib
 import hmac
+import http.client
 import ipaddress
 import json
 import logging
@@ -23,6 +24,7 @@ import os
 import re
 import secrets
 import signal
+import ssl
 import sqlite3
 import struct
 import sys
@@ -36,7 +38,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-GATEWAY_VERSION = "1.12.15.1"
+GATEWAY_VERSION = "1.12.16"
 IS_RAILWAY = bool(os.getenv("RAILWAY_ENVIRONMENT_NAME") or os.getenv("RAILWAY_SERVICE_ID"))
 RUNTIME_DIR = Path(os.getenv("LEAPHUB_RUNTIME_DIR", "/tmp/leaphub-ocpp" if IS_RAILWAY else "."))
 BIND = os.getenv("LEAPHUB_OCPP_BIND", "0.0.0.0")
@@ -73,6 +75,9 @@ DIAGNOSTIC_WINDOW_SECONDS = 180
 DIAGNOSTIC_NONCES: dict[str, float] = {}
 STATUS_API_LAST_ERROR = ""
 STATUS_API_LAST_LOG_AT = 0.0
+API_CONNECTIONS: dict[tuple[str, int], dict[str, Any]] = {}
+API_CONNECTIONS_GUARD = threading.RLock()
+API_SSL_CONTEXT = ssl.create_default_context()
 
 
 for path in (STATUS_FILE, PID_FILE, LOG_FILE):
@@ -279,6 +284,11 @@ def remember_route(identity: str, target_name: str) -> None:
 def queue_event(target: ApiTarget, identity: str, message_id: str, action: str, payload: dict[str, Any], error: str) -> None:
     try:
         with state_db() as db:
+            if action == "Heartbeat":
+                db.execute(
+                    "DELETE FROM event_queue WHERE target_name=? AND identity=? AND ocpp_action='Heartbeat'",
+                    (target.name, identity),
+                )
             db.execute(
                 "INSERT OR IGNORE INTO event_queue(target_name,identity,message_id,ocpp_action,payload_json,attempts,available_at,created_at,last_error) "
                 "VALUES(?,?,?,?,?,0,?,?,?)",
@@ -355,34 +365,129 @@ def safe_http_error_detail(code: int, raw: bytes) -> str:
     return f"HTTP {code}: {re.sub(r'\s+', ' ', text)[:180]}"
 
 
+def _api_connection_state(target: ApiTarget) -> dict[str, Any]:
+    # Uma conexão persistente por worker evita handshakes repetidos sem
+    # serializar todas as wallboxes em um único socket.
+    key = (target.url, threading.get_ident())
+    with API_CONNECTIONS_GUARD:
+        state = API_CONNECTIONS.get(key)
+        if state is None:
+            state = {"connection": None, "lock": threading.RLock()}
+            API_CONNECTIONS[key] = state
+        return state
+
+
+def _drop_api_connection(target: ApiTarget) -> None:
+    state = _api_connection_state(target)
+    with state["lock"]:
+        connection = state.get("connection")
+        state["connection"] = None
+        if connection is not None:
+            try:
+                connection.close()
+            except OSError:
+                pass
+
+
+def _new_api_connection(target: ApiTarget, timeout: float) -> tuple[http.client.HTTPConnection, str]:
+    parsed = urllib.parse.urlsplit(target.url)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise RuntimeError(f"Internal API {target.name} has an invalid URL")
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    path = urllib.parse.urlunsplit(("", "", parsed.path or "/", parsed.query, ""))
+    if parsed.scheme == "https":
+        connection: http.client.HTTPConnection = http.client.HTTPSConnection(
+            parsed.hostname, port, timeout=timeout, context=API_SSL_CONTEXT
+        )
+    else:
+        connection = http.client.HTTPConnection(parsed.hostname, port, timeout=timeout)
+    return connection, path
+
+
 def api_call(target: ApiTarget, payload: dict[str, Any], timeout: float = 8.0) -> dict[str, Any]:
-    body=json.dumps(payload,ensure_ascii=False,separators=(",",":")).encode("utf-8"); timestamp=str(int(time.time())); nonce=secrets.token_hex(16)
-    path=urllib.parse.urlsplit(target.url).path or "/api/internal/ocpp"; canonical=f"POST\n{path}\n{timestamp}\n{nonce}\n{hashlib.sha256(body).hexdigest()}".encode("utf-8")
-    signature=hmac.new(target.secret.encode("utf-8"),canonical,hashlib.sha256).hexdigest()
-    request=urllib.request.Request(target.url,data=body,method="POST",headers={"Content-Type":"application/json","Accept":"application/json","X-LeapHub-Timestamp":timestamp,"X-LeapHub-Nonce":nonce,"X-LeapHub-Signature":signature,"User-Agent":f"LeapHub-OCPP-Gateway/{GATEWAY_VERSION}"})
-    try:
-        with urllib.request.urlopen(request,timeout=timeout) as response: raw=response.read(1024*1024)
-    except urllib.error.HTTPError as exc: raise RuntimeError(f"Internal API {target.name} rejected request: {safe_http_error_detail(exc.code,exc.read(4096))}") from exc
-    except (TimeoutError,OSError) as exc:
-        detail="read operation timed out" if "timed out" in str(exc).lower() else str(exc)
-        raise RuntimeError(f"Internal API {target.name} unavailable: {detail}") from exc
-    try: decoded=json.loads(raw.decode("utf-8"))
-    except (UnicodeDecodeError,json.JSONDecodeError) as exc: raise RuntimeError(f"Internal API {target.name} returned a non-JSON response") from exc
-    if not isinstance(decoded,dict) or not decoded.get("ok"):
-        message=str(decoded.get("message","Internal API returned an invalid response.")) if isinstance(decoded,dict) else "Invalid response"
-        raise RuntimeError(f"Internal API {target.name}: {message[:200]}")
-    return decoded
+    body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    parsed_path = urllib.parse.urlsplit(target.url).path or "/api/internal/ocpp"
+    state = _api_connection_state(target)
+    last_error: Exception | None = None
+    with state["lock"]:
+        for attempt in range(2):
+            timestamp = str(int(time.time()))
+            nonce = secrets.token_hex(16)
+            canonical = f"POST\n{parsed_path}\n{timestamp}\n{nonce}\n{hashlib.sha256(body).hexdigest()}".encode("utf-8")
+            signature = hmac.new(target.secret.encode("utf-8"), canonical, hashlib.sha256).hexdigest()
+            headers = {
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "Connection": "keep-alive",
+                "X-LeapHub-Timestamp": timestamp,
+                "X-LeapHub-Nonce": nonce,
+                "X-LeapHub-Signature": signature,
+                "User-Agent": f"LeapHub-OCPP-Gateway/{GATEWAY_VERSION}",
+            }
+            connection = state.get("connection")
+            path = ""
+            try:
+                if connection is None:
+                    connection, path = _new_api_connection(target, timeout)
+                    state["connection"] = connection
+                else:
+                    path = urllib.parse.urlunsplit(("", "", urllib.parse.urlsplit(target.url).path or "/", urllib.parse.urlsplit(target.url).query, ""))
+                    connection.timeout = timeout
+                    if connection.sock is not None:
+                        connection.sock.settimeout(timeout)
+                connection.request("POST", path, body=body, headers=headers)
+                response = connection.getresponse()
+                raw = response.read(1024 * 1024 + 1)
+                if len(raw) > 1024 * 1024:
+                    raise RuntimeError(f"Internal API {target.name} returned a response above the limit")
+                if response.will_close or response.getheader("Connection", "").lower() == "close":
+                    state["connection"] = None
+                    connection.close()
+                if response.status < 200 or response.status >= 300:
+                    raise RuntimeError(
+                        f"Internal API {target.name} rejected request: {safe_http_error_detail(response.status, raw[:4096])}"
+                    )
+                try:
+                    decoded = json.loads(raw.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                    raise RuntimeError(f"Internal API {target.name} returned a non-JSON response") from exc
+                if not isinstance(decoded, dict) or not decoded.get("ok"):
+                    message = str(decoded.get("message", "Internal API returned an invalid response.")) if isinstance(decoded, dict) else "Invalid response"
+                    raise RuntimeError(f"Internal API {target.name}: {message[:200]}")
+                return decoded
+            except (TimeoutError, OSError, http.client.HTTPException) as exc:
+                last_error = exc
+                state["connection"] = None
+                try:
+                    connection.close()
+                except (AttributeError, OSError):
+                    pass
+                if attempt == 0:
+                    continue
+                detail = "read operation timed out" if "timed out" in str(exc).lower() else str(exc)
+                raise RuntimeError(f"Internal API {target.name} unavailable: {detail}") from exc
+    raise RuntimeError(f"Internal API {target.name} unavailable: {last_error or 'unknown transport error'}")
 
 
 def resolve_route(identity: str, password: str, remote_ip: str) -> tuple[ApiTarget, dict[str, Any]]:
-    unavailable: list[str] = []
-    ordered: list[ApiTarget] = []
     cached = cached_target(identity)
     if cached is not None:
-        ordered.append(cached)
-    ordered.extend(target for target in API_TARGETS if target not in ordered)
+        try:
+            result = api_call(cached, {"action": "authorize_connection", "identity": identity, "password": password, "remote_ip": remote_ip}, 4.0)
+        except RuntimeError as exc:
+            # Uma rota conhecida indisponível não é falha de senha e não deve
+            # fazer a wallbox alternar entre Beta e Produção.
+            raise RuntimeError(str(exc)) from exc
+        if result.get("accepted"):
+            remember_route(identity, cached.name)
+            return cached, result
+        candidates = [target for target in API_TARGETS if target != cached]
+    else:
+        candidates = list(API_TARGETS)
+
+    unavailable: list[str] = []
     rejected = 0
-    for target in ordered:
+    for target in candidates:
         try:
             result = api_call(target, {"action": "authorize_connection", "identity": identity, "password": password, "remote_ip": remote_ip}, 4.0)
         except RuntimeError as exc:
@@ -392,9 +497,11 @@ def resolve_route(identity: str, password: str, remote_ip: str) -> tuple[ApiTarg
             remember_route(identity, target.name)
             return target, result
         rejected += 1
-    if unavailable and rejected == 0:
+    if unavailable:
         raise RuntimeError("; ".join(unavailable[:2]))
-    raise PermissionError("Charge point is not approved")
+    if rejected > 0 or cached is not None:
+        raise PermissionError("Charge point is not approved")
+    raise RuntimeError("No OCPP API target is currently available")
 
 
 def parse_headers(raw: bytes) -> tuple[str, str, dict[str, str]]:
@@ -964,10 +1071,16 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
         if len(decoded_key) != 16:
             await http_error(writer, 400, "Bad Request")
             return
-        if len(CONNECTIONS) >= MAX_CONNECTIONS:
+        existing_connection = CONNECTIONS.get(identity)
+        replacing_existing = existing_connection is not None and not existing_connection.closed
+        effective_connections = len(CONNECTIONS) - (1 if replacing_existing else 0)
+        effective_ip_connections = ACTIVE_BY_IP.get(remote_ip, 0)
+        if replacing_existing and existing_connection.remote_ip == remote_ip:
+            effective_ip_connections = max(0, effective_ip_connections - 1)
+        if effective_connections >= MAX_CONNECTIONS:
             await http_error(writer, 503, "Service Unavailable")
             return
-        if ACTIVE_BY_IP.get(remote_ip, 0) >= MAX_CONNECTIONS_PER_IP:
+        if effective_ip_connections >= MAX_CONNECTIONS_PER_IP:
             await http_error(writer, 429, "Too Many Requests")
             return
 

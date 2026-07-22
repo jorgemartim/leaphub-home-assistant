@@ -20,7 +20,7 @@ Enquanto uma aba autenticada do Leap Hub permanece visível, o site renova uma j
 - Reenvios com as mesmas credenciais não removem a proteção de autenticação ou cooldown.
 - Limite geral de requisições usa Retry-After; sem prazo, reavalia em 15 minutos.
 - Intervalos seguros: 30 s dirigindo/carregando, 5 min estacionado e 15 min em repouso.
-- Quando a janela de presença termina, a sessão é encerrada e nenhuma consulta à nuvem continua.
+- Quando a janela de presença termina, as consultas à nuvem param; a sessão saudável fica ociosa por uma janela limitada para evitar novo login ao retornar.
 
 ## Automação autônoma 1.11.69
 
