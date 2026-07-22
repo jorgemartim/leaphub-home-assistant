@@ -31,7 +31,16 @@ from typing import Any, Callable
 try:
     from leaphub_privacy import sanitize_log
 except ImportError:
-    from privacy import sanitize_log
+    try:
+        from privacy import sanitize_log
+    except ImportError:
+        import importlib.util as _importlib_util
+        _privacy_spec = _importlib_util.spec_from_file_location("leaphub_privacy_local", Path(__file__).with_name("privacy.py"))
+        if _privacy_spec is None or _privacy_spec.loader is None:
+            raise
+        _privacy_module = _importlib_util.module_from_spec(_privacy_spec)
+        _privacy_spec.loader.exec_module(_privacy_module)
+        sanitize_log = _privacy_module.sanitize_log
 
 CONNECTOR_VERSION = "1.12.13"
 MAX_INPUT_BYTES = 1024 * 1024
@@ -72,6 +81,10 @@ COMMAND_METHODS: dict[str, str] = {
     "unlock_charger": "unlock_charger",
     "set_charge_limit": "set_charge_limit",
     "send_destination": "send_destination",
+    "steering_wheel_heat_on": "steering_wheel_heat_on",
+    "steering_wheel_heat_off": "steering_wheel_heat_off",
+    "rearview_mirror_heat_on": "rearview_mirror_heat_on",
+    "rearview_mirror_heat_off": "rearview_mirror_heat_off",
 }
 
 
@@ -107,9 +120,8 @@ class ConnectorLoginCooldownError(ConnectorTemporaryError):
 
     def __init__(self, message: str, retry_after_seconds: int = 135) -> None:
         super().__init__(message)
-        # A nuvem costuma informar 135–300s; o gerenciador global pode elevar
-        # para 5/10/20/30 minutos após bloqueios consecutivos. O erro precisa
-        # transportar o prazo real sem reduzi-lo para cinco minutos.
+        # O valor imediato informado pela Leapmotor é preservado, enquanto o
+        # coordenador global pode ampliar bloqueios consecutivos até 30 minutos.
         self.retry_after_seconds = max(30, min(1800, int(retry_after_seconds or 135)))
 
 
@@ -1682,9 +1694,23 @@ def serialize_vehicle(
     raw_abilities = attribute(vehicle, "abilities", []) or []
     raw_rights = attribute(vehicle, "rights", []) or []
     raw_module_rights = attribute(vehicle, "module_rights", []) or []
-    abilities = [str(value_of(item)) for item in raw_abilities]
-    rights = [str(value_of(item)) for item in raw_rights]
-    module_rights = [str(value_of(item)) for item in raw_module_rights]
+
+    def capability_label(item: Any) -> str:
+        parts: list[str] = []
+        for candidate in (
+            value_of(item),
+            attribute(item, "name"),
+            attribute(item, "description"),
+            str(item),
+        ):
+            value = " ".join(str(candidate or "").split()).strip()
+            if value and value not in parts:
+                parts.append(value[:120])
+        return " | ".join(parts)[:240]
+
+    abilities = [label for item in raw_abilities if (label := capability_label(item))]
+    rights = [label for item in raw_rights if (label := capability_label(item))]
+    module_rights = [label for item in raw_module_rights if (label := capability_label(item))]
     vehicle_scalars = object_scalar_map(vehicle)
     exterior_color = first_text(
         attribute(vehicle, "out_color"),
@@ -2253,39 +2279,51 @@ def create_client(credentials: dict[str, Any], temp_dir: Path, operation_passwor
     )
 
 
-def handle_account(payload: dict[str, Any], sync: bool) -> dict[str, Any]:
+def handle_account(
+    payload: dict[str, Any],
+    sync: bool,
+    borrowed_client: Any | None = None,
+    borrowed_vehicles: list[Any] | None = None,
+) -> dict[str, Any]:
     credentials_value = payload.get("credentials") if sync else payload
     credentials = credentials_value if isinstance(credentials_value, dict) else {}
     vehicle_id = str(payload.get("vehicle_id") or "").strip() if sync else ""
     force_visual_bytes = bool(payload.get("force_visual_bytes")) if sync else False
     force_debug_package = bool(payload.get("force_debug_package")) if sync else False
     force_package_refresh = bool(payload.get("force_package_refresh")) if sync else False
-    temp_dir = secure_temp_directory()
-    client = None
+    client = borrowed_client
+    client_is_borrowed = borrowed_client is not None
+    temp_dir: Path | None = None
     try:
         try:
-            attempt_dir = temp_dir / "attempt-1"
-            attempt_dir.mkdir(mode=0o700, parents=True, exist_ok=False)
-            client = create_client(credentials, attempt_dir, None)
-            # Uma solicitação gera no máximo um login. Falhas transitórias são
-            # devolvidas ao scheduler, que aplica espera progressiva antes de
-            # qualquer nova autenticação.
-            client.login()
-            vehicles_value = client.get_vehicle_list()
-            vehicles = vehicles_value if isinstance(vehicles_value, list) else list(vehicles_value or [])
+            if client is None:
+                temp_dir = secure_temp_directory()
+                attempt_dir = temp_dir / "attempt-1"
+                attempt_dir.mkdir(mode=0o700, parents=True, exist_ok=False)
+                client = create_client(credentials, attempt_dir, None)
+                # Uma solicitação gera no máximo um login. Falhas transitórias são
+                # devolvidas ao coordenador global, que persiste o próximo prazo.
+                client.login()
+                vehicles_value = client.get_vehicle_list()
+                vehicles = vehicles_value if isinstance(vehicles_value, list) else list(vehicles_value or [])
+            else:
+                vehicles = list(borrowed_vehicles) if isinstance(borrowed_vehicles, list) and borrowed_vehicles else []
+                if not vehicles:
+                    vehicles_value = client.get_vehicle_list()
+                    vehicles = vehicles_value if isinstance(vehicles_value, list) else list(vehicles_value or [])
         except Exception as exc:  # noqa: BLE001
             cooldown = login_cooldown_seconds(exc)
             if cooldown > 0:
                 raise ConnectorLoginCooldownError(
-                    "A Leapmotor limitou temporariamente novas autenticações. O comando continuará protegido até a próxima tentativa permitida.",
+                    "A Leapmotor limitou temporariamente novas autenticações. A solicitação continuará protegida até a próxima tentativa permitida.",
                     cooldown,
                 ) from exc
             if is_transient_cloud_error(exc):
                 raise ConnectorTemporaryError(reconnect_message(exc)) from exc
             if is_authentication_error(exc):
                 raise ConnectorAuthenticationError(
-                    "A conta Leapmotor recusou a autenticação. "
-                    "Nenhuma nova tentativa automática será feita até a conta ser confirmada."
+                    "A sessão ou a conta Leapmotor recusou a autenticação. "
+                    "Nenhuma repetição paralela será iniciada."
                 ) from exc
             raise RuntimeError(clean_message(str(exc))) from exc
 
@@ -2327,16 +2365,18 @@ def handle_account(payload: dict[str, Any], sync: bool) -> dict[str, Any]:
             "vehicles": serialized,
             "connector_version": CONNECTOR_VERSION,
             "library_version": package_version(),
-            "login_attempts": 1,
+            "login_attempts": 0 if client_is_borrowed else 1,
             "reconnected": False,
+            "session_reused": client_is_borrowed,
         }
     finally:
-        if client is not None:
+        if client is not None and not client_is_borrowed:
             try:
                 client.close()
             except Exception:
                 pass
-        shutil.rmtree(temp_dir, ignore_errors=True)
+        if temp_dir is not None:
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 
@@ -2489,43 +2529,27 @@ def execute_vehicle_command(
         longitude = float(parameters.get("longitude"))
         if latitude < -90 or latitude > 90 or longitude < -180 or longitude > 180:
             raise ValueError("Coordenadas inválidas.")
-        # leapmotor-api 0.3.x changed the destination signature between builds.
-        # Build exactly one compatible call instead of blindly sending `name=`,
-        # which is rejected by versions that expose only address/lat/lon.
         values = {
-            "name": name,
-            "title": name,
-            "poi_name": name,
-            "destination_name": name,
-            "address": address,
-            "addr": address,
-            "latitude": latitude,
-            "lat": latitude,
-            "longitude": longitude,
-            "lon": longitude,
-            "lng": longitude,
+            "name": name, "title": name, "poi_name": name, "destination_name": name,
+            "address": address, "addr": address,
+            "latitude": latitude, "lat": latitude,
+            "longitude": longitude, "lon": longitude, "lng": longitude,
         }
         try:
             signature = inspect.signature(method)
         except (TypeError, ValueError):
             return method(vehicle_id, address=address, latitude=latitude, longitude=longitude)
-
         positional: list[Any] = [vehicle_id]
         keyword: dict[str, Any] = {}
-        parameters_by_name = list(signature.parameters.values())
-        # Bound methods normally omit self. The first exposed argument is the
-        # vehicle identifier already supplied above.
-        remaining = parameters_by_name[1:] if parameters_by_name else []
+        exposed = list(signature.parameters.values())
+        remaining = exposed[1:] if exposed else []
         accepts_var_keyword = any(item.kind == inspect.Parameter.VAR_KEYWORD for item in remaining)
         for item in remaining:
             if item.kind in {inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD}:
                 continue
             if item.name not in values:
                 if item.default is inspect.Parameter.empty:
-                    raise RuntimeError(
-                        "A biblioteca Leapmotor exige um parâmetro de destino ainda não suportado: "
-                        + item.name
-                    )
+                    raise RuntimeError("Parâmetro de destino ainda não suportado pela biblioteca: " + item.name)
                 continue
             if item.kind == inspect.Parameter.POSITIONAL_ONLY:
                 positional.append(values[item.name])

@@ -78,7 +78,7 @@ schema:
   telemetry_command_max_polls: "int(2,12)"
   telemetry_charging_seconds: "int(15,600)"
   telemetry_parked_seconds: "int(60,3600)"
-  telemetry_sleep_seconds: "int(600,900)"
+  telemetry_sleep_seconds: "int(300,14400)"
   telemetry_presence_window_seconds: "int(300,1800)"
   telemetry_rate_limit_cooldown_seconds: "int(300,21600)"
   telemetry_batch_size: "int(1,50)"

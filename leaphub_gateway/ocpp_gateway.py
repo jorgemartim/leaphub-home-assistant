@@ -15,6 +15,10 @@ import hmac
 import ipaddress
 import json
 import logging
+try:
+    from leaphub_privacy import install_logging_privacy_filter
+except ModuleNotFoundError:
+    from privacy import install_logging_privacy_filter
 import os
 import re
 import secrets
@@ -30,11 +34,6 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
-
-try:
-    from leaphub_privacy import install_logging_privacy_filter
-except ImportError:
-    from privacy import install_logging_privacy_filter
 
 GATEWAY_VERSION = "1.12.13"
 IS_RAILWAY = bool(os.getenv("RAILWAY_ENVIRONMENT_NAME") or os.getenv("RAILWAY_SERVICE_ID"))

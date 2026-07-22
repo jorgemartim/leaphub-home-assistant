@@ -4,6 +4,10 @@ from __future__ import annotations
 import hmac
 import json
 import logging
+try:
+    from leaphub_privacy import install_logging_privacy_filter, sanitize_log
+except ModuleNotFoundError:
+    from privacy import install_logging_privacy_filter, sanitize_log
 import os
 import re
 import secrets
@@ -19,11 +23,6 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-
-try:
-    from leaphub_privacy import install_logging_privacy_filter, sanitize_log
-except ImportError:
-    from privacy import install_logging_privacy_filter, sanitize_log
 
 VERSION = "1.12.13"
 OPTIONS_PATH = Path(os.getenv("LEAPHUB_OPTIONS_PATH", "/data/options.json"))
@@ -223,13 +222,13 @@ def write_connector_options() -> Path:
         "telemetry_beta_internal_url": str(OPTIONS.get("telemetry_beta_internal_url") or ""),
         "telemetry_production_enabled": bool(OPTIONS.get("telemetry_production_enabled", False)),
         "telemetry_production_internal_url": str(OPTIONS.get("telemetry_production_internal_url") or ""),
-        "telemetry_active_seconds": int(OPTIONS.get("telemetry_active_seconds") or 20),
+        "telemetry_active_seconds": int(OPTIONS.get("telemetry_active_seconds") or 30),
         "telemetry_interactive_seconds": int(OPTIONS.get("telemetry_interactive_seconds") or 20),
         "telemetry_command_seconds": max(10, min(60, int(OPTIONS.get("telemetry_command_seconds") or 12))),
         "telemetry_command_max_polls": max(2, min(4, int(OPTIONS.get("telemetry_command_max_polls") or 3))),
-        "telemetry_charging_seconds": int(OPTIONS.get("telemetry_charging_seconds") or 25),
-        "telemetry_parked_seconds": int(OPTIONS.get("telemetry_parked_seconds") or 90),
-        "telemetry_sleep_seconds": int(OPTIONS.get("telemetry_sleep_seconds") or 600),
+        "telemetry_charging_seconds": int(OPTIONS.get("telemetry_charging_seconds") or 30),
+        "telemetry_parked_seconds": int(OPTIONS.get("telemetry_parked_seconds") or 300),
+        "telemetry_sleep_seconds": int(OPTIONS.get("telemetry_sleep_seconds") or 900),
         "telemetry_presence_window_seconds": int(OPTIONS.get("telemetry_presence_window_seconds") or 420),
         "telemetry_rate_limit_cooldown_seconds": int(OPTIONS.get("telemetry_rate_limit_cooldown_seconds") or 900),
         "telemetry_batch_size": int(OPTIONS.get("telemetry_batch_size") or 25),
@@ -367,6 +366,8 @@ def status_payload(include_logs: bool = True) -> dict[str, Any]:
     result: dict[str, Any] = {
         "ok": True,
         "version": VERSION,
+        "connector_api_version": 2,
+        "capability_schema_version": 1,
         "updated_at": utc_now(),
         "hostname_for_tunnel": "local-leaphub-gateway",
         "services": {},

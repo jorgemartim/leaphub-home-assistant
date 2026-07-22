@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import py_compile
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -128,5 +129,14 @@ for translation in (APP / "translations").glob("*.yaml"):
 changelog = (APP / "CHANGELOG.md").read_text(encoding="utf-8")
 if f"## {version}" not in changelog:
     fail(f"CHANGELOG.md não contém a versão {version}.")
+
+for test_file in (
+    ROOT / "tests" / "test_contracts.py",
+    ROOT / "tests" / "test_remote_command_matrix.py",
+    ROOT / "tests" / "test_comfort_contract.py",
+    ROOT / "tests" / "test_auth_recovery_contract.py",
+    ROOT / "tests" / "test_gateway_1_12_13.py",
+):
+    subprocess.run([sys.executable, str(test_file)], cwd=ROOT, check=True)
 
 print(f"Repositório válido. Leap Hub Gateway {version}.")

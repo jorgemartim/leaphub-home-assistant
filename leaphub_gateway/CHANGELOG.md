@@ -1,10 +1,35 @@
-## 1.12.13 - 2026-07-21
+## 1.12.13
 
-- Sessão reutilizada sem TTL artificial de 45 minutos, refresh antes de login e autenticação global por conta.
-- Cooldown persistente com tentativa única e backoff de 5/10/20/30 minutos.
-- Telemetria com estado estabilizado e sleep progressivo de 10–15 minutos.
-- Upsert idêntico sem despertar conta, destino compatível e privacidade central de logs.
-- Conexões SQLite fechadas ao final de cada operação.
+- Mantém integralmente os contratos, comandos, OCPP e recursos da 1.12.12.
+- Remove expiração artificial de sessão e tenta refresh antes de novo login.
+- Adiciona cooldown global persistente e uma única autenticação por conta.
+- Deduplica assinaturas idênticas sem acordar o veículo ou alterar a agenda.
+- Estabiliza estados de telemetria e aplica intervalos adaptativos de repouso.
+- Corrige compatibilidade do comando de destino entre versões da biblioteca.
+- Centraliza a sanitização de identificadores e segredos nos logs.
+- Fecha conexões SQLite após cada operação.
+
+## 1.12.12
+
+- Classificação de cooldown e trava persistente contra logins automáticos repetidos.
+- Recuperação automática moderada após bloqueio curto da nuvem.
+- Sem mudança em comandos físicos ou OCPP.
+
+## 1.12.11
+
+- Volante e retrovisores aquecidos orientados por capacidade.
+- Metadados completos de permissões e confirmação por telemetria.
+- Sem alteração em fila, cooldown ou OCPP.
+
+## 1.12.10
+
+- Contrato automatizado para todos os comandos remotos.
+- Testes de cooldown, redaction e pares de ações opostas.
+- Sem alteração no comportamento operacional do Gateway.
+
+## 1.12.09
+
+- Contrato versionado, rastreabilidade e diagnóstico de compatibilidade Hub ↔ Gateway.
 
 ## 1.12.08
 

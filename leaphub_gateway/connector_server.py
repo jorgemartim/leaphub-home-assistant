@@ -38,6 +38,9 @@ except ModuleNotFoundError:
     from privacy import install_logging_privacy_filter
 
 VERSION = "1.12.13"
+API_VERSION = 2
+CAPABILITY_SCHEMA_VERSION = 1
+MIN_SUPPORTED_CLIENT_API_VERSION = 1
 SERVICE = "Leap Hub Leapmotor Connector"
 MAX_BODY = 1024 * 1024
 WINDOW_SECONDS = 180
@@ -188,6 +191,21 @@ TELEMETRY: TelemetryEngine
 
 def json_bytes(payload: dict[str, Any]) -> bytes:
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"), default=connector.json_default).encode("utf-8")
+
+
+def trace_identifier(value: Any) -> str:
+    candidate = str(value or "").strip().lower()
+    if re.fullmatch(r"[a-z0-9][a-z0-9._:-]{7,95}", candidate):
+        return candidate
+    return hashlib.sha256(f"{time.time_ns()}:{threading.get_ident()}".encode("utf-8")).hexdigest()[:24]
+
+
+def client_api_version(headers: Any) -> int:
+    raw = str(headers.get("X-LeapHub-API-Version") or "1").strip()
+    try:
+        return int(raw)
+    except ValueError:
+        return 0
 
 
 def request_identifier(payload: dict[str, Any]) -> str:
@@ -442,7 +460,7 @@ def command_journal_finish(request_hash: str | None, request_id: str, response: 
 def command_journal_wait_auth(request_hash: str | None, request_id: str, retry_after_seconds: int) -> None:
     if not request_hash:
         return
-    delay = max(30, min(300, int(retry_after_seconds or 135)))
+    delay = max(30, min(1800, int(retry_after_seconds or 300)))
     now = time.time()
     retry_at = now + delay
     response = {
@@ -728,7 +746,7 @@ def schedule_command_retry(
     request_id: str,
     retry_after_seconds: int,
 ) -> None:
-    delay = max(30, min(300, int(retry_after_seconds or 135)))
+    delay = max(30, min(1800, int(retry_after_seconds or 300)))
     worker_key = command_worker_key(environment, request_id)
 
     def resume() -> None:
@@ -861,7 +879,7 @@ def run_command_job(
         defer_seconds = 0
         retry_after_seconds = 0
     except connector.ConnectorLoginCooldownError as exc:
-        retry_after_seconds = max(30, min(300, int(exc.retry_after_seconds or 135)))
+        retry_after_seconds = max(30, min(1800, int(exc.retry_after_seconds or 300)))
         command_journal_wait_auth(request_hash, request_id, retry_after_seconds)
         defer_seconds = 1
         LOG.info(
@@ -1097,7 +1115,12 @@ def connector_ready() -> bool:
 
 
 def public_health_payload() -> dict[str, Any]:
-    return {"ok": connector_ready()}
+    return {
+        "ok": connector_ready(),
+        "version": VERSION,
+        "api_version": API_VERSION,
+        "capability_schema_version": CAPABILITY_SCHEMA_VERSION,
+    }
 
 
 def detailed_health_payload(environment: str) -> dict[str, Any]:
@@ -1108,6 +1131,9 @@ def detailed_health_payload(environment: str) -> dict[str, Any]:
         "service": SERVICE,
         "message": "Conector remoto pronto." if library is not None and environment in configured else "Confira a chave do ambiente e a biblioteca leapmotor-api.",
         "version": VERSION,
+        "api_version": API_VERSION,
+        "capability_schema_version": CAPABILITY_SCHEMA_VERSION,
+        "minimum_client_api_version": MIN_SUPPORTED_CLIENT_API_VERSION,
         "connector_version": connector.CONNECTOR_VERSION,
         "library_version": library,
         "operation_limiter": SEMAPHORE.snapshot(),
@@ -1126,6 +1152,13 @@ class Handler(BaseHTTPRequestHandler):
     def setup(self) -> None:
         super().setup()
         self.connection.settimeout(15.0)
+        self.trace_id = trace_identifier("")
+
+    def parse_request(self) -> bool:
+        parsed = super().parse_request()
+        if parsed:
+            self.trace_id = trace_identifier(self.headers.get("X-Request-ID"))
+        return parsed
 
     def log_message(self, fmt: str, *args: Any) -> None:
         line = fmt % args
@@ -1142,17 +1175,24 @@ class Handler(BaseHTTPRequestHandler):
         LOG.info("%s - %s", self.address_string(), line)
 
     def send_json(self, status: int, payload: dict[str, Any]) -> bool:
-        body = json_bytes(payload)
+        response = dict(payload)
+        response.setdefault("trace_id", self.trace_id)
+        response.setdefault("gateway_version", VERSION)
+        response.setdefault("api_version", API_VERSION)
+        body = json_bytes(response)
         try:
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
             self.send_header("Pragma", "no-cache")
             self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("X-Request-ID", self.trace_id)
+            self.send_header("X-LeapHub-Gateway-Version", VERSION)
+            self.send_header("X-LeapHub-API-Version", str(API_VERSION))
             self.send_header("X-Robots-Tag", "noindex, nofollow, noarchive")
             self.send_header("Referrer-Policy", "no-referrer")
             self.send_header("Connection", "close")
-            retry_after = int(payload.get("retry_after_seconds") or 0) if isinstance(payload, dict) else 0
+            retry_after = int(response.get("retry_after_seconds") or 0)
             if retry_after > 0:
                 self.send_header("Retry-After", str(min(86400, retry_after)))
             self.send_header("Content-Length", str(len(body)))
@@ -1193,6 +1233,16 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json(404, {"ok": False, "message": "Página não encontrada."})
 
     def do_POST(self) -> None:
+        requested_api = client_api_version(self.headers)
+        if requested_api < MIN_SUPPORTED_CLIENT_API_VERSION or requested_api > API_VERSION:
+            self.send_json(409, {
+                "ok": False,
+                "incompatible_api": True,
+                "message": "Versão de integração incompatível. Atualize o Leap Hub ou o Gateway.",
+                "requested_api_version": requested_api,
+                "supported_api_version": API_VERSION,
+            })
+            return
         if self.path not in {"/v1/accounts/test", "/v1/vehicles/sync", "/v1/vehicles/command", "/v1/vehicles/command/status", "/v1/vehicles/command/cancel", "/v1/telemetry/subscriptions/upsert", "/v1/telemetry/subscriptions/remove", "/v1/telemetry/subscriptions/boost", "/v1/telemetry/subscriptions/release"}:
             self.send_json(404, {"ok": False, "message": "Página não encontrada."})
             return
@@ -1222,9 +1272,9 @@ class Handler(BaseHTTPRequestHandler):
 
         try:
             if self.path in {"/v1/telemetry/subscriptions/boost", "/v1/telemetry/subscriptions/release", "/v1/vehicles/command/status"}:
-                LOG.debug("Action %s accepted for %s", self.path, environment)
+                LOG.debug("Action %s accepted for %s trace=%s", self.path, environment, self.trace_id)
             else:
-                LOG.info("Action %s accepted for %s", self.path, environment)
+                LOG.info("Action %s accepted for %s trace=%s", self.path, environment, self.trace_id)
             if self.path == "/v1/telemetry/subscriptions/upsert":
                 self.send_json(200, TELEMETRY.upsert(environment, payload))
                 return
@@ -1290,31 +1340,9 @@ class Handler(BaseHTTPRequestHandler):
                     })
                     return
                 if self.path == "/v1/accounts/test":
-                    TELEMETRY.begin_account_auth(environment, payload, "account_test")
-                    try:
-                        result = connector.handle_account(payload, sync=False)
-                        TELEMETRY.record_account_auth_success(environment, payload, "account_test")
-                    except connector.ConnectorLoginCooldownError as exc:
-                        TELEMETRY.record_account_auth_failure(
-                            environment, payload, "account_test", str(exc), exc.retry_after_seconds, blocked=True
-                        )
-                        raise
-                    except Exception as exc:
-                        TELEMETRY.record_account_auth_failure(environment, payload, "account_test", str(exc), 300, blocked=False)
-                        raise
+                    result = TELEMETRY.execute_account_operation(environment, payload, sync=False, origin="account_test")
                 elif self.path == "/v1/vehicles/sync":
-                    TELEMETRY.begin_account_auth(environment, payload, "vehicle_sync")
-                    try:
-                        result = connector.handle_account(payload, sync=True)
-                        TELEMETRY.record_account_auth_success(environment, payload, "vehicle_sync")
-                    except connector.ConnectorLoginCooldownError as exc:
-                        TELEMETRY.record_account_auth_failure(
-                            environment, payload, "vehicle_sync", str(exc), exc.retry_after_seconds, blocked=True
-                        )
-                        raise
-                    except Exception as exc:
-                        TELEMETRY.record_account_auth_failure(environment, payload, "vehicle_sync", str(exc), 300, blocked=False)
-                        raise
+                    result = TELEMETRY.execute_account_operation(environment, payload, sync=True, origin="vehicle_sync")
                 else:
                     # Fallback síncrono para clientes antigos sem request_id.
                     # Clientes atuais entram na fila protegida e recebem resposta imediata.

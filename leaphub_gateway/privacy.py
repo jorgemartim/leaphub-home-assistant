@@ -62,7 +62,8 @@ _UUID = re.compile(r"(?i)\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-
 _TRACE = re.compile(r"(?i)(?<![a-z0-9])[a-f0-9]{20,64}(?![a-z0-9])")
 _VIN = re.compile(r"(?i)\b[A-HJ-NPR-Z0-9]{17}\b")
 _ACCOUNT = re.compile(r"(?i)\bleaphub-(?:staging|production)-account-\d+\b")
-_CHARGE_CONTEXT = re.compile(r"(?i)(?P<prefix>charge(?:\s+point|\s+id)?\s*(?:(?:connected|disconnected|failed|for)\s*[:=]?\s*|[:=]\s*))(?P<value>[A-Z0-9._:-]{8,80})")
+_ACCOUNT_FIELD = re.compile(r"(?i)(?P<prefix>\b(?:account_id|account|conta)\s*[=:]\s*)(?P<value>\d{1,18})\b")
+_CHARGE_CONTEXT = re.compile(r"(?i)(?P<prefix>charge(?:\s+point|\s+id)?\s*(?:(?:connected|disconnected|failed|for)\s*[:=]?\s*|[:=]\s*|\s+))(?P<value>[A-Z0-9._:-]{8,80})")
 _COORD_PAIR = re.compile(r"(?<!\d)(-?\d{1,2}\.\d{4,})\s*[,;/]\s*(-?\d{1,3}\.\d{4,})(?!\d)")
 _BEARER = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/-]+=*\b")
 _PEM = re.compile(r"-----BEGIN [^-]+-----.*?-----END [^-]+-----", re.DOTALL)
@@ -76,12 +77,18 @@ def sanitize_log(value: Any, maximum: int = 8000) -> str:
     text = str(value or "").replace("\x00", " ")
     if "-----BEGIN" in text:
         text = _PEM.sub("[certificado protegido]", text)
+    # Bearer precisa ser removido antes do filtro genérico de Authorization;
+    # caso contrário apenas a palavra "Bearer" seria consumida e o token
+    # permaneceria no fim da linha.
+    text = _BEARER.sub("Bearer [protegido]", text)
     text = re.sub(rf"(?i)({_SECRET_KEY})\s*[=:]\s*([^&\s,;]+)", r"\1=[protegido]", text)
     text = re.sub(rf'(?i)(["\']{_SECRET_KEY}["\']\s*:\s*["\'])[^"\']*(["\'])', r"\1[protegido]\2", text)
-    text = _BEARER.sub("Bearer [protegido]", text)
     text = _EMAIL.sub(lambda match: alias("email", match.group(0)), text)
     text = _PHONE.sub(lambda match: alias("phone", match.group(0)), text)
     text = _ACCOUNT.sub(lambda match: alias("acct", match.group(0)), text)
+    text = _ACCOUNT_FIELD.sub(
+        lambda match: match.group("prefix") + alias("acct", match.group("value")), text
+    )
     text = _VIN.sub(lambda match: alias("veh", match.group(0)), text)
     text = _MAC.sub(lambda match: alias("dev", match.group(0)), text)
     text = _UUID.sub(lambda match: alias("ref", match.group(0)), text)

@@ -72,7 +72,7 @@ assert Path('/app/connector.py').is_file()
 assert Path('/app/telemetry_engine.py').is_file()
 assert leaphub_connector.CONNECTOR_VERSION
 assert leaphub_telemetry_engine.ENGINE_VERSION
-assert callable(leaphub_privacy.sanitize_log)
+assert leaphub_privacy.PRIVACY_VERSION
 assert TelemetryEngine is not None
 import os
 import sqlite3
