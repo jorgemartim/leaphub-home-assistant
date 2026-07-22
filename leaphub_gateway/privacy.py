@@ -14,7 +14,7 @@ import re
 from pathlib import Path
 from typing import Any
 
-PRIVACY_VERSION = "1.12.17"
+PRIVACY_VERSION = "1.12.18"
 
 _KEY_PATH = Path(os.getenv("LEAPHUB_PRIVACY_KEY_PATH", "/data/security/log-privacy.key"))
 _KEY: bytes | None = None

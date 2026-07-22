@@ -1,3 +1,9 @@
+## 1.12.18
+
+- Atualização rápida por imagem GHCR pré-compilada, com build local mantido em pacote de recuperação.
+- Workflow com cache Buildx, autoteste e confirmação do manifesto antes de considerar a publicação concluída.
+- Cloudflared deixou de ser baixado em todas as compilações e agora é preparado somente quando o túnel embutido está ativo, com SHA-256 fixo.
+
 ## 1.12.17
 
 

@@ -143,6 +143,7 @@ for test_file in (
     ROOT / "tests" / "test_connection_resilience_1_12_15.py",
     ROOT / "tests" / "test_full_resilience_1_12_16.py",
     ROOT / "tests" / "test_single_ocpp_1_12_17.py",
+    ROOT / "tests" / "test_fast_install_1_12_18.py",
 ):
     subprocess.run([sys.executable, str(test_file)], cwd=ROOT, check=True)
 

@@ -1,4 +1,4 @@
-## Resiliência integrada 1.12.17
+## Resiliência integrada 1.12.18
 
 - Corrige a retomada antecipada de comandos em cooldown progressivo.
 - Evita múltiplas chamadas de refresh para a mesma recuperação de sessão.

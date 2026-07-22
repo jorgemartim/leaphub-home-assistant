@@ -1,46 +1,42 @@
 # Publicação de novas versões
 
-## Fluxo normal
+## Fluxo rápido normal
 
-1. Atualize o código dentro de `leaphub_gateway/`.
-2. Atualize `version` em `leaphub_gateway/config.yaml`.
-3. Registre as mudanças em `leaphub_gateway/CHANGELOG.md`.
-4. Envie as alterações para o branch `main`.
-5. O GitHub Actions valida o pacote, compila a imagem `amd64` e publica no GitHub Container Registry.
-6. O Home Assistant detecta a nova versão pelo `config.yaml`.
+1. Atualize `leaphub_gateway/` e o número de `version` em `config.yaml`.
+2. Envie o repositório para a branch `main`.
+3. Abra **Actions → Build and publish Leap Hub Gateway**.
+4. Aguarde a etapa **Verify published manifest** ficar verde.
+5. Abra **Packages → leaphub-gateway** e confirme que a versão está pública.
+6. Somente depois recarregue o repositório no Home Assistant.
 
-## Nome da imagem
-
-```text
-ghcr.io/jorgemartim/leaphub-gateway:<versão>
-```
-
-Também é publicada a tag:
+O Home Assistant solicitará exatamente:
 
 ```text
-ghcr.io/jorgemartim/leaphub-gateway:latest
+ghcr.io/jorgemartim/leaphub-gateway:<version>
 ```
 
-O Home Assistant usa sempre a tag indicada por `version`, não a tag `latest`.
+A atualização só deve aparecer na Loja depois que essa tag existir. Isso impede o erro `manifest unknown`.
 
-## Primeira publicação
+## Visibilidade do GHCR
 
-Depois do primeiro build bem-sucedido:
+Na primeira publicação ou depois de recriar o pacote:
 
-1. Abra o perfil do GitHub.
-2. Entre em **Packages → leaphub-gateway**.
-3. Abra **Package settings**.
-4. Confirme que a visibilidade é **Public**.
+1. Abra **Packages → leaphub-gateway** no GitHub.
+2. Entre em **Package settings**.
+3. Defina a visibilidade como **Public**.
 
-Uma imagem pública pode ser baixada pelo Home Assistant sem login no GitHub.
+O Home Assistant não possui credenciais do seu GitHub e precisa baixar a imagem publicamente.
 
-## Regras de versão
+## Cache e validação
 
-- Não reutilize uma versão que já foi publicada.
-- Não altere o código mantendo o mesmo número de versão.
-- Use versões crescentes, por exemplo `1.11.56.1`, `1.11.56.1` e `1.11.56.1.1`.
-- O valor de `version` precisa corresponder à tag da imagem.
+O workflow usa cache Buildx. Depois da primeira compilação, versões que alteram apenas o código reaproveitam as camadas de dependências. Antes da publicação definitiva, o workflow:
 
-## Execução manual
+- valida o repositório;
+- compila a imagem `amd64`;
+- executa o autoteste dentro da imagem exata;
+- publica as tags de versão e `latest`;
+- confirma que o manifesto `linux/amd64` está disponível no GHCR.
 
-Em **Actions → Build and publish Leap Hub Gateway → Run workflow**, é possível refazer a compilação da versão atual. Evite isso depois de usuários instalarem a tag; prefira publicar uma nova versão.
+## Recuperação
+
+Se a publicação GHCR falhar, use o pacote separado `1.12.18.1-recuperacao`, que não possui `image:` e permite build local. Não altere o pacote rápido removendo o campo manualmente.

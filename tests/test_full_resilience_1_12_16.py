@@ -108,8 +108,8 @@ with tempfile.TemporaryDirectory(prefix="leaphub-1-12-16-") as tmp:
     check("if streak >= 6:" in telemetry, "Repouso ainda demora consultas demais")
     check("renovada por refresh durante a leitura de mensagens" in telemetry, "Mensagens ainda forçam relogin direto")
     check('required = ("name", "version", "slug", "description", "arch")' in validator, "Validador ainda exige imagem GHCR")
-    check('version: "1.12.17"' in (APP / "config.yaml").read_text(), "Versão do App divergente")
+    check('version: "1.12.18"' in (APP / "config.yaml").read_text(), "Versão do App divergente")
 
 if failures:
-    raise SystemExit("full resilience 1.12.17 failed:\n- " + "\n- ".join(failures))
-print({"ok": True, "checks": 12, "version": "1.12.17"})
+    raise SystemExit("full resilience 1.12.18 failed:\n- " + "\n- ".join(failures))
+print({"ok": True, "checks": 12, "version": "1.12.18"})

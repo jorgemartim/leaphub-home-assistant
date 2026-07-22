@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 try:
@@ -23,7 +24,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-VERSION = "1.12.17"
+VERSION = "1.12.18"
 OPTIONS_PATH = Path(os.getenv("LEAPHUB_OPTIONS_PATH", "/data/options.json"))
 RUNTIME = Path(os.getenv("LEAPHUB_RUNTIME_DIR", "/data/runtime"))
 LOG_DIR = Path(os.getenv("LEAPHUB_LOG_DIR", "/data/logs"))
@@ -52,9 +53,84 @@ LOG = logging.getLogger("leaphub.gateway")
 STOP = threading.Event()
 UI_TOKEN = secrets.token_hex(24)
 
+CLOUDFLARED_VERSION = "2026.7.1"
+CLOUDFLARED_SHA256_AMD64 = "79a0ade7fc854f62c1aaef48424d9d979e8c2fcd039189d24db82b84cd146be1"
+CLOUDFLARED_URL_AMD64 = f"https://github.com/cloudflare/cloudflared/releases/download/{CLOUDFLARED_VERSION}/cloudflared-linux-amd64"
+MAX_CLOUDFLARED_BYTES = 100 * 1024 * 1024
+
 
 def secret_ok(value: Any, minimum: int = 32) -> bool:
     return len(str(value or "").strip()) >= minimum
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def resolve_cloudflared() -> str:
+    """Resolve cloudflared without slowing every image build.
+
+    The binary is downloaded only when the embedded tunnel is actually enabled.
+    The fixed checksum prevents executing an unexpected payload.
+    """
+    explicit = str(os.getenv("LEAPHUB_CLOUDFLARED") or "").strip()
+    candidates = [Path(explicit)] if explicit else []
+    candidates.extend([Path("/usr/local/bin/cloudflared"), RUNTIME / "bin" / "cloudflared"])
+    for candidate in candidates:
+        try:
+            if candidate.is_file() and os.access(candidate, os.X_OK):
+                if candidate == RUNTIME / "bin" / "cloudflared" and _file_sha256(candidate) != CLOUDFLARED_SHA256_AMD64:
+                    LOG.warning("Cloudflared local possui hash inesperado; será substituído.")
+                    candidate.unlink(missing_ok=True)
+                    continue
+                return str(candidate)
+        except OSError:
+            continue
+
+    if not bool(OPTIONS.get("tunnel_enabled", False)):
+        return ""
+
+    target = RUNTIME / "bin" / "cloudflared"
+    temp = target.with_name(target.name + ".download")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temp.unlink(missing_ok=True)
+    LOG.info("Cloudflare Tunnel ativado; preparando binário verificado uma única vez.")
+    try:
+        request = urllib.request.Request(
+            CLOUDFLARED_URL_AMD64,
+            headers={"User-Agent": f"LeapHubGateway/{VERSION}"},
+        )
+        digest = hashlib.sha256()
+        total = 0
+        with urllib.request.urlopen(request, timeout=90) as response, temp.open("wb") as output:
+            content_length = int(response.headers.get("Content-Length") or 0)
+            if content_length > MAX_CLOUDFLARED_BYTES:
+                raise RuntimeError("binário cloudflared excede o tamanho permitido")
+            while True:
+                chunk = response.read(1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > MAX_CLOUDFLARED_BYTES:
+                    raise RuntimeError("download cloudflared excedeu o limite")
+                digest.update(chunk)
+                output.write(chunk)
+        if total < 5 * 1024 * 1024:
+            raise RuntimeError("download cloudflared incompleto")
+        if digest.hexdigest() != CLOUDFLARED_SHA256_AMD64:
+            raise RuntimeError("checksum cloudflared inválido")
+        temp.chmod(0o755)
+        os.replace(temp, target)
+        LOG.info("Cloudflared %s preparado com integridade confirmada.", CLOUDFLARED_VERSION)
+        return str(target)
+    except Exception as exc:  # noqa: BLE001
+        temp.unlink(missing_ok=True)
+        LOG.error("Não foi possível preparar o Cloudflare Tunnel: %s", sanitize(str(exc)))
+        return ""
 
 
 def sanitize(line: str) -> str:
@@ -363,6 +439,7 @@ CONNECTOR_MODULE_AVAILABLE = connector_module_available()
 connector_options = write_connector_options()
 OCPP_SELECTION = selected_ocpp_configuration()
 tunnel_token = str(OPTIONS.get("tunnel_token") or "").strip()
+cloudflared_path = resolve_cloudflared()
 tunnel_protocol = str(OPTIONS.get("tunnel_protocol") or "http2").strip().lower()
 if tunnel_protocol not in {"auto", "http2", "quic"}:
     tunnel_protocol = "http2"
@@ -381,8 +458,8 @@ SERVICES: dict[str, ManagedService] = {
         "http://127.0.0.1:8092/health",
     ),
     "tunnel": ManagedService(
-        "tunnel", "Cloudflare Tunnel", bool(OPTIONS.get("tunnel_enabled", False)), secret_ok(tunnel_token, 40),
-        [os.getenv("LEAPHUB_CLOUDFLARED", "/usr/local/bin/cloudflared"), "tunnel", "--no-autoupdate", "--loglevel", str(OPTIONS.get("tunnel_log_level") or "info"), "--protocol", tunnel_protocol, "run"],
+        "tunnel", "Cloudflare Tunnel", bool(OPTIONS.get("tunnel_enabled", False)), secret_ok(tunnel_token, 40) and bool(cloudflared_path),
+        [cloudflared_path or "/bin/false", "tunnel", "--no-autoupdate", "--loglevel", str(OPTIONS.get("tunnel_log_level") or "info"), "--protocol", tunnel_protocol, "run"],
         {"TUNNEL_TOKEN": tunnel_token},
         None,
     ),
@@ -495,7 +572,7 @@ main{max-width:1180px;margin:auto;padding:24px}.hero{display:flex;gap:18px;align
 details{margin-top:12px}summary{cursor:pointer;color:var(--muted)}pre{white-space:pre-wrap;word-break:break-word;background:#050c15;border:1px solid var(--line);border-radius:12px;padding:12px;max-height:260px;overflow:auto;color:#bcd0e8;font-size:12px}.wide{grid-column:1/-1}.routes{display:grid;grid-template-columns:1fr auto;gap:8px}.routes code{background:#050c15;border:1px solid var(--line);border-radius:10px;padding:9px;overflow:auto}.notice{border-left:3px solid var(--blue);padding:10px 12px;background:rgba(85,167,255,.08);border-radius:10px;color:#cfe4ff}.foot{color:var(--muted);text-align:center;padding:20px}
 @media(max-width:760px){main{padding:14px}.grid{grid-template-columns:1fr}.hero{align-items:flex-start}.badge{display:none}.meta{grid-template-columns:1fr 1fr}.routes{grid-template-columns:1fr}}
 </style></head><body><main>
-<div class="hero"><div class="mark">LH</div><div><h1>Leap Hub Gateway</h1><p class="sub">Telemetria resiliente, Connector, OCPP e Cloudflare em um único App</p></div><span class="badge">v1.12.17</span></div>
+<div class="hero"><div class="mark">LH</div><div><h1>Leap Hub Gateway</h1><p class="sub">Telemetria resiliente, Connector, OCPP e Cloudflare em um único App</p></div><span class="badge">v1.12.18</span></div>
 <div class="grid" id="cards"></div>
 <section class="card wide" style="margin-top:16px"><div class="head"><div><h2>Rotas do Cloudflare Tunnel</h2><p>Como o Tunnel roda dentro do mesmo App, use 127.0.0.1 nas origens.</p></div></div><div class="routes"><code>connector.leaphub.com.br → http://127.0.0.1:8094</code><span>Connector</span><code>ocpp-wallbox.leaphub.com.br → http://127.0.0.1:8092</code><span>OCPP Wallbox · ambiente ativo</span></div><p class="notice">A fila de telemetria sobrevive a reinícios do App. Uma queda do Home Assistant inteiro ainda cria uma lacuna real, que nunca será preenchida com dados inventados.</p></section>
 <div class="foot">Tokens e chaves nunca são exibidos neste painel.</div></main><script>

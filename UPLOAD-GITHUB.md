@@ -1,27 +1,21 @@
-# Enviar este repositório ao GitHub
+# Enviar ao GitHub
 
-O repositório de destino é:
+Repositório de destino:
 
 ```text
 https://github.com/jorgemartim/leaphub-home-assistant
 ```
 
-## Pelo navegador
+1. Extraia o ZIP.
+2. Substitua no repositório os arquivos pelas versões extraídas, incluindo `.github`.
+3. Faça commit e envie para `main`.
+4. Abra a aba **Actions**.
+5. Aguarde **Validate repository** e **Build and publish Leap Hub Gateway** ficarem verdes.
+6. Confirme em **Packages → leaphub-gateway** que a tag da versão existe e está pública.
+7. Só então recarregue a Loja de Apps no Home Assistant.
 
-1. Extraia o ZIP no computador.
-2. Abra o repositório no GitHub.
-3. Na tela do repositório vazio, clique em **uploading an existing file**.
-4. Abra a pasta extraída.
-5. Selecione todos os arquivos e pastas que estão dentro dela, incluindo `.github` e `leaphub_gateway`.
-6. Arraste para a área de upload do GitHub.
-7. Em **Commit changes**, use:
+Para a versão rápida 1.12.18, a tag esperada é:
 
-   ```text
-   Corrige Connector e publica Leap Hub Gateway 1.11.56.1
-   ```
-
-8. Clique em **Commit changes**.
-9. Abra a aba **Actions** e acompanhe:
-   - `Validate repository`;
-   - `Build and publish Leap Hub Gateway`.
-10. Depois do build verde, abra **Packages → leaphub-gateway** e confirme a visibilidade pública.
+```text
+ghcr.io/jorgemartim/leaphub-gateway:1.12.18
+```
