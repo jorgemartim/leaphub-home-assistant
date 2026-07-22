@@ -1,3 +1,7 @@
+## 1.12.18.2
+
+- Pacote de recuperação por build local, sem dependência da tag GHCR.
+
 ## 1.12.18
 
 - Atualização rápida por imagem GHCR pré-compilada, com build local mantido em pacote de recuperação.
@@ -451,3 +455,6 @@ A janela interativa encerra ao fechar a última aba. Timeouts temporários prese
 - Corrige a classificação de `Failed to issue certificate`: falha temporária da nuvem não bloqueia mais a conta como senha incorreta.
 - Permite limpar com segurança um `auth_required` preso quando o Leap Hub comprova uma sincronização manual bem-sucedida.
 - Corrige a composição oficial do veículo com portas abertas, removendo o reflexo do vidro fechado que aparecia deslocado na frente da porta.
+
+## 1.12.18.2
+- Recuperação por build local quando a imagem GHCR não estiver publicada.

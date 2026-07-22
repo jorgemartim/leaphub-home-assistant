@@ -39,4 +39,4 @@ O workflow usa cache Buildx. Depois da primeira compilação, versões que alter
 
 ## Recuperação
 
-Se a publicação GHCR falhar, use o pacote separado `1.12.18.1-recuperacao`, que não possui `image:` e permite build local. Não altere o pacote rápido removendo o campo manualmente.
+Se a publicação GHCR falhar, use o pacote separado `1.12.18.2-recuperacao`, que não possui `image:` e permite build local. Não altere o pacote rápido removendo o campo manualmente.

@@ -1,11 +1,9 @@
-# Instalação rápida do Leap Hub Gateway 1.12.18
+# Instalação de recuperação 1.12.18.2
 
-1. Publique este repositório na branch `main`.
-2. Aguarde o workflow **Build and publish Leap Hub Gateway** concluir, inclusive **Verify published manifest**.
-3. Confirme que `ghcr.io/jorgemartim/leaphub-gateway:1.12.18` está público.
-4. Recarregue o repositório na Loja de Apps do Home Assistant.
-5. Atualize para 1.12.18.
+Use somente quando a tag GHCR da 1.12.18 não puder ser publicada.
 
-O Home Assistant apenas baixa a imagem pronta. Não recarregue a Loja antes da publicação da tag, ou o Supervisor encontrará a versão sem encontrar a imagem.
+1. Publique este repositório com a versão 1.12.18.2.
+2. Recarregue a Loja de Apps do Home Assistant.
+3. Instale ou atualize o Gateway.
 
-As configurações em `/data` permanecem preservadas durante a atualização.
+Este pacote não contém `image:`. O Home Assistant fará build local. O build foi reduzido: cloudflared não é mais baixado durante a compilação quando o túnel integrado está desativado.
