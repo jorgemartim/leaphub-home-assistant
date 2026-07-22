@@ -1,9 +1,22 @@
-## 1.12.13.1
+## 1.12.15.1
 
-- Hotfix de instalação: remove a dependência obrigatória da tag GHCR ausente.
-- O Home Assistant passa a construir o App localmente a partir do Dockerfile incluído.
-- Mantém integralmente o código, opções, portas, OCPP, Connector e telemetria da 1.12.13.
-- Workflow de publicação reforçado com verificação do manifesto após o push.
+- Hotfix de instalação: build local pelo Home Assistant sem depender de tag GHCR ausente.
+- Código funcional idêntico à 1.12.15.
+
+## 1.12.15
+
+- Preserva os backoffs legítimos de até 30 minutos no diário idempotente de comandos.
+- Bloqueia retomadas enquanto o cooldown global da conta ainda estiver ativo.
+- Executa somente um refresh lógico por falha de sessão.
+- Habilita HTTP/1.1 keepalive no Connector sem alterar HMAC ou API v2.
+
+## 1.12.14
+
+- Mantém sessões Leapmotor saudáveis após o fim da janela ativa.
+- Reduz chamadas repetidas de lista de veículos e mensagens.
+- Trata expiração real de sessão com uma única reconexão coordenada.
+- Detecta conexões OCPP mortas, acelera falha de comandos e aplica graça de reconexão.
+- Preserva ordem e limita retenção da fila OCPP.
 
 ## 1.12.13
 

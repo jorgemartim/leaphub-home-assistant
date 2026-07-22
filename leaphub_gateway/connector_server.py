@@ -37,7 +37,7 @@ try:
 except ModuleNotFoundError:
     from privacy import install_logging_privacy_filter
 
-VERSION = "1.12.13.1"
+VERSION = "1.12.15.1"
 API_VERSION = 2
 CAPABILITY_SCHEMA_VERSION = 1
 MIN_SUPPORTED_CLIENT_API_VERSION = 1
@@ -56,6 +56,8 @@ COMMAND_CACHE: dict[str, dict[str, Any]] = {}
 COMMAND_CACHE_LOCK = threading.RLock()
 COMMAND_CACHE_MAX = 2000
 COMMAND_CANCEL_REQUESTS: set[str] = set()
+MAX_AUTH_RETRY_SECONDS = 1800
+AUTH_RETRY_CLOCK_SKEW_SECONDS = 90
 
 
 class CommandCancelled(RuntimeError):
@@ -341,15 +343,53 @@ def command_journal_begin(environment: str, payload: dict[str, Any]) -> tuple[st
             if isinstance(response, dict):
                 retry_at = float(response.get("retry_at") or 0)
                 retry_after = int(response.get("retry_after_seconds") or 0)
-                stale_waiting_auth = existing_status == "waiting_auth" and (
-                    retry_after > 300 or retry_at > now + 300 or retry_at <= now
+                impossible_waiting_auth = existing_status == "waiting_auth" and (
+                    retry_after < 0
+                    or retry_after > MAX_AUTH_RETRY_SECONDS
+                    or retry_at > now + MAX_AUTH_RETRY_SECONDS + AUTH_RETRY_CLOCK_SKEW_SECONDS
                 )
-                if not stale_waiting_auth:
+                if existing_status == "waiting_auth" and not impossible_waiting_auth:
+                    # Backoffs progressivos legítimos chegam a 30 minutos. Antes
+                    # da 1.12.15.1 qualquer espera acima de 5 minutos era tratada
+                    # como registro defeituoso, o que podia reenviar o comando e
+                    # renovar o bloqueio da Leapmotor antes da hora.
+                    if retry_at > now:
+                        response["retry_after_seconds"] = max(1, int(retry_at - now))
+                        response["duplicate"] = True
+                        response["request_id"] = request_id
+                        return None, response
+                    try:
+                        auth_status = TELEMETRY.account_auth_status(environment, payload)
+                    except Exception as exc:  # noqa: BLE001
+                        LOG.debug("Consulta do cooldown global adiada para o comando %s: %s", request_id[:12], exc)
+                        auth_status = {"cooldown": True, "retry_after_seconds": 30}
+                    if bool(auth_status.get("cooldown")):
+                        remaining = max(1, min(MAX_AUTH_RETRY_SECONDS, int(auth_status.get("retry_after_seconds") or 30)))
+                        response["retry_after_seconds"] = remaining
+                        response["retry_at"] = now + remaining
+                        response["duplicate"] = True
+                        response["request_id"] = request_id
+                        response["message"] = "A autenticação global ainda está protegida. O comando permanece na fila sem novo envio."
+                        return None, response
+                    stale_waiting_auth = True
+                elif impossible_waiting_auth:
+                    # Um registro realmente impossível é retomado apenas depois
+                    # de confirmar que o coordenador global não está bloqueado.
+                    try:
+                        auth_status = TELEMETRY.account_auth_status(environment, payload)
+                    except Exception:  # noqa: BLE001
+                        auth_status = {"cooldown": True}
+                    if bool(auth_status.get("cooldown")):
+                        response["duplicate"] = True
+                        response["request_id"] = request_id
+                        return None, response
+                    stale_waiting_auth = True
+                else:
                     response["duplicate"] = True
                     response["request_id"] = request_id
                     return None, response
         if stale_waiting_auth:
-            LOG.info("Retomando o comando %s após o prazo de autenticação, preservando o mesmo identificador idempotente.", request_id[:12])
+            LOG.info("Retomando o comando %s somente após o coordenador global liberar a autenticação.", request_id[:12])
             row["status"] = "queued"
             row["response_json"] = ""
         if str(row.get("status") or "") in active_states and now - float(row.get("updated_at") or 0) < 900 and not stale_waiting_auth:
@@ -564,7 +604,9 @@ def command_journal_status(environment: str, payload: dict[str, Any]) -> dict[st
     retry_at = float(response.get("retry_at") or 0)
     retry_after_recorded = int(response.get("retry_after_seconds") or 0)
     impossible_waiting_auth = status == "waiting_auth" and (
-        retry_after_recorded > 300 or retry_at > time.time() + 300
+        retry_after_recorded < 0
+        or retry_after_recorded > MAX_AUTH_RETRY_SECONDS
+        or retry_at > time.time() + MAX_AUTH_RETRY_SECONDS + AUTH_RETRY_CLOCK_SKEW_SECONDS
     )
     if impossible_waiting_auth:
         response = {
@@ -1147,6 +1189,7 @@ def detailed_health_payload(environment: str) -> dict[str, Any]:
 
 class Handler(BaseHTTPRequestHandler):
     server_version = "LeapHubConnector"
+    protocol_version = "HTTP/1.1"
     sys_version = ""
 
     def setup(self) -> None:
@@ -1191,7 +1234,6 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("X-LeapHub-API-Version", str(API_VERSION))
             self.send_header("X-Robots-Tag", "noindex, nofollow, noarchive")
             self.send_header("Referrer-Policy", "no-referrer")
-            self.send_header("Connection", "close")
             retry_after = int(response.get("retry_after_seconds") or 0)
             if retry_after > 0:
                 self.send_header("Retry-After", str(min(86400, retry_after)))

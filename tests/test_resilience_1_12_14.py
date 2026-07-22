@@ -241,5 +241,5 @@ with tempfile.TemporaryDirectory(prefix="leaphub-ocpp-resilience-") as tmp:
     asyncio.run(pending_disconnect_test())
 
 if failures:
-    raise SystemExit("resilience 1.12.14 failed:\n- " + "\n- ".join(failures))
-print({"ok": True, "checks": 16, "version": "1.12.14"})
+    raise SystemExit("resilience 1.12.15 failed:\n- " + "\n- ".join(failures))
+print({"ok": True, "checks": 16, "version": "1.12.15"})

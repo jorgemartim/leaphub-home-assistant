@@ -1,3 +1,9 @@
+## Conexão protegida 1.12.15
+
+- Corrige a retomada antecipada de comandos em cooldown progressivo.
+- Evita múltiplas chamadas de refresh para a mesma recuperação de sessão.
+- Ativa conexão persistente entre Leap Hub, Cloudflare e Gateway.
+
 ## Hotfix de sessão e OCPP 1.11.75
 
 - Corrige status OCPP e reduz recriações de sessão durante navegação.

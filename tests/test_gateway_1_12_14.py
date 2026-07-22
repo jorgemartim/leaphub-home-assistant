@@ -249,5 +249,5 @@ with tempfile.TemporaryDirectory(prefix="leaphub-gateway-test-") as tmp:
         restarted._instance_lock_handle.close()
 
 if failures:
-    raise SystemExit("gateway 1.12.14 runtime failed:\n- " + "\n- ".join(failures))
-print({"ok": True, "checks": 22, "version": "1.12.14"})
+    raise SystemExit("gateway 1.12.15 runtime failed:\n- " + "\n- ".join(failures))
+print({"ok": True, "checks": 22, "version": "1.12.15"})
