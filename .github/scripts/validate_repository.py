@@ -33,7 +33,7 @@ for key in ("name", "url", "maintainer"):
         fail(f"repository.yaml não contém {key}.")
 
 config = load_yaml(APP / "config.yaml")
-required = ("name", "version", "slug", "description", "arch", "image")
+required = ("name", "version", "slug", "description", "arch")
 for key in required:
     if not config.get(key):
         fail(f"config.yaml não contém {key}.")
@@ -42,8 +42,13 @@ version = str(config["version"])
 if not re.fullmatch(r"\d+\.\d+\.\d+(?:\.\d+)?", version):
     fail(f"Versão inválida: {version}")
 
-if config["image"] != "ghcr.io/jorgemartim/leaphub-gateway":
+image = str(config.get("image") or "").strip()
+if image and image != "ghcr.io/jorgemartim/leaphub-gateway":
     fail("A imagem do config.yaml não aponta para o GHCR oficial.")
+if not image:
+    dockerfile_path = APP / "Dockerfile"
+    if not dockerfile_path.is_file():
+        fail("Sem image no config.yaml, o Dockerfile é obrigatório para build local.")
 
 architectures = set(config["arch"])
 if architectures != {"amd64"}:

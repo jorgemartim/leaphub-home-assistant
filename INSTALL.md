@@ -73,3 +73,9 @@ Quando os testes estiverem corretos, ative `tunnel_enabled`, reinicie o Gateway 
 ## Atualizações
 
 Quando uma nova versão for publicada, o Home Assistant exibirá **Atualização disponível**. A atualização apenas baixa a nova imagem pronta.
+
+## Recuperação do erro `manifest unknown`
+
+A versão 1.12.13.1 não usa o campo `image` no `config.yaml`. Assim, o Home Assistant constrói o App localmente a partir do Dockerfile incluído e não tenta baixar uma tag inexistente do GHCR.
+
+Na primeira instalação, a etapa de compilação pode demorar mais do que uma instalação por imagem pronta. Não interrompa enquanto o Supervisor estiver mostrando atividade de build.

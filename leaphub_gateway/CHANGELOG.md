@@ -1,3 +1,10 @@
+## 1.12.13.1
+
+- Hotfix de instalação: remove a dependência obrigatória da tag GHCR ausente.
+- O Home Assistant passa a construir o App localmente a partir do Dockerfile incluído.
+- Mantém integralmente o código, opções, portas, OCPP, Connector e telemetria da 1.12.13.
+- Workflow de publicação reforçado com verificação do manifesto após o push.
+
 ## 1.12.13
 
 - Mantém integralmente os contratos, comandos, OCPP e recursos da 1.12.12.
