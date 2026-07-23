@@ -26,6 +26,12 @@ configuration:
   telemetry_production_internal_url:
     name: Production telemetry internal endpoint
     description: HTTPS URL that receives the Production queue.
+  telemetry_background_enabled:
+    name: Monitor without opening Leap Hub
+    description: Keep adaptive collection active in the background to record trips and vehicle changes.
+  telemetry_background_seconds:
+    name: Maximum background interval
+    description: Maximum delay between checks while the vehicle is resting and no Leap Hub screen is open.
   telemetry_active_seconds:
     name: Driving interval
     description: Polling frequency while driving or READY.

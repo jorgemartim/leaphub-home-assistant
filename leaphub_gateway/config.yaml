@@ -1,5 +1,5 @@
 name: "Leap Hub Gateway"
-version: "1.12.18.2"
+version: "1.12.19"
 slug: "leaphub_gateway"
 description: "Gateway unificado com sincronização automática adaptativa, fila persistente, Leapmotor, OCPP e Cloudflare Tunnel."
 url: "https://github.com/jorgemartim/leaphub-home-assistant"
@@ -35,6 +35,8 @@ options:
   telemetry_beta_internal_url: "https://leaphub.com.br/beta/leap/api/internal/telemetry/events"
   telemetry_production_enabled: false
   telemetry_production_internal_url: "https://leaphub.com.br/leap/api/internal/telemetry/events"
+  telemetry_background_enabled: true
+  telemetry_background_seconds: 300
   telemetry_active_seconds: 20
   telemetry_interactive_seconds: 20
   telemetry_command_seconds: 12
@@ -80,6 +82,8 @@ schema:
   telemetry_beta_internal_url: url
   telemetry_production_enabled: bool
   telemetry_production_internal_url: url
+  telemetry_background_enabled: bool
+  telemetry_background_seconds: "int(120,1800)"
   telemetry_active_seconds: "int(15,300)"
   telemetry_interactive_seconds: "int(15,60)"
   telemetry_command_seconds: "int(3,60)"

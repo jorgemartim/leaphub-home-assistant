@@ -26,18 +26,24 @@ configuration:
   telemetry_production_internal_url:
     name: Endpoint interno de telemetria Produção
     description: URL HTTPS que recebe a fila no Leap Hub de Produção.
+  telemetry_background_enabled:
+    name: Monitorar sem abrir o Leap Hub
+    description: Mantém a coleta adaptativa ativa em segundo plano para registrar viagens e mudanças do veículo.
+  telemetry_background_seconds:
+    name: Intervalo máximo em segundo plano
+    description: Tempo máximo entre verificações quando o veículo está em repouso e nenhuma tela do Leap Hub está aberta.
   telemetry_active_seconds:
     name: Intervalo durante viagem
-    description: Consulta automática rápida durante viagem. O padrão é 5 segundos e usa proteção com recuo em caso de limite ou falha.
+    description: Consulta automática rápida durante viagem. O padrão é 20 segundos e usa proteção com recuo em caso de limite ou falha.
   telemetry_charging_seconds:
     name: Intervalo durante recarga
-    description: Consulta automática durante carregamento. O padrão é 5 segundos para detectar o início e acompanhar a curva.
+    description: Consulta automática durante carregamento. O padrão é 25 segundos para detectar o início e acompanhar a curva.
   telemetry_parked_seconds:
     name: Intervalo estacionado
-    description: Frequência automática quando estacionado. O padrão é 30 segundos para detectar cabo, recarga ou início de viagem.
+    description: Frequência automática quando estacionado. O padrão é 90 segundos para detectar cabo, recarga ou início de viagem.
   telemetry_sleep_seconds:
     name: Intervalo em repouso prolongado
-    description: Frequência econômica após repouso prolongado. O padrão é 120 segundos.
+    description: Frequência econômica após repouso prolongado. O padrão é 600 segundos, limitado pelo monitoramento em segundo plano quando ele estiver ativo.
   telemetry_rate_limit_cooldown_seconds:
     name: Pausa de proteção da nuvem Leapmotor
     description: Tempo de espera automático quando o Gateway detectar limitação de requisições. O padrão é 30 minutos.

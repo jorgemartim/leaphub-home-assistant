@@ -1,3 +1,11 @@
+## 1.12.19
+
+- Mantém assinaturas habilitadas em coleta adaptativa mesmo sem nenhuma tela do Leap Hub aberta.
+- Usa a janela de presença somente para aumentar temporariamente a frequência das leituras.
+- Limita o intervalo econômico em segundo plano a cinco minutos por padrão para detectar viagens e recargas.
+- Preserva sessão, fila SQLite, cooldown, idempotência e confirmação rápida de comandos já existentes.
+- Expõe no diagnóstico se o monitoramento de fundo está ativo e corrige os textos dos intervalos padrão.
+
 ## 1.12.18.2
 
 - Pacote de recuperação por build local, sem dependência da tag GHCR.

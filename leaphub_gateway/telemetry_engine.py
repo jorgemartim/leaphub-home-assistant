@@ -24,7 +24,7 @@ from cryptography.fernet import Fernet, InvalidToken
 import leaphub_connector as connector
 
 LOG = logging.getLogger("leaphub.telemetry")
-ENGINE_VERSION = "1.12.18.2"
+ENGINE_VERSION = "1.12.19"
 
 
 def utc_iso() -> str:
@@ -122,6 +122,13 @@ class TelemetryEngine:
         self.charging_seconds = self._bounded("telemetry_charging_seconds", 25, 15, 600)
         self.parked_seconds = self._bounded("telemetry_parked_seconds", 90, 60, 3600)
         self.sleep_seconds = self._bounded("telemetry_sleep_seconds", 600, 300, 14400)
+        # A presença no site controla somente a cadência rápida. Quando o modo
+        # de fundo está ativo, assinaturas habilitadas continuam elegíveis mesmo
+        # depois de active_until expirar. O limite econômico evita ficar horas
+        # sem perceber uma viagem curta, sem consultar agressivamente o carro
+        # enquanto ele está parado.
+        self.background_enabled = bool(options.get("telemetry_background_enabled", True))
+        self.background_seconds = self._bounded("telemetry_background_seconds", 300, 120, 1800)
         self.presence_window_seconds = self._bounded("telemetry_presence_window_seconds", 420, 300, 1800)
         self.rate_limit_cooldown_seconds = self._bounded("telemetry_rate_limit_cooldown_seconds", 900, 300, 3600)
         self.login_cooldown_max_seconds = 1800
@@ -1251,8 +1258,14 @@ class TelemetryEngine:
                     status = "waiting"
                     next_run = min(next_run, now_epoch + 0.5) if next_run > now_epoch else now_epoch + 0.5
             elif status not in {"auth_required", "cooldown", "recovering", "error"}:
-                status = "idle"
-                next_run = max(next_run, now_epoch + self.sleep_seconds)
+                if self.background_enabled:
+                    status = "background"
+                    # Não adia uma leitura já próxima e nunca deixa o próximo
+                    # teste de atividade além do limite econômico configurado.
+                    next_run = min(max(next_run, now_epoch + 5), now_epoch + self.background_seconds)
+                else:
+                    status = "idle"
+                    next_run = max(next_run, now_epoch + self.sleep_seconds)
             cursor = db.execute(
                 "UPDATE subscriptions SET status=?,interactive_until=0,next_run_at=?,updated_at=? WHERE subscription_id=?",
                 (status, next_run, now_iso, subscription_id),
@@ -1512,10 +1525,13 @@ class TelemetryEngine:
                 "charge_watch_seconds": self.charge_watch_seconds,
                 "parked_seconds": self.parked_seconds,
                 "sleep_seconds": self.sleep_seconds,
+                "background_enabled": self.background_enabled,
+                "background_seconds": self.background_seconds,
                 "rate_limit_cooldown_seconds": self.rate_limit_cooldown_seconds,
                 "auth_attempt_min_interval_seconds": self.auth_attempt_min_interval_seconds,
                 "presence_window_seconds": self.presence_window_seconds,
-                "presence_driven": True,
+                "presence_driven": not self.background_enabled,
+                "presence_role": "fast_mode",
                 "session_reuse": True,
             },
             "recent_vehicle_states": recent_states,
@@ -1585,15 +1601,31 @@ class TelemetryEngine:
     def _next_due_subscription(self) -> sqlite3.Row | None:
         with self.lock, self._db() as db:
             now_epoch = time.time()
+            active_filter = "" if self.background_enabled else " AND active_until>?"
+            parameters: tuple[float, ...]
+            if self.background_enabled:
+                parameters = (now_epoch, now_epoch, now_epoch)
+            else:
+                parameters = (now_epoch, now_epoch, now_epoch, now_epoch)
             return db.execute(
-                "SELECT * FROM subscriptions WHERE enabled=1 AND auth_required=0 AND active_until>? AND next_run_at<=? "
+                "SELECT * FROM subscriptions WHERE enabled=1 AND auth_required=0"
+                + active_filter
+                + " AND next_run_at<=? "
                 "ORDER BY CASE WHEN command_until>? THEN 0 WHEN interactive_until>? THEN 1 ELSE 2 END, next_run_at ASC LIMIT 1",
-                (now_epoch, now_epoch, now_epoch, now_epoch),
+                parameters,
             ).fetchone()
 
     def _seconds_until_next(self) -> float:
         with self.lock, self._db() as db:
-            row = db.execute("SELECT MIN(next_run_at) due FROM subscriptions WHERE enabled=1 AND auth_required=0 AND active_until>?", (time.time(),)).fetchone()
+            if self.background_enabled:
+                row = db.execute(
+                    "SELECT MIN(next_run_at) due FROM subscriptions WHERE enabled=1 AND auth_required=0"
+                ).fetchone()
+            else:
+                row = db.execute(
+                    "SELECT MIN(next_run_at) due FROM subscriptions WHERE enabled=1 AND auth_required=0 AND active_until>?",
+                    (time.time(),),
+                ).fetchone()
             delivery = db.execute("SELECT MIN(next_attempt_at) due FROM events WHERE status='pending'").fetchone()
         values = [float(item["due"]) for item in (row, delivery) if item and item["due"] is not None]
         return max(0.25, min(values) - time.time()) if values else 5.0
@@ -1602,10 +1634,11 @@ class TelemetryEngine:
         sid = str(subscription["subscription_id"])
         now_epoch = time.time()
         active_until = float(subscription["active_until"] or 0)
+        presence_active = active_until > now_epoch
         interactive = float(subscription["interactive_until"] or 0) > now_epoch
         command_mode = float(subscription["command_until"] or 0) > now_epoch
         fast_mode = interactive or command_mode
-        if active_until <= now_epoch:
+        if not presence_active and not self.background_enabled:
             # O fim da janela ativa pausa novas leituras, mas não encerra uma
             # sessão saudável. Fechar aqui obrigava um novo login a cada janela.
             with self.lock, self._db() as db:
@@ -1874,6 +1907,8 @@ class TelemetryEngine:
         sleep_streak = previous_sleep_streak + 1 if aggregate_state == "sleep" else 0
         if aggregate_state == "sleep" and not effective_command_mode:
             interval = self.sleep_seconds if sleep_streak < 3 else max(self.sleep_seconds, min(900, int(self.sleep_seconds * 1.5)))
+        if self.background_enabled and not presence_active and not effective_command_mode:
+            interval = min(interval, self.background_seconds)
         jitter = random.uniform(0, 0.25) if effective_command_mode else random.uniform(0, min(4.0, max(0.5, interval * 0.04)))
         now = utc_iso()
         next_run = time.time() + interval + jitter
@@ -2633,14 +2668,16 @@ class TelemetryEngine:
         expired_windows: list[str] = []
         with self.lock, self._db() as db:
             expired_windows = [str(row[0]) for row in db.execute(
-                "SELECT subscription_id FROM subscriptions WHERE enabled=1 AND active_until<=? AND status NOT IN ('idle','disabled','auth_required','cooldown')",
+                "SELECT subscription_id FROM subscriptions WHERE enabled=1 AND active_until<=? "
+                "AND status NOT IN ('idle','background','disabled','auth_required','cooldown')",
                 (now_epoch,),
             ).fetchall()]
             if expired_windows:
                 placeholders = ",".join("?" for _ in expired_windows)
+                expired_status = "background" if self.background_enabled else "idle"
                 db.execute(
-                    f"UPDATE subscriptions SET status='idle', interactive_until=0, command_until=0, last_error=NULL, updated_at=? WHERE subscription_id IN ({placeholders})",
-                    (utc_iso(), *expired_windows),
+                    f"UPDATE subscriptions SET status=?, interactive_until=0, command_until=0, last_error=NULL, updated_at=? WHERE subscription_id IN ({placeholders})",
+                    (expired_status, utc_iso(), *expired_windows),
                 )
             db.execute("DELETE FROM events WHERE status='delivered' AND delivered_at<?", (cutoff_iso,))
             total = int(db.execute("SELECT COUNT(*) FROM events").fetchone()[0])

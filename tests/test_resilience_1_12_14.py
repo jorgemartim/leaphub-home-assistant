@@ -41,6 +41,7 @@ with tempfile.TemporaryDirectory(prefix="leaphub-resilience-") as tmp:
     options = {
         "telemetry_beta_enabled": True,
         "telemetry_beta_internal_url": "https://example.invalid/telemetry",
+        "telemetry_background_enabled": False,
         "telemetry_session_idle_seconds": 1800,
         "telemetry_vehicle_list_cache_seconds": 1800,
         "telemetry_message_cache_seconds": 1800,

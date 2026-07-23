@@ -5,7 +5,7 @@ SERVER = (ROOT / "leaphub_gateway" / "connector_server.py").read_text(encoding="
 CONFIG = (ROOT / "leaphub_gateway" / "config.yaml").read_text(encoding="utf-8")
 
 checks = {
-    "version": 'VERSION = "1.12.18.2"' in SERVER and 'version: "1.12.18.2"' in CONFIG,
+    "version": 'VERSION = "1.12.19"' in SERVER and 'version: "1.12.19"' in CONFIG,
     "api_contract": "API_VERSION = 2" in SERVER and 'X-LeapHub-API-Version' in SERVER,
     "trace": 'X-Request-ID' in SERVER and 'trace_id' in SERVER,
     "compatibility": 'incompatible_api' in SERVER,
