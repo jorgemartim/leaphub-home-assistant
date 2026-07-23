@@ -24,7 +24,7 @@ from cryptography.fernet import Fernet, InvalidToken
 import leaphub_connector as connector
 
 LOG = logging.getLogger("leaphub.telemetry")
-ENGINE_VERSION = "1.12.21"
+ENGINE_VERSION = "1.12.22"
 
 
 def utc_iso() -> str:
@@ -117,8 +117,11 @@ class TelemetryEngine:
         # mantém o último estado confirmado enquanto aguarda, portanto não há
         # motivo para consultar a nuvem a cada três segundos.
         self.command_seconds = self._bounded("telemetry_command_seconds", 12, 10, 60)
-        self.command_max_polls = self._bounded("telemetry_command_max_polls", 3, 2, 4)
-        self.command_cadence = (self.command_seconds, 20, 35, 60)
+        # Cinco amostras cobrem o atraso normal entre a aceitação da nuvem e a
+        # telemetria física do veículo. Instalações atualizadas que ainda tenham
+        # o valor legado 3 recebem o novo mínimo automaticamente.
+        self.command_max_polls = self._bounded("telemetry_command_max_polls", 5, 5, 8)
+        self.command_cadence = (self.command_seconds, 20, 35, 45, 60, 90, 120, 120)
         self.charging_seconds = self._bounded("telemetry_charging_seconds", 25, 15, 600)
         self.parked_seconds = self._bounded("telemetry_parked_seconds", 90, 60, 3600)
         self.sleep_seconds = self._bounded("telemetry_sleep_seconds", 600, 300, 14400)

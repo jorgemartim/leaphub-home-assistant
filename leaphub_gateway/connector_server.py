@@ -37,7 +37,7 @@ try:
 except ModuleNotFoundError:
     from privacy import install_logging_privacy_filter
 
-VERSION = "1.12.21"
+VERSION = "1.12.22"
 API_VERSION = 2
 CAPABILITY_SCHEMA_VERSION = 1
 MIN_SUPPORTED_CLIENT_API_VERSION = 1
@@ -1300,7 +1300,8 @@ class Handler(BaseHTTPRequestHandler):
             retry_after = int(response.get("retry_after_seconds") or 0)
             if retry_after > 0:
                 self.send_header("Retry-After", str(min(86400, retry_after)))
-            if close_connection:
+            should_close = close_connection or bool(getattr(self, "close_connection", False))
+            if should_close:
                 self.send_header("Connection", "close")
                 self.close_connection = True
             self.send_header("Content-Length", str(len(body)))
@@ -1341,6 +1342,10 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json(404, {"ok": False, "message": "Página não encontrada."}, close_connection=True)
 
     def do_POST(self) -> None:
+        # As chamadas assinadas vêm do PHP/Cloudflare e não reutilizam o socket.
+        # Encerrar explicitamente evita que o handler espere mais 15 segundos por
+        # uma segunda requisição que nunca virá e registre um timeout falso.
+        self.close_connection = True
         requested_api = client_api_version(self.headers)
         if requested_api < MIN_SUPPORTED_CLIENT_API_VERSION or requested_api > API_VERSION:
             self.send_json(409, {

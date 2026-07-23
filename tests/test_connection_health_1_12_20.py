@@ -77,4 +77,4 @@ with tempfile.TemporaryDirectory(prefix="leaphub-health-") as tmp:
     os.utime(status_path, (old, old))
     assert server.gateway_services_health() == {}
 
-print({"ok": True, "checks": 9, "version": "1.12.21"})
+print({"ok": True, "checks": 9, "version": "1.12.22"})

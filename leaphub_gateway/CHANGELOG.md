@@ -1,3 +1,9 @@
+## 1.12.22
+- Amplia de três para cinco as leituras adaptativas de confirmação após comandos remotos.
+- Corrige instalações atualizadas que mantinham o limite legado de três leituras.
+- Encerra todas as respostas privadas assinadas, eliminando timeouts ociosos após HTTP 200.
+- Mantém a fila idempotente: trava, destrava, abertura e fechamento continuam sem repetição automática.
+
 ## 1.12.21
 
 - Encerra respostas de saúde depois do envio para evitar conexões ociosas e falsos timeouts de 15 segundos.
