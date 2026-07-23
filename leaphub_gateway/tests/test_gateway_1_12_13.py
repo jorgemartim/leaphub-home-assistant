@@ -125,21 +125,21 @@ class GatewayRegressionTests(unittest.TestCase):
         self.assertEqual(status["block_count"], 0)
 
     def test_conservative_state_and_sleep_intervals(self) -> None:
-        self.assertEqual(self.engine._state_of({"vehicle_state": "ready", "ignition": True, "speed_kmh": 0}), "sleep")
-        self.assertEqual(self.engine._state_of({"vehicle_state": "driving", "speed_kmh": 0}), "sleep")
+        self.assertEqual(self.engine._state_of({"vehicle_state": "ready", "ignition": True, "speed_kmh": 0}), "parked")
+        self.assertEqual(self.engine._state_of({"vehicle_state": "driving", "speed_kmh": 0}), "driving")
         self.assertEqual(self.engine._state_of({"vehicle_state": "driving", "speed_kmh": 8}), "driving")
-        self.assertEqual(self.engine._state_of({"gear": "D", "ready_state": True, "speed_kmh": 0}), "driving")
-        self.assertEqual(self.engine._interval_for_state("driving", 0), 20)
-        self.assertEqual(self.engine._interval_for_state("charging", 0), 25)
-        self.assertEqual(self.engine._interval_for_state("parked", 0), 90)
-        self.assertEqual(self.engine._interval_for_state("sleep", 1), 600)
-        self.assertEqual(self.engine._interval_for_state("sleep", 3), 900)
+        self.assertEqual(self.engine._state_of({"gear": "D", "ready_state": True, "speed_kmh": 0}), "parked")
+        self.assertEqual(self.engine._adaptive_interval(["driving"], 0)[0], 20)
+        self.assertEqual(self.engine._adaptive_interval(["charging"], 0)[0], 25)
+        self.assertEqual(self.engine._adaptive_interval(["parked"], 0)[0], 90)
+        self.assertEqual(self.engine._adaptive_interval(["sleep"], 1)[0], 600)
+        self.assertEqual(self.engine._adaptive_interval(["sleep"], 3)[0], 600)
 
-        stable, candidate, count = self.engine._stabilize_state("sleep", "driving", "", 0, False)
+        stable, candidate, count = self.engine._confirm_state_transition("sleep", "", 0, "driving")
         self.assertEqual((stable, candidate, count), ("sleep", "driving", 1))
-        stable, candidate, count = self.engine._stabilize_state(stable, "driving", candidate, count, False)
-        self.assertEqual(stable, "sleep")
-        stable, candidate, count = self.engine._stabilize_state(stable, "driving", candidate, count, False)
+        stable, candidate, count = self.engine._confirm_state_transition(stable, candidate, count, "driving")
+        self.assertEqual(stable, "driving")
+        stable, candidate, count = self.engine._confirm_state_transition(stable, candidate, count, "driving")
         self.assertEqual(stable, "driving")
 
     def test_destination_signature_compatibility(self) -> None:

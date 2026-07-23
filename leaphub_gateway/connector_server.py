@@ -37,7 +37,7 @@ try:
 except ModuleNotFoundError:
     from privacy import install_logging_privacy_filter
 
-VERSION = "1.12.19"
+VERSION = "1.12.20"
 API_VERSION = 2
 CAPABILITY_SCHEMA_VERSION = 1
 MIN_SUPPORTED_CLIENT_API_VERSION = 1
@@ -52,6 +52,7 @@ NONCE_DB_LAST_CLEANUP = 0.0
 NONCE_DB_LAST_WARNING = 0.0
 NONCE_DB_PATH = Path(os.getenv("LEAPHUB_NONCE_DB_PATH", "/data/security/connector-nonces.sqlite"))
 COMMAND_DB_PATH = Path(os.getenv("LEAPHUB_COMMAND_DB_PATH", "/data/security/connector-commands.sqlite"))
+MANAGER_STATUS_PATH = Path(os.getenv("LEAPHUB_MANAGER_STATUS_PATH", "/data/runtime/unified-status.json"))
 COMMAND_CACHE: dict[str, dict[str, Any]] = {}
 COMMAND_CACHE_LOCK = threading.RLock()
 COMMAND_CACHE_MAX = 2000
@@ -1165,6 +1166,67 @@ def public_health_payload() -> dict[str, Any]:
     }
 
 
+def gateway_services_health() -> dict[str, dict[str, Any]]:
+    """Expõe apenas o mínimo necessário para a saúde remota do site."""
+    try:
+        if not MANAGER_STATUS_PATH.is_file():
+            return {}
+        age = max(0.0, time.time() - MANAGER_STATUS_PATH.stat().st_mtime)
+        if age > 90:
+            return {}
+        raw = MANAGER_STATUS_PATH.read_text(encoding="utf-8")
+        if not raw or len(raw) > 262_144:
+            return {}
+        payload = json.loads(raw)
+        services = payload.get("services") if isinstance(payload, dict) else None
+        if not isinstance(services, dict):
+            return {}
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return {}
+
+    result: dict[str, dict[str, Any]] = {}
+    aliases = {
+        "connector": "connector",
+        "ocpp": "ocpp_wallbox",
+        "tunnel": "tunnel",
+    }
+    for public_name, source_name in aliases.items():
+        source = services.get(source_name)
+        if not isinstance(source, dict):
+            continue
+        enabled = bool(source.get("enabled"))
+        configured = bool(source.get("configured"))
+        process_state = str(source.get("state") or "unknown").strip().lower()
+        health = source.get("health") if isinstance(source.get("health"), dict) else {}
+        health_ok = bool(health.get("ok"))
+        if not enabled:
+            state = "disabled"
+        elif not configured:
+            state = "unconfigured"
+        elif process_state == "running" and health_ok:
+            state = "healthy"
+        elif process_state in {"starting", "stopping"} or (process_state == "running" and not health_ok):
+            state = "degraded"
+        elif process_state in {"stopped", "failed", "crashed"}:
+            state = "down"
+        else:
+            state = "unknown"
+        result[public_name] = {
+            "enabled": enabled,
+            "configured": configured,
+            "state": state,
+            "restarts": max(0, int(source.get("restarts") or 0)),
+            "message": {
+                "healthy": "Serviço ativo e saudável.",
+                "degraded": "Serviço ativo com diagnóstico instável.",
+                "down": "Serviço interrompido.",
+                "disabled": "Serviço desativado.",
+                "unconfigured": "Serviço não configurado.",
+            }.get(state, "Sem diagnóstico recente."),
+        }
+    return result
+
+
 def detailed_health_payload(environment: str) -> dict[str, Any]:
     library = connector.package_version()
     configured = [name for name, secret in SECRETS.items() if len(secret) >= 32]
@@ -1183,6 +1245,7 @@ def detailed_health_payload(environment: str) -> dict[str, Any]:
         "environment": environment,
         "configured_environments": configured,
         "telemetry_storage": TELEMETRY.storage_status(),
+        "gateway_services": gateway_services_health(),
         "uptime_seconds": int(time.time() - STARTED_AT),
     }
 

@@ -1,3 +1,8 @@
+## 1.12.20
+
+- Saúde sanitizada de Connector, OCPP e Tunnel no diagnóstico privado.
+- Detecção de estado desatualizado sem exposição de logs ou identificadores.
+
 ## 1.12.19
 
 - Mantém assinaturas habilitadas em coleta adaptativa mesmo sem nenhuma tela do Leap Hub aberta.
