@@ -8,11 +8,11 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 APP = ROOT / "leaphub_gateway"
 config = yaml.safe_load((APP / "config.yaml").read_text(encoding="utf-8"))
-assert config["version"] == "1.12.22"
+assert config["version"] == "1.12.23"
 assert not config.get("image")
 assert (APP / "Dockerfile").is_file()
 assert "/data/runtime/bin/cloudflared rix," in (APP / "apparmor.txt").read_text(encoding="utf-8")
-assert len(config.get("options", {})) == 46
+assert len(config.get("options", {})) == 47
 
 dockerfile = (APP / "Dockerfile").read_text(encoding="utf-8")
 assert "cloudflared/releases/download" not in dockerfile
@@ -21,7 +21,7 @@ assert "ca-certificates libstdc++6" in dockerfile
 
 manager = (APP / "gateway_manager.py").read_text(encoding="utf-8")
 for marker in (
-    'VERSION = "1.12.22"',
+    'VERSION = "1.12.23"',
     "def resolve_cloudflared()",
     "CLOUDFLARED_SHA256_AMD64",
     "MAX_CLOUDFLARED_BYTES",
@@ -48,4 +48,4 @@ ocpp = (APP / "ocpp_gateway.py").read_text(encoding="utf-8")
 for command_marker in ("RemoteStartTransaction", "RemoteStopTransaction", "UnlockConnector", "ChangeAvailability"):
     assert command_marker in ocpp, command_marker
 assert (ROOT / "tests" / "test_remote_command_matrix.py").is_file()
-print("recovery local build 1.12.22 contract ok")
+print("recovery local build 1.12.23 contract ok")

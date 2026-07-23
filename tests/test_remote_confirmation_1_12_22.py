@@ -50,8 +50,8 @@ with tempfile.TemporaryDirectory(prefix="leaphub-confirmation-") as tmp:
         engine._instance_lock_handle.close()
 
 checks = {
-    "version": 'version: "1.12.22"' in config_source
-        and 'VERSION = "1.12.22"' in server_source,
+    "version": 'version: "1.12.23"' in config_source
+        and 'VERSION = "1.12.23"' in server_source,
     "manager_migrates_legacy_limit": 'max(5, min(8' in manager_source,
     "private_posts_close": "def do_POST(self) -> None:\n        # As chamadas assinadas" in server_source
         and "self.close_connection = True" in server_source,
@@ -61,6 +61,6 @@ checks = {
 
 failed = [name for name, ok in checks.items() if not ok]
 if failed:
-    raise SystemExit("remote confirmation 1.12.22 failed:\n- " + "\n- ".join(failed))
+    raise SystemExit("remote confirmation 1.12.23 failed:\n- " + "\n- ".join(failed))
 
-print({"ok": True, "checks": len(checks) + 4, "version": "1.12.22"})
+print({"ok": True, "checks": len(checks) + 4, "version": "1.12.23"})

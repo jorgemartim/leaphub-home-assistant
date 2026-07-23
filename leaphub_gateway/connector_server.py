@@ -37,7 +37,7 @@ try:
 except ModuleNotFoundError:
     from privacy import install_logging_privacy_filter
 
-VERSION = "1.12.22"
+VERSION = "1.12.23"
 API_VERSION = 2
 CAPABILITY_SCHEMA_VERSION = 1
 MIN_SUPPORTED_CLIENT_API_VERSION = 1
@@ -184,6 +184,7 @@ MAX_PARALLEL = max(1, min(8, int(OPTIONS.get("connector_max_parallel") or OPTION
 SEMAPHORE = PriorityOperationLimiter(MAX_PARALLEL)
 MANUAL_WAIT_SECONDS = max(2, min(60, int(OPTIONS.get("connector_manual_wait_seconds") or OPTIONS.get("manual_wait_seconds") or 35)))
 MANUAL_QUEUE_SECONDS = max(120, min(300, int(OPTIONS.get("connector_manual_queue_seconds") or 180)))
+MANUAL_SETTLE_SECONDS = max(8, min(45, int(OPTIONS.get("connector_manual_settle_seconds") or 20)))
 LOG_LEVEL = str(OPTIONS.get("log_level") or "INFO").upper()
 logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO), format="%(asctime)s %(levelname)s %(message)s")
 install_logging_privacy_filter()
@@ -895,7 +896,10 @@ def run_command_job(
         result["queued"] = False
         result["queue_wait_seconds"] = int(time.monotonic() - queue_started)
         command_journal_finish(request_hash, request_id, result)
-        defer_seconds = 5 if bool(result.get("wake_attempted")) else 3
+        # Preserve uma janela curta para uma ação manual seguinte. Antes, a
+        # telemetria de confirmação assumia a conta após três segundos e
+        # abrir/fechar ou travar/destravar em sequência aguardava até 31s.
+        defer_seconds = MANUAL_SETTLE_SECONDS
         LOG.info(
             "Comando remoto %s finalizado no worker para %s; resultado=%s, espera_fila=%ss, tentativas=%s, despertar_real=%s, repetição_segura=%s, estratégia=%s, confirmado_direto=%s, confirmação_pendente=%s.",
             str(payload.get("command") or "desconhecido")[:40],

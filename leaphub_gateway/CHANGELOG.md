@@ -1,3 +1,8 @@
+## 1.12.23
+- Reserva uma janela curta para comandos manuais antes da telemetria de confirmação.
+- Impede que abrir/fechar ou travar/destravar em sequência fique atrás de uma leitura automática longa.
+- Mantém a confirmação adaptativa em segundo plano sem transformar entrega em estado físico confirmado.
+
 ## 1.12.22
 - Amplia de três para cinco as leituras adaptativas de confirmação após comandos remotos.
 - Corrige instalações atualizadas que mantinham o limite legado de três leituras.
