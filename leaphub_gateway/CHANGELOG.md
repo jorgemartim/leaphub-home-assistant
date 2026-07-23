@@ -1,3 +1,9 @@
+## 1.12.21
+
+- Encerra respostas de saúde depois do envio para evitar conexões ociosas e falsos timeouts de 15 segundos.
+- Mantém `confirmation_pending` coerente quando a nuvem aceitou o comando, mas a telemetria ainda não confirmou o estado.
+- Preserva sessão única, idempotência, telemetria adaptativa, OCPP e diagnóstico sanitizado.
+
 ## 1.12.20
 
 - Saúde sanitizada de Connector, OCPP e Tunnel no diagnóstico privado.

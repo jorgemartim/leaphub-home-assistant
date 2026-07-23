@@ -42,7 +42,7 @@ except ImportError:
         _privacy_spec.loader.exec_module(_privacy_module)
         sanitize_log = _privacy_module.sanitize_log
 
-CONNECTOR_VERSION = "1.12.20"
+CONNECTOR_VERSION = "1.12.21"
 MAX_INPUT_BYTES = 1024 * 1024
 logging.getLogger("leapmotor_api").setLevel(logging.WARNING)
 LOGGER = logging.getLogger("leaphub.connector")
@@ -3208,6 +3208,12 @@ def handle_command(
             # terminal for this request: do not pretend success and do not issue a
             # third delivery. A later user action receives a new request id.
             confirmation_pending = False
+        elif verified_by_gateway:
+            confirmation_pending = False
+        elif command_dispatched or cloud_accepted:
+            # Uma ação aceita, mas ainda não verificada, deve manter o mesmo
+            # estado em todo o resultado e no diário do Gateway.
+            confirmation_pending = True
         if verified_by_gateway:
             message = "A ação foi executada e confirmada por uma leitura nova do veículo."
         elif not_applied:

@@ -37,7 +37,7 @@ try:
 except ModuleNotFoundError:
     from privacy import install_logging_privacy_filter
 
-VERSION = "1.12.20"
+VERSION = "1.12.21"
 API_VERSION = 2
 CAPABILITY_SCHEMA_VERSION = 1
 MIN_SUPPORTED_CLIENT_API_VERSION = 1
@@ -1280,7 +1280,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
         LOG.info("%s - %s", self.address_string(), line)
 
-    def send_json(self, status: int, payload: dict[str, Any]) -> bool:
+    def send_json(self, status: int, payload: dict[str, Any], *, close_connection: bool = False) -> bool:
         response = dict(payload)
         response.setdefault("trace_id", self.trace_id)
         response.setdefault("gateway_version", VERSION)
@@ -1300,6 +1300,9 @@ class Handler(BaseHTTPRequestHandler):
             retry_after = int(response.get("retry_after_seconds") or 0)
             if retry_after > 0:
                 self.send_header("Retry-After", str(min(86400, retry_after)))
+            if close_connection:
+                self.send_header("Connection", "close")
+                self.close_connection = True
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -1326,16 +1329,16 @@ class Handler(BaseHTTPRequestHandler):
                 environment = verify_signature("GET", path, b"", self.headers)
             except PermissionError as exc:
                 LOG.warning("Private diagnostics rejected: %s", exc)
-                self.send_json(403, {"ok": False})
+                self.send_json(403, {"ok": False}, close_connection=True)
                 return
             if path == "/health/details":
                 details = detailed_health_payload(environment)
                 details["telemetry"] = TELEMETRY.status_fast()
-                self.send_json(200, details)
+                self.send_json(200, details, close_connection=True)
             else:
-                self.send_json(200, TELEMETRY.status())
+                self.send_json(200, TELEMETRY.status(), close_connection=True)
             return
-        self.send_json(404, {"ok": False, "message": "Página não encontrada."})
+        self.send_json(404, {"ok": False, "message": "Página não encontrada."}, close_connection=True)
 
     def do_POST(self) -> None:
         requested_api = client_api_version(self.headers)
