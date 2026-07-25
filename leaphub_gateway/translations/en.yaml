@@ -26,6 +26,12 @@ configuration:
   telemetry_production_internal_url:
     name: Production telemetry internal endpoint
     description: HTTPS URL that receives the Production queue.
+  telemetry_background_enabled:
+    name: Monitor without opening Leap Hub
+    description: Keep adaptive collection active in the background to record trips and vehicle changes.
+  telemetry_background_seconds:
+    name: Maximum background interval
+    description: Maximum delay between checks while the vehicle is resting and no Leap Hub screen is open.
   telemetry_active_seconds:
     name: Driving interval
     description: Polling frequency while driving or READY.
@@ -52,7 +58,7 @@ configuration:
     description: Storage protection for the persistent queue.
   ocpp_beta_enabled:
     name: Enable OCPP Beta
-    description: Starts the Beta OCPP gateway on port 8092.
+    description: Selects Beta as the single OCPP owner. Do not enable it together with Production.
   ocpp_beta_internal_url:
     name: OCPP Beta internal URL
     description: Leap Hub Beta HTTPS endpoint.
@@ -64,7 +70,7 @@ configuration:
     description: Maximum simultaneous OCPP connections.
   ocpp_production_enabled:
     name: Enable OCPP Production
-    description: Starts the Production OCPP gateway on port 8093.
+    description: Selects Production as the single OCPP owner. Do not enable it together with Beta.
   ocpp_production_internal_url:
     name: OCPP Production internal URL
     description: Leap Hub Production HTTPS endpoint.
@@ -91,6 +97,6 @@ configuration:
     description: Maximum recent lines shown per service.
 network:
   8092/TCP: OCPP Beta for Cloudflare Tunnel
-  8093/TCP: OCPP Production for Cloudflare Tunnel
+  8093/TCP: Legacy OCPP port (unused by new installations)
   8094/TCP: Leapmotor Connector for Cloudflare Tunnel
   8099/TCP: Internal Ingress dashboard

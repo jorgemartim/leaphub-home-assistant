@@ -32,7 +32,15 @@ except ModuleNotFoundError as exc:
         "Módulo interno leaphub_connector ausente na imagem. Atualize o Leap Hub Gateway."
     ) from exc
 
-VERSION = "1.12.08"
+try:
+    from leaphub_privacy import install_logging_privacy_filter
+except ModuleNotFoundError:
+    from privacy import install_logging_privacy_filter
+
+VERSION = "1.12.24"
+API_VERSION = 2
+CAPABILITY_SCHEMA_VERSION = 1
+MIN_SUPPORTED_CLIENT_API_VERSION = 1
 SERVICE = "Leap Hub Leapmotor Connector"
 MAX_BODY = 1024 * 1024
 WINDOW_SECONDS = 180
@@ -44,10 +52,13 @@ NONCE_DB_LAST_CLEANUP = 0.0
 NONCE_DB_LAST_WARNING = 0.0
 NONCE_DB_PATH = Path(os.getenv("LEAPHUB_NONCE_DB_PATH", "/data/security/connector-nonces.sqlite"))
 COMMAND_DB_PATH = Path(os.getenv("LEAPHUB_COMMAND_DB_PATH", "/data/security/connector-commands.sqlite"))
+MANAGER_STATUS_PATH = Path(os.getenv("LEAPHUB_MANAGER_STATUS_PATH", "/data/runtime/unified-status.json"))
 COMMAND_CACHE: dict[str, dict[str, Any]] = {}
 COMMAND_CACHE_LOCK = threading.RLock()
 COMMAND_CACHE_MAX = 2000
 COMMAND_CANCEL_REQUESTS: set[str] = set()
+MAX_AUTH_RETRY_SECONDS = 1800
+AUTH_RETRY_CLOCK_SKEW_SECONDS = 90
 
 
 class CommandCancelled(RuntimeError):
@@ -173,8 +184,10 @@ MAX_PARALLEL = max(1, min(8, int(OPTIONS.get("connector_max_parallel") or OPTION
 SEMAPHORE = PriorityOperationLimiter(MAX_PARALLEL)
 MANUAL_WAIT_SECONDS = max(2, min(60, int(OPTIONS.get("connector_manual_wait_seconds") or OPTIONS.get("manual_wait_seconds") or 35)))
 MANUAL_QUEUE_SECONDS = max(120, min(300, int(OPTIONS.get("connector_manual_queue_seconds") or 180)))
+MANUAL_SETTLE_SECONDS = max(8, min(45, int(OPTIONS.get("connector_manual_settle_seconds") or 20)))
 LOG_LEVEL = str(OPTIONS.get("log_level") or "INFO").upper()
 logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO), format="%(asctime)s %(levelname)s %(message)s")
+install_logging_privacy_filter()
 LOG = logging.getLogger("leaphub.connector")
 logging.getLogger("leapmotor_api").setLevel(logging.WARNING)
 TELEMETRY: TelemetryEngine
@@ -182,6 +195,21 @@ TELEMETRY: TelemetryEngine
 
 def json_bytes(payload: dict[str, Any]) -> bytes:
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"), default=connector.json_default).encode("utf-8")
+
+
+def trace_identifier(value: Any) -> str:
+    candidate = str(value or "").strip().lower()
+    if re.fullmatch(r"[a-z0-9][a-z0-9._:-]{7,95}", candidate):
+        return candidate
+    return hashlib.sha256(f"{time.time_ns()}:{threading.get_ident()}".encode("utf-8")).hexdigest()[:24]
+
+
+def client_api_version(headers: Any) -> int:
+    raw = str(headers.get("X-LeapHub-API-Version") or "1").strip()
+    try:
+        return int(raw)
+    except ValueError:
+        return 0
 
 
 def request_identifier(payload: dict[str, Any]) -> str:
@@ -317,15 +345,53 @@ def command_journal_begin(environment: str, payload: dict[str, Any]) -> tuple[st
             if isinstance(response, dict):
                 retry_at = float(response.get("retry_at") or 0)
                 retry_after = int(response.get("retry_after_seconds") or 0)
-                stale_waiting_auth = existing_status == "waiting_auth" and (
-                    retry_after > 300 or retry_at > now + 300 or retry_at <= now
+                impossible_waiting_auth = existing_status == "waiting_auth" and (
+                    retry_after < 0
+                    or retry_after > MAX_AUTH_RETRY_SECONDS
+                    or retry_at > now + MAX_AUTH_RETRY_SECONDS + AUTH_RETRY_CLOCK_SKEW_SECONDS
                 )
-                if not stale_waiting_auth:
+                if existing_status == "waiting_auth" and not impossible_waiting_auth:
+                    # Backoffs progressivos legítimos chegam a 30 minutos. Antes
+                    # da 1.12.15.1 qualquer espera acima de 5 minutos era tratada
+                    # como registro defeituoso, o que podia reenviar o comando e
+                    # renovar o bloqueio da Leapmotor antes da hora.
+                    if retry_at > now:
+                        response["retry_after_seconds"] = max(1, int(retry_at - now))
+                        response["duplicate"] = True
+                        response["request_id"] = request_id
+                        return None, response
+                    try:
+                        auth_status = TELEMETRY.account_auth_status(environment, payload)
+                    except Exception as exc:  # noqa: BLE001
+                        LOG.debug("Consulta do cooldown global adiada para o comando %s: %s", request_id[:12], exc)
+                        auth_status = {"cooldown": True, "retry_after_seconds": 30}
+                    if bool(auth_status.get("cooldown")):
+                        remaining = max(1, min(MAX_AUTH_RETRY_SECONDS, int(auth_status.get("retry_after_seconds") or 30)))
+                        response["retry_after_seconds"] = remaining
+                        response["retry_at"] = now + remaining
+                        response["duplicate"] = True
+                        response["request_id"] = request_id
+                        response["message"] = "A autenticação global ainda está protegida. O comando permanece na fila sem novo envio."
+                        return None, response
+                    stale_waiting_auth = True
+                elif impossible_waiting_auth:
+                    # Um registro realmente impossível é retomado apenas depois
+                    # de confirmar que o coordenador global não está bloqueado.
+                    try:
+                        auth_status = TELEMETRY.account_auth_status(environment, payload)
+                    except Exception:  # noqa: BLE001
+                        auth_status = {"cooldown": True}
+                    if bool(auth_status.get("cooldown")):
+                        response["duplicate"] = True
+                        response["request_id"] = request_id
+                        return None, response
+                    stale_waiting_auth = True
+                else:
                     response["duplicate"] = True
                     response["request_id"] = request_id
                     return None, response
         if stale_waiting_auth:
-            LOG.info("Retomando o comando %s após o prazo de autenticação, preservando o mesmo identificador idempotente.", request_id[:12])
+            LOG.info("Retomando o comando %s somente após o coordenador global liberar a autenticação.", request_id[:12])
             row["status"] = "queued"
             row["response_json"] = ""
         if str(row.get("status") or "") in active_states and now - float(row.get("updated_at") or 0) < 900 and not stale_waiting_auth:
@@ -436,7 +502,7 @@ def command_journal_finish(request_hash: str | None, request_id: str, response: 
 def command_journal_wait_auth(request_hash: str | None, request_id: str, retry_after_seconds: int) -> None:
     if not request_hash:
         return
-    delay = max(30, min(300, int(retry_after_seconds or 135)))
+    delay = max(30, min(1800, int(retry_after_seconds or 300)))
     now = time.time()
     retry_at = now + delay
     response = {
@@ -540,7 +606,9 @@ def command_journal_status(environment: str, payload: dict[str, Any]) -> dict[st
     retry_at = float(response.get("retry_at") or 0)
     retry_after_recorded = int(response.get("retry_after_seconds") or 0)
     impossible_waiting_auth = status == "waiting_auth" and (
-        retry_after_recorded > 300 or retry_at > time.time() + 300
+        retry_after_recorded < 0
+        or retry_after_recorded > MAX_AUTH_RETRY_SECONDS
+        or retry_at > time.time() + MAX_AUTH_RETRY_SECONDS + AUTH_RETRY_CLOCK_SKEW_SECONDS
     )
     if impossible_waiting_auth:
         response = {
@@ -722,7 +790,7 @@ def schedule_command_retry(
     request_id: str,
     retry_after_seconds: int,
 ) -> None:
-    delay = max(30, min(300, int(retry_after_seconds or 135)))
+    delay = max(30, min(1800, int(retry_after_seconds or 300)))
     worker_key = command_worker_key(environment, request_id)
 
     def resume() -> None:
@@ -828,7 +896,10 @@ def run_command_job(
         result["queued"] = False
         result["queue_wait_seconds"] = int(time.monotonic() - queue_started)
         command_journal_finish(request_hash, request_id, result)
-        defer_seconds = 5 if bool(result.get("wake_attempted")) else 3
+        # Preserve uma janela curta para uma ação manual seguinte. Antes, a
+        # telemetria de confirmação assumia a conta após três segundos e
+        # abrir/fechar ou travar/destravar em sequência aguardava até 31s.
+        defer_seconds = MANUAL_SETTLE_SECONDS
         LOG.info(
             "Comando remoto %s finalizado no worker para %s; resultado=%s, espera_fila=%ss, tentativas=%s, despertar_real=%s, repetição_segura=%s, estratégia=%s, confirmado_direto=%s, confirmação_pendente=%s.",
             str(payload.get("command") or "desconhecido")[:40],
@@ -855,7 +926,7 @@ def run_command_job(
         defer_seconds = 0
         retry_after_seconds = 0
     except connector.ConnectorLoginCooldownError as exc:
-        retry_after_seconds = max(30, min(300, int(exc.retry_after_seconds or 135)))
+        retry_after_seconds = max(30, min(1800, int(exc.retry_after_seconds or 300)))
         command_journal_wait_auth(request_hash, request_id, retry_after_seconds)
         defer_seconds = 1
         LOG.info(
@@ -1091,7 +1162,73 @@ def connector_ready() -> bool:
 
 
 def public_health_payload() -> dict[str, Any]:
-    return {"ok": connector_ready()}
+    return {
+        "ok": connector_ready(),
+        "version": VERSION,
+        "api_version": API_VERSION,
+        "capability_schema_version": CAPABILITY_SCHEMA_VERSION,
+    }
+
+
+def gateway_services_health() -> dict[str, dict[str, Any]]:
+    """Expõe apenas o mínimo necessário para a saúde remota do site."""
+    try:
+        if not MANAGER_STATUS_PATH.is_file():
+            return {}
+        age = max(0.0, time.time() - MANAGER_STATUS_PATH.stat().st_mtime)
+        if age > 90:
+            return {}
+        raw = MANAGER_STATUS_PATH.read_text(encoding="utf-8")
+        if not raw or len(raw) > 262_144:
+            return {}
+        payload = json.loads(raw)
+        services = payload.get("services") if isinstance(payload, dict) else None
+        if not isinstance(services, dict):
+            return {}
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return {}
+
+    result: dict[str, dict[str, Any]] = {}
+    aliases = {
+        "connector": "connector",
+        "ocpp": "ocpp_wallbox",
+        "tunnel": "tunnel",
+    }
+    for public_name, source_name in aliases.items():
+        source = services.get(source_name)
+        if not isinstance(source, dict):
+            continue
+        enabled = bool(source.get("enabled"))
+        configured = bool(source.get("configured"))
+        process_state = str(source.get("state") or "unknown").strip().lower()
+        health = source.get("health") if isinstance(source.get("health"), dict) else {}
+        health_ok = bool(health.get("ok"))
+        if not enabled:
+            state = "disabled"
+        elif not configured:
+            state = "unconfigured"
+        elif process_state == "running" and health_ok:
+            state = "healthy"
+        elif process_state in {"starting", "stopping"} or (process_state == "running" and not health_ok):
+            state = "degraded"
+        elif process_state in {"stopped", "failed", "crashed"}:
+            state = "down"
+        else:
+            state = "unknown"
+        result[public_name] = {
+            "enabled": enabled,
+            "configured": configured,
+            "state": state,
+            "restarts": max(0, int(source.get("restarts") or 0)),
+            "message": {
+                "healthy": "Serviço ativo e saudável.",
+                "degraded": "Serviço ativo com diagnóstico instável.",
+                "down": "Serviço interrompido.",
+                "disabled": "Serviço desativado.",
+                "unconfigured": "Serviço não configurado.",
+            }.get(state, "Sem diagnóstico recente."),
+        }
+    return result
 
 
 def detailed_health_payload(environment: str) -> dict[str, Any]:
@@ -1102,6 +1239,9 @@ def detailed_health_payload(environment: str) -> dict[str, Any]:
         "service": SERVICE,
         "message": "Conector remoto pronto." if library is not None and environment in configured else "Confira a chave do ambiente e a biblioteca leapmotor-api.",
         "version": VERSION,
+        "api_version": API_VERSION,
+        "capability_schema_version": CAPABILITY_SCHEMA_VERSION,
+        "minimum_client_api_version": MIN_SUPPORTED_CLIENT_API_VERSION,
         "connector_version": connector.CONNECTOR_VERSION,
         "library_version": library,
         "operation_limiter": SEMAPHORE.snapshot(),
@@ -1109,17 +1249,26 @@ def detailed_health_payload(environment: str) -> dict[str, Any]:
         "environment": environment,
         "configured_environments": configured,
         "telemetry_storage": TELEMETRY.storage_status(),
+        "gateway_services": gateway_services_health(),
         "uptime_seconds": int(time.time() - STARTED_AT),
     }
 
 
 class Handler(BaseHTTPRequestHandler):
     server_version = "LeapHubConnector"
+    protocol_version = "HTTP/1.1"
     sys_version = ""
 
     def setup(self) -> None:
         super().setup()
         self.connection.settimeout(15.0)
+        self.trace_id = trace_identifier("")
+
+    def parse_request(self) -> bool:
+        parsed = super().parse_request()
+        if parsed:
+            self.trace_id = trace_identifier(self.headers.get("X-Request-ID"))
+        return parsed
 
     def log_message(self, fmt: str, *args: Any) -> None:
         line = fmt % args
@@ -1135,20 +1284,30 @@ class Handler(BaseHTTPRequestHandler):
                 return
         LOG.info("%s - %s", self.address_string(), line)
 
-    def send_json(self, status: int, payload: dict[str, Any]) -> bool:
-        body = json_bytes(payload)
+    def send_json(self, status: int, payload: dict[str, Any], *, close_connection: bool = False) -> bool:
+        response = dict(payload)
+        response.setdefault("trace_id", self.trace_id)
+        response.setdefault("gateway_version", VERSION)
+        response.setdefault("api_version", API_VERSION)
+        body = json_bytes(response)
         try:
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
             self.send_header("Pragma", "no-cache")
             self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("X-Request-ID", self.trace_id)
+            self.send_header("X-LeapHub-Gateway-Version", VERSION)
+            self.send_header("X-LeapHub-API-Version", str(API_VERSION))
             self.send_header("X-Robots-Tag", "noindex, nofollow, noarchive")
             self.send_header("Referrer-Policy", "no-referrer")
-            self.send_header("Connection", "close")
-            retry_after = int(payload.get("retry_after_seconds") or 0) if isinstance(payload, dict) else 0
+            retry_after = int(response.get("retry_after_seconds") or 0)
             if retry_after > 0:
                 self.send_header("Retry-After", str(min(86400, retry_after)))
+            should_close = close_connection or bool(getattr(self, "close_connection", False))
+            if should_close:
+                self.send_header("Connection", "close")
+                self.close_connection = True
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -1175,18 +1334,32 @@ class Handler(BaseHTTPRequestHandler):
                 environment = verify_signature("GET", path, b"", self.headers)
             except PermissionError as exc:
                 LOG.warning("Private diagnostics rejected: %s", exc)
-                self.send_json(403, {"ok": False})
+                self.send_json(403, {"ok": False}, close_connection=True)
                 return
             if path == "/health/details":
                 details = detailed_health_payload(environment)
                 details["telemetry"] = TELEMETRY.status_fast()
-                self.send_json(200, details)
+                self.send_json(200, details, close_connection=True)
             else:
-                self.send_json(200, TELEMETRY.status())
+                self.send_json(200, TELEMETRY.status(), close_connection=True)
             return
-        self.send_json(404, {"ok": False, "message": "Página não encontrada."})
+        self.send_json(404, {"ok": False, "message": "Página não encontrada."}, close_connection=True)
 
     def do_POST(self) -> None:
+        # As chamadas assinadas vêm do PHP/Cloudflare e não reutilizam o socket.
+        # Encerrar explicitamente evita que o handler espere mais 15 segundos por
+        # uma segunda requisição que nunca virá e registre um timeout falso.
+        self.close_connection = True
+        requested_api = client_api_version(self.headers)
+        if requested_api < MIN_SUPPORTED_CLIENT_API_VERSION or requested_api > API_VERSION:
+            self.send_json(409, {
+                "ok": False,
+                "incompatible_api": True,
+                "message": "Versão de integração incompatível. Atualize o Leap Hub ou o Gateway.",
+                "requested_api_version": requested_api,
+                "supported_api_version": API_VERSION,
+            })
+            return
         if self.path not in {"/v1/accounts/test", "/v1/vehicles/sync", "/v1/vehicles/command", "/v1/vehicles/command/status", "/v1/vehicles/command/cancel", "/v1/telemetry/subscriptions/upsert", "/v1/telemetry/subscriptions/remove", "/v1/telemetry/subscriptions/boost", "/v1/telemetry/subscriptions/release"}:
             self.send_json(404, {"ok": False, "message": "Página não encontrada."})
             return
@@ -1216,9 +1389,9 @@ class Handler(BaseHTTPRequestHandler):
 
         try:
             if self.path in {"/v1/telemetry/subscriptions/boost", "/v1/telemetry/subscriptions/release", "/v1/vehicles/command/status"}:
-                LOG.debug("Action %s accepted for %s", self.path, environment)
+                LOG.debug("Action %s accepted for %s trace=%s", self.path, environment, self.trace_id)
             else:
-                LOG.info("Action %s accepted for %s", self.path, environment)
+                LOG.info("Action %s accepted for %s trace=%s", self.path, environment, self.trace_id)
             if self.path == "/v1/telemetry/subscriptions/upsert":
                 self.send_json(200, TELEMETRY.upsert(environment, payload))
                 return
@@ -1284,9 +1457,9 @@ class Handler(BaseHTTPRequestHandler):
                     })
                     return
                 if self.path == "/v1/accounts/test":
-                    result = connector.handle_account(payload, sync=False)
+                    result = TELEMETRY.execute_account_operation(environment, payload, sync=False, origin="account_test")
                 elif self.path == "/v1/vehicles/sync":
-                    result = connector.handle_account(payload, sync=True)
+                    result = TELEMETRY.execute_account_operation(environment, payload, sync=True, origin="vehicle_sync")
                 else:
                     # Fallback síncrono para clientes antigos sem request_id.
                     # Clientes atuais entram na fila protegida e recebem resposta imediata.
@@ -1295,9 +1468,8 @@ class Handler(BaseHTTPRequestHandler):
                         if replay is not None:
                             self.send_json(200, replay)
                             return
-                    TELEMETRY.invalidate_account_session(environment, payload)
                     try:
-                        result = connector.handle_command(payload)
+                        result = TELEMETRY.execute_command(environment, payload)
                         if request_id:
                             result["request_id"] = request_id
                         command_journal_finish(command_journal_key, request_id, result)

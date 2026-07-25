@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-import hmac
+import hashlib
 import json
 import logging
+try:
+    from leaphub_privacy import install_logging_privacy_filter, sanitize_log
+except ModuleNotFoundError:
+    from privacy import install_logging_privacy_filter, sanitize_log
 import os
 import re
 import secrets
@@ -20,7 +24,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-VERSION = "1.12.08"
+VERSION = "1.12.24"
 OPTIONS_PATH = Path(os.getenv("LEAPHUB_OPTIONS_PATH", "/data/options.json"))
 RUNTIME = Path(os.getenv("LEAPHUB_RUNTIME_DIR", "/data/runtime"))
 LOG_DIR = Path(os.getenv("LEAPHUB_LOG_DIR", "/data/logs"))
@@ -44,38 +48,122 @@ def load_options() -> dict[str, Any]:
 OPTIONS = load_options()
 LOG_LEVEL = str(OPTIONS.get("log_level") or "INFO").upper()
 logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO), format="%(asctime)s %(levelname)s %(message)s")
+install_logging_privacy_filter()
 LOG = logging.getLogger("leaphub.gateway")
 STOP = threading.Event()
 UI_TOKEN = secrets.token_hex(24)
+
+CLOUDFLARED_VERSION = "2026.7.1"
+CLOUDFLARED_SHA256_AMD64 = "79a0ade7fc854f62c1aaef48424d9d979e8c2fcd039189d24db82b84cd146be1"
+CLOUDFLARED_URL_AMD64 = f"https://github.com/cloudflare/cloudflared/releases/download/{CLOUDFLARED_VERSION}/cloudflared-linux-amd64"
+MAX_CLOUDFLARED_BYTES = 100 * 1024 * 1024
 
 
 def secret_ok(value: Any, minimum: int = 32) -> bool:
     return len(str(value or "").strip()) >= minimum
 
 
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def resolve_cloudflared() -> str:
+    """Resolve cloudflared without slowing every image build.
+
+    The binary is downloaded only when the embedded tunnel is actually enabled.
+    The fixed checksum prevents executing an unexpected payload.
+    """
+    explicit = str(os.getenv("LEAPHUB_CLOUDFLARED") or "").strip()
+    candidates = [Path(explicit)] if explicit else []
+    candidates.extend([Path("/usr/local/bin/cloudflared"), RUNTIME / "bin" / "cloudflared"])
+    for candidate in candidates:
+        try:
+            if candidate.is_file() and os.access(candidate, os.X_OK):
+                if candidate == RUNTIME / "bin" / "cloudflared" and _file_sha256(candidate) != CLOUDFLARED_SHA256_AMD64:
+                    LOG.warning("Cloudflared local possui hash inesperado; será substituído.")
+                    candidate.unlink(missing_ok=True)
+                    continue
+                return str(candidate)
+        except OSError:
+            continue
+
+    if not bool(OPTIONS.get("tunnel_enabled", False)):
+        return ""
+
+    target = RUNTIME / "bin" / "cloudflared"
+    temp = target.with_name(target.name + ".download")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temp.unlink(missing_ok=True)
+    LOG.info("Cloudflare Tunnel ativado; preparando binário verificado uma única vez.")
+    try:
+        request = urllib.request.Request(
+            CLOUDFLARED_URL_AMD64,
+            headers={"User-Agent": f"LeapHubGateway/{VERSION}"},
+        )
+        digest = hashlib.sha256()
+        total = 0
+        with urllib.request.urlopen(request, timeout=90) as response, temp.open("wb") as output:
+            content_length = int(response.headers.get("Content-Length") or 0)
+            if content_length > MAX_CLOUDFLARED_BYTES:
+                raise RuntimeError("binário cloudflared excede o tamanho permitido")
+            while True:
+                chunk = response.read(1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > MAX_CLOUDFLARED_BYTES:
+                    raise RuntimeError("download cloudflared excedeu o limite")
+                digest.update(chunk)
+                output.write(chunk)
+        if total < 5 * 1024 * 1024:
+            raise RuntimeError("download cloudflared incompleto")
+        if digest.hexdigest() != CLOUDFLARED_SHA256_AMD64:
+            raise RuntimeError("checksum cloudflared inválido")
+        temp.chmod(0o755)
+        os.replace(temp, target)
+        LOG.info("Cloudflared %s preparado com integridade confirmada.", CLOUDFLARED_VERSION)
+        return str(target)
+    except Exception as exc:  # noqa: BLE001
+        temp.unlink(missing_ok=True)
+        LOG.error("Não foi possível preparar o Cloudflare Tunnel: %s", sanitize(str(exc)))
+        return ""
+
+
 def sanitize(line: str) -> str:
-    text = str(line).replace("\x00", " ").rstrip()
-    for key in ("tunnel_token", "gateway_secret", "staging_secret", "production_secret", "TUNNEL_TOKEN"):
-        text = text.replace(key + "=", key + "=[protegido]")
-    text = re.sub(r"(?i)(operatePassword|operation_password|password|token|authorization)=([^&\s]+)", r"\1=[protegido]", text)
-    text = re.sub(r'(?i)("(?:operatePassword|operation_password|password|token|authorization)"\s*:\s*")[^"]+("?)', r'\1[protegido]\2', text)
-    text = re.sub(r"(?i)(vin)=([^&\s]+)", r"\1=[VIN protegido]", text)
-    text = re.sub(r'(?i)("vin"\s*:\s*")[^"]+("?)', r'\1[VIN protegido]\2', text)
-    text = re.sub(r"\b[A-HJ-NPR-Z0-9]{17}\b", "[VIN protegido]", text, flags=re.IGNORECASE)
-    if "eyJ" in text and len(text) > 120:
-        start = text.find("eyJ")
-        end = text.find(" ", start)
-        if end < 0:
-            end = len(text)
-        text = text[:start] + "[token protegido]" + text[end:]
-    return text[-4000:]
+    return sanitize_log(line, 4000)
+
+
+MAX_MANAGED_LOG_BYTES = 10 * 1024 * 1024
+MANAGED_LOG_BACKUPS = 3
+
+
+def rotate_managed_log(path: Path) -> None:
+    """Rotaciona logs locais sem depender do Supervisor ou de logrotate."""
+    try:
+        if not path.is_file() or path.stat().st_size < MAX_MANAGED_LOG_BYTES:
+            return
+        oldest = path.with_name(path.name + f".{MANAGED_LOG_BACKUPS}")
+        oldest.unlink(missing_ok=True)
+        for index in range(MANAGED_LOG_BACKUPS - 1, 0, -1):
+            source = path.with_name(path.name + f".{index}")
+            if source.exists():
+                source.replace(path.with_name(path.name + f".{index + 1}"))
+        path.replace(path.with_name(path.name + ".1"))
+    except OSError as exc:
+        LOG.warning("Não foi possível rotacionar o log %s: %s", path.name, exc)
 
 
 def scrub_existing_logs() -> None:
-    """Remove segredos que versões antigas possam ter gravado em /data/logs."""
-    for path in LOG_DIR.glob("*.log"):
+    """Higieniza e limita logs antigos antes de iniciar os serviços."""
+    for active in LOG_DIR.glob("*.log"):
+        rotate_managed_log(active)
+    for path in LOG_DIR.glob("*.log*"):
         try:
-            if not path.is_file() or path.stat().st_size > 50 * 1024 * 1024:
+            if not path.is_file() or path.name.endswith(".scrub"):
                 continue
             temp = path.with_suffix(path.suffix + ".scrub")
             with path.open("r", encoding="utf-8", errors="replace") as source, temp.open("w", encoding="utf-8") as target:
@@ -108,6 +196,8 @@ class ManagedService:
     log_file: Any = None
     health_cache: dict[str, Any] = field(default_factory=lambda: {"ok": False, "message": "não verificado"})
     health_checked_at: float = 0.0
+    process_started_monotonic: float = 0.0
+    captured_lines_total: int = 0
 
     def state(self) -> str:
         if not self.enabled:
@@ -124,7 +214,10 @@ class ManagedService:
         if self.process is not None and self.process.poll() is None:
             return
         self.next_start = 0.0
-        self.log_file = (LOG_DIR / f"{self.name}.log").open("a", encoding="utf-8")
+        log_path = LOG_DIR / f"{self.name}.log"
+        rotate_managed_log(log_path)
+        self.log_file = log_path.open("a", encoding="utf-8")
+        self.captured_lines_total = 0
         env = os.environ.copy()
         env.update(self.env)
         LOG.info("Iniciando %s.", self.label)
@@ -138,6 +231,7 @@ class ManagedService:
             bufsize=1,
         )
         self.started_at = utc_now()
+        self.process_started_monotonic = time.monotonic()
         threading.Thread(target=self._capture, daemon=True).start()
 
     def _capture(self) -> None:
@@ -151,7 +245,15 @@ class ManagedService:
             self.lines.append(line)
             try:
                 self.log_file.write(line + "\n")
-                self.log_file.flush()
+                self.captured_lines_total += 1
+                if self.captured_lines_total % 10 == 0:
+                    self.log_file.flush()
+                if self.captured_lines_total % 200 == 0 and self.log_file.tell() >= MAX_MANAGED_LOG_BYTES:
+                    self.log_file.flush()
+                    self.log_file.close()
+                    log_path = LOG_DIR / f"{self.name}.log"
+                    rotate_managed_log(log_path)
+                    self.log_file = log_path.open("a", encoding="utf-8")
             except Exception:
                 pass
             print(f"[{self.name}] {line}", flush=True)
@@ -180,6 +282,8 @@ class ManagedService:
             return
         code = self.process.poll()
         if code is None:
+            if self.restarts > 0 and self.process_started_monotonic > 0 and time.monotonic() - self.process_started_monotonic >= 300:
+                self.restarts = 0
             return
         self.last_exit_code = int(code)
         self.process = None
@@ -227,19 +331,26 @@ def write_connector_options() -> Path:
         "production_secret": str(OPTIONS.get("production_secret") or "").strip(),
         "max_parallel_requests": int(OPTIONS.get("connector_max_parallel") or 2),
         "manual_wait_seconds": int(OPTIONS.get("connector_manual_wait_seconds") or 35),
+        "connector_manual_settle_seconds": int(OPTIONS.get("connector_manual_settle_seconds") or 20),
         "telemetry_beta_enabled": bool(OPTIONS.get("telemetry_beta_enabled", True)),
         "telemetry_beta_internal_url": str(OPTIONS.get("telemetry_beta_internal_url") or ""),
         "telemetry_production_enabled": bool(OPTIONS.get("telemetry_production_enabled", False)),
         "telemetry_production_internal_url": str(OPTIONS.get("telemetry_production_internal_url") or ""),
+        "telemetry_background_enabled": bool(OPTIONS.get("telemetry_background_enabled", True)),
+        "telemetry_background_seconds": max(120, min(1800, int(OPTIONS.get("telemetry_background_seconds") or 300))),
         "telemetry_active_seconds": int(OPTIONS.get("telemetry_active_seconds") or 30),
         "telemetry_interactive_seconds": int(OPTIONS.get("telemetry_interactive_seconds") or 20),
         "telemetry_command_seconds": max(10, min(60, int(OPTIONS.get("telemetry_command_seconds") or 12))),
-        "telemetry_command_max_polls": max(2, min(4, int(OPTIONS.get("telemetry_command_max_polls") or 3))),
+        "telemetry_command_max_polls": max(5, min(8, int(OPTIONS.get("telemetry_command_max_polls") or 5))),
         "telemetry_charging_seconds": int(OPTIONS.get("telemetry_charging_seconds") or 30),
         "telemetry_parked_seconds": int(OPTIONS.get("telemetry_parked_seconds") or 300),
         "telemetry_sleep_seconds": int(OPTIONS.get("telemetry_sleep_seconds") or 900),
         "telemetry_presence_window_seconds": int(OPTIONS.get("telemetry_presence_window_seconds") or 420),
         "telemetry_rate_limit_cooldown_seconds": int(OPTIONS.get("telemetry_rate_limit_cooldown_seconds") or 900),
+        "telemetry_request_timeout_seconds": int(OPTIONS.get("telemetry_request_timeout_seconds") or 15),
+        "telemetry_session_idle_seconds": int(OPTIONS.get("telemetry_session_idle_seconds") or 21600),
+        "telemetry_vehicle_list_cache_seconds": int(OPTIONS.get("telemetry_vehicle_list_cache_seconds") or 1800),
+        "telemetry_message_cache_seconds": int(OPTIONS.get("telemetry_message_cache_seconds") or 1800),
         "telemetry_batch_size": int(OPTIONS.get("telemetry_batch_size") or 25),
         "telemetry_retention_days": int(OPTIONS.get("telemetry_retention_days") or 7),
         "telemetry_queue_max_events": int(OPTIONS.get("telemetry_queue_max_events") or 10000),
@@ -253,9 +364,63 @@ def write_connector_options() -> Path:
     return path
 
 
-def ocpp_env(port: int, beta_url: str, production_url: str, beta_secret: str, production_secret: str, maximum: int) -> dict[str, str]:
-    runtime = RUNTIME / "ocpp-wallbox"; runtime.mkdir(parents=True, exist_ok=True)
-    return {"LEAPHUB_BETA_INTERNAL_URL":beta_url,"LEAPHUB_PRODUCTION_INTERNAL_URL":production_url,"LEAPHUB_BETA_GATEWAY_SECRET":beta_secret,"LEAPHUB_PRODUCTION_GATEWAY_SECRET":production_secret,"LEAPHUB_ENVIRONMENT":"unified","LEAPHUB_OCPP_PORT":str(port),"LEAPHUB_RUNTIME_DIR":str(runtime),"LEAPHUB_STATUS_FILE":str(runtime/"status.json"),"LEAPHUB_PID_FILE":str(runtime/"gateway.pid"),"LEAPHUB_LOG_FILE":str(runtime/"gateway.log"),"LEAPHUB_OCPP_STATE_DB":str(runtime/"ocpp-state.sqlite"),"LEAPHUB_SERVICE_NAME":"leaphub-ocpp-wallbox","LEAPHUB_GATEWAY_MODE":"home_assistant_tunnel","LEAPHUB_GATEWAY_PROVIDER":"home_assistant_tunnel","LEAPHUB_OCPP_MAX_CONNECTIONS":str(maximum),"LEAPHUB_OCPP_COMMAND_POLL":"2","LEAPHUB_OCPP_COMMAND_IDLE_POLL":"10","LEAPHUB_OCPP_LOG_LEVEL":LOG_LEVEL}
+def ocpp_env(port: int, environment: str, internal_url: str, secret: str, maximum: int) -> dict[str, str]:
+    runtime = RUNTIME / "ocpp-wallbox"
+    runtime.mkdir(parents=True, exist_ok=True)
+    return {
+        "LEAPHUB_INTERNAL_URL": internal_url,
+        "LEAPHUB_GATEWAY_SECRET": secret,
+        "LEAPHUB_ENVIRONMENT": environment,
+        "LEAPHUB_OCPP_PORT": str(port),
+        "LEAPHUB_RUNTIME_DIR": str(runtime),
+        "LEAPHUB_STATUS_FILE": str(runtime / "status.json"),
+        "LEAPHUB_PID_FILE": str(runtime / "gateway.pid"),
+        "LEAPHUB_LOG_FILE": str(runtime / "gateway.log"),
+        "LEAPHUB_OCPP_STATE_DB": str(runtime / "ocpp-state.sqlite"),
+        "LEAPHUB_SERVICE_NAME": "leaphub-ocpp-wallbox",
+        "LEAPHUB_GATEWAY_MODE": "home_assistant_tunnel",
+        "LEAPHUB_GATEWAY_PROVIDER": "home_assistant_tunnel",
+        "LEAPHUB_OCPP_MAX_CONNECTIONS": str(maximum),
+        "LEAPHUB_OCPP_COMMAND_POLL": "2",
+        "LEAPHUB_OCPP_COMMAND_IDLE_POLL": "10",
+        "LEAPHUB_OCPP_STATUS_INTERVAL": "30",
+        "LEAPHUB_OCPP_PING_INTERVAL": str(int(OPTIONS.get("ocpp_ping_interval_seconds") or 30)),
+        "LEAPHUB_OCPP_LIVENESS_TIMEOUT": str(int(OPTIONS.get("ocpp_liveness_timeout_seconds") or 120)),
+        "LEAPHUB_OCPP_DISCONNECT_GRACE": str(int(OPTIONS.get("ocpp_disconnect_grace_seconds") or 8)),
+        "LEAPHUB_OCPP_QUEUE_MAX": str(int(OPTIONS.get("ocpp_queue_max_events") or 10000)),
+        "LEAPHUB_OCPP_QUEUE_RETENTION_SECONDS": str(int(OPTIONS.get("ocpp_queue_retention_days") or 7) * 86400),
+        "LEAPHUB_OCPP_LOG_LEVEL": LOG_LEVEL,
+    }
+
+
+def selected_ocpp_configuration() -> dict[str, Any]:
+    beta_enabled = bool(OPTIONS.get("ocpp_beta_enabled", True))
+    production_enabled = bool(OPTIONS.get("ocpp_production_enabled", False))
+    if beta_enabled and production_enabled:
+        LOG.error("O OCPP é único: mantenha somente Beta ou Produção ativo, nunca os dois.")
+        return {"enabled": True, "configured": False, "environment": "", "url": "", "secret": "", "maximum": 20}
+    if not beta_enabled and not production_enabled:
+        return {"enabled": False, "configured": False, "environment": "", "url": "", "secret": "", "maximum": 20}
+    if beta_enabled:
+        environment = "staging"
+        url = str(OPTIONS.get("ocpp_beta_internal_url") or "").strip()
+        secret = str(OPTIONS.get("ocpp_beta_secret") or "").strip()
+        maximum = int(OPTIONS.get("ocpp_beta_max_connections") or 20)
+    else:
+        environment = "production"
+        url = str(OPTIONS.get("ocpp_production_internal_url") or "").strip()
+        secret = str(OPTIONS.get("ocpp_production_secret") or "").strip()
+        maximum = int(OPTIONS.get("ocpp_production_max_connections") or 20)
+    configured = url.lower().startswith("https://") and secret_ok(secret)
+    return {
+        "enabled": True,
+        "configured": configured,
+        "environment": environment,
+        "url": url,
+        "secret": secret,
+        "maximum": max(1, min(1000, maximum)),
+    }
+
 
 
 APP_DIR = Path(__file__).resolve().parent
@@ -275,17 +440,9 @@ def connector_module_available() -> bool:
 
 CONNECTOR_MODULE_AVAILABLE = connector_module_available()
 connector_options = write_connector_options()
-beta_secret = str(OPTIONS.get("ocpp_beta_secret") or "").strip()
-prod_secret = str(OPTIONS.get("ocpp_production_secret") or "").strip()
-# Desde o endpoint unificado, Beta e Produção usam a mesma chave HMAC. Mantém
-# compatibilidade com instalações em que a chave foi preenchida em um só campo.
-if secret_ok(beta_secret) and not secret_ok(prod_secret):
-    prod_secret = beta_secret
-elif secret_ok(prod_secret) and not secret_ok(beta_secret):
-    beta_secret = prod_secret
-elif secret_ok(beta_secret) and secret_ok(prod_secret) and not hmac.compare_digest(beta_secret, prod_secret):
-    LOG.warning("As chaves OCPP Beta e Produção são diferentes; use a chave compartilhada exibida no Leap Hub em ambos os campos.")
+OCPP_SELECTION = selected_ocpp_configuration()
 tunnel_token = str(OPTIONS.get("tunnel_token") or "").strip()
+cloudflared_path = resolve_cloudflared()
 tunnel_protocol = str(OPTIONS.get("tunnel_protocol") or "http2").strip().lower()
 if tunnel_protocol not in {"auto", "http2", "quic"}:
     tunnel_protocol = "http2"
@@ -298,14 +455,14 @@ SERVICES: dict[str, ManagedService] = {
         "http://127.0.0.1:8094/health",
     ),
     "ocpp_wallbox": ManagedService(
-        "ocpp_wallbox", "OCPP Wallbox", bool(OPTIONS.get("ocpp_beta_enabled", True) or OPTIONS.get("ocpp_production_enabled", False)), secret_ok(beta_secret) or secret_ok(prod_secret),
+        "ocpp_wallbox", "OCPP Wallbox", bool(OCPP_SELECTION["enabled"]), bool(OCPP_SELECTION["configured"]),
         [sys.executable, "-u", str(APP_DIR / "ocpp_gateway.py")],
-        ocpp_env(8092, str(OPTIONS.get("ocpp_beta_internal_url") or "").strip(), str(OPTIONS.get("ocpp_production_internal_url") or "").strip(), beta_secret, prod_secret, max(int(OPTIONS.get("ocpp_beta_max_connections") or 100), int(OPTIONS.get("ocpp_production_max_connections") or 100))),
+        ocpp_env(8092, str(OCPP_SELECTION["environment"]), str(OCPP_SELECTION["url"]), str(OCPP_SELECTION["secret"]), int(OCPP_SELECTION["maximum"])),
         "http://127.0.0.1:8092/health",
     ),
     "tunnel": ManagedService(
-        "tunnel", "Cloudflare Tunnel", bool(OPTIONS.get("tunnel_enabled", False)), secret_ok(tunnel_token, 40),
-        [os.getenv("LEAPHUB_CLOUDFLARED", "/usr/local/bin/cloudflared"), "tunnel", "--no-autoupdate", "--loglevel", str(OPTIONS.get("tunnel_log_level") or "info"), "--protocol", tunnel_protocol, "run"],
+        "tunnel", "Cloudflare Tunnel", bool(OPTIONS.get("tunnel_enabled", False)), secret_ok(tunnel_token, 40) and bool(cloudflared_path),
+        [cloudflared_path or "/bin/false", "tunnel", "--no-autoupdate", "--loglevel", str(OPTIONS.get("tunnel_log_level") or "info"), "--protocol", tunnel_protocol, "run"],
         {"TUNNEL_TOKEN": tunnel_token},
         None,
     ),
@@ -375,6 +532,8 @@ def status_payload(include_logs: bool = True) -> dict[str, Any]:
     result: dict[str, Any] = {
         "ok": True,
         "version": VERSION,
+        "connector_api_version": 2,
+        "capability_schema_version": 1,
         "updated_at": utc_now(),
         "hostname_for_tunnel": "local-leaphub-gateway",
         "services": {},
@@ -416,9 +575,9 @@ main{max-width:1180px;margin:auto;padding:24px}.hero{display:flex;gap:18px;align
 details{margin-top:12px}summary{cursor:pointer;color:var(--muted)}pre{white-space:pre-wrap;word-break:break-word;background:#050c15;border:1px solid var(--line);border-radius:12px;padding:12px;max-height:260px;overflow:auto;color:#bcd0e8;font-size:12px}.wide{grid-column:1/-1}.routes{display:grid;grid-template-columns:1fr auto;gap:8px}.routes code{background:#050c15;border:1px solid var(--line);border-radius:10px;padding:9px;overflow:auto}.notice{border-left:3px solid var(--blue);padding:10px 12px;background:rgba(85,167,255,.08);border-radius:10px;color:#cfe4ff}.foot{color:var(--muted);text-align:center;padding:20px}
 @media(max-width:760px){main{padding:14px}.grid{grid-template-columns:1fr}.hero{align-items:flex-start}.badge{display:none}.meta{grid-template-columns:1fr 1fr}.routes{grid-template-columns:1fr}}
 </style></head><body><main>
-<div class="hero"><div class="mark">LH</div><div><h1>Leap Hub Gateway</h1><p class="sub">Telemetria resiliente, Connector, OCPP e Cloudflare em um único App</p></div><span class="badge">v1.12.08</span></div>
+<div class="hero"><div class="mark">LH</div><div><h1>Leap Hub Gateway</h1><p class="sub">Telemetria resiliente, Connector, OCPP e Cloudflare em um único App</p></div><span class="badge">v1.12.24</span></div>
 <div class="grid" id="cards"></div>
-<section class="card wide" style="margin-top:16px"><div class="head"><div><h2>Rotas do Cloudflare Tunnel</h2><p>Como o Tunnel roda dentro do mesmo App, use 127.0.0.1 nas origens.</p></div></div><div class="routes"><code>connector.leaphub.com.br → http://127.0.0.1:8094</code><span>Connector</span><code>ocpp-wallbox.leaphub.com.br → http://127.0.0.1:8092</code><span>OCPP Wallbox · Beta e Produção</span></div><p class="notice">A fila de telemetria sobrevive a reinícios do App. Uma queda do Home Assistant inteiro ainda cria uma lacuna real, que nunca será preenchida com dados inventados.</p></section>
+<section class="card wide" style="margin-top:16px"><div class="head"><div><h2>Rotas do Cloudflare Tunnel</h2><p>Como o Tunnel roda dentro do mesmo App, use 127.0.0.1 nas origens.</p></div></div><div class="routes"><code>connector.leaphub.com.br → http://127.0.0.1:8094</code><span>Connector</span><code>ocpp-wallbox.leaphub.com.br → http://127.0.0.1:8092</code><span>OCPP Wallbox · ambiente ativo</span></div><p class="notice">A fila de telemetria sobrevive a reinícios do App. Uma queda do Home Assistant inteiro ainda cria uma lacuna real, que nunca será preenchida com dados inventados.</p></section>
 <div class="foot">Tokens e chaves nunca são exibidos neste painel.</div></main><script>
 const token='__TOKEN__';const labels={connector:'Connector Leapmotor',ocpp_wallbox:'OCPP Wallbox',tunnel:'Cloudflare Tunnel'};
 function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}

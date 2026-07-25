@@ -12,16 +12,23 @@ import asyncio
 import base64
 import hashlib
 import hmac
+import http.client
 import ipaddress
 import json
 import logging
+try:
+    from leaphub_privacy import install_logging_privacy_filter
+except ModuleNotFoundError:
+    from privacy import install_logging_privacy_filter
 import os
 import re
 import secrets
 import signal
+import ssl
 import sqlite3
 import struct
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -31,7 +38,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-GATEWAY_VERSION = "1.12.08"
+GATEWAY_VERSION = "1.12.24"
 IS_RAILWAY = bool(os.getenv("RAILWAY_ENVIRONMENT_NAME") or os.getenv("RAILWAY_SERVICE_ID"))
 RUNTIME_DIR = Path(os.getenv("LEAPHUB_RUNTIME_DIR", "/tmp/leaphub-ocpp" if IS_RAILWAY else "."))
 BIND = os.getenv("LEAPHUB_OCPP_BIND", "0.0.0.0")
@@ -53,16 +60,25 @@ GATEWAY_PROVIDER = os.getenv("LEAPHUB_GATEWAY_PROVIDER", "home_assistant_tunnel"
 MAX_FRAME_BYTES = int(os.getenv("LEAPHUB_OCPP_MAX_FRAME_BYTES", str(1024 * 1024)))
 COMMAND_POLL_SECONDS = float(os.getenv("LEAPHUB_OCPP_COMMAND_POLL", "2.0"))
 COMMAND_IDLE_POLL_SECONDS = float(os.getenv("LEAPHUB_OCPP_COMMAND_IDLE_POLL", "10.0"))
+STATUS_REPORT_SECONDS = max(15.0, float(os.getenv("LEAPHUB_OCPP_STATUS_INTERVAL", "30")))
 MAX_CONNECTIONS = max(1, int(os.getenv("LEAPHUB_OCPP_MAX_CONNECTIONS", "1000")))
 MAX_CONNECTIONS_PER_IP = max(1, int(os.getenv("LEAPHUB_OCPP_MAX_CONNECTIONS_PER_IP", "50")))
 AUTH_FAILURE_WINDOW_SECONDS = max(60, int(os.getenv("LEAPHUB_OCPP_AUTH_WINDOW", "300")))
 AUTH_FAILURE_LIMIT = max(3, int(os.getenv("LEAPHUB_OCPP_AUTH_FAILURE_LIMIT", "20")))
 AUTH_BLOCK_SECONDS = max(60, int(os.getenv("LEAPHUB_OCPP_AUTH_BLOCK_SECONDS", "600")))
+PING_INTERVAL_SECONDS = max(15.0, float(os.getenv("LEAPHUB_OCPP_PING_INTERVAL", "30")))
+LIVENESS_TIMEOUT_SECONDS = max(60.0, float(os.getenv("LEAPHUB_OCPP_LIVENESS_TIMEOUT", "120")))
+DISCONNECT_GRACE_SECONDS = max(0.0, min(30.0, float(os.getenv("LEAPHUB_OCPP_DISCONNECT_GRACE", "8"))))
+EVENT_QUEUE_MAX = max(100, int(os.getenv("LEAPHUB_OCPP_QUEUE_MAX", "10000")))
+EVENT_QUEUE_RETENTION_SECONDS = max(86400, int(os.getenv("LEAPHUB_OCPP_QUEUE_RETENTION_SECONDS", str(7 * 86400))))
 STARTED_AT = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 DIAGNOSTIC_WINDOW_SECONDS = 180
 DIAGNOSTIC_NONCES: dict[str, float] = {}
 STATUS_API_LAST_ERROR = ""
 STATUS_API_LAST_LOG_AT = 0.0
+API_CONNECTIONS: dict[tuple[str, int], dict[str, Any]] = {}
+API_CONNECTIONS_GUARD = threading.RLock()
+API_SSL_CONTEXT = ssl.create_default_context()
 
 
 for path in (STATUS_FILE, PID_FILE, LOG_FILE):
@@ -73,6 +89,7 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(message)s",
     handlers=[logging.FileHandler(LOG_FILE, encoding="utf-8"), logging.StreamHandler(sys.stdout)],
 )
+install_logging_privacy_filter()
 LOG = logging.getLogger("leaphub.ocpp")
 
 
@@ -98,29 +115,38 @@ class ApiTarget:
 
 
 def configured_targets() -> list[ApiTarget]:
-    targets: list[ApiTarget] = []
-    # Em modo local legado cada processo atende somente seu ambiente. No Home
-    # Assistant o endpoint é unificado e resolve Beta/Produção pelo Charge ID.
-    if LEGACY_INTERNAL_URL and ENVIRONMENT_LABEL in {"staging", "production"}:
-        secret_name = "beta" if ENVIRONMENT_LABEL == "staging" else "production"
+    """Carrega exatamente um destino OCPP por processo.
+
+    A porta pública continua única. O ambiente proprietário é escolhido pelo
+    manager e nunca é descoberto consultando Beta e Produção em paralelo.
+    """
+    environment = ENVIRONMENT_LABEL if ENVIRONMENT_LABEL in {"staging", "production"} else ""
+    if environment:
+        name = "beta" if environment == "staging" else "production"
+        selected_url = LEGACY_INTERNAL_URL or (BETA_INTERNAL_URL if environment == "staging" else PRODUCTION_INTERNAL_URL)
+        secret = configured_secret(name)
+        return [ApiTarget(environment, selected_url, secret)] if selected_url and secret else []
+
+    candidates: list[ApiTarget] = []
+    for name, url, secret_name in (
+        ("staging", BETA_INTERNAL_URL, "beta"),
+        ("production", PRODUCTION_INTERNAL_URL, "production"),
+    ):
         secret = configured_secret(secret_name)
-        if secret:
-            return [ApiTarget(ENVIRONMENT_LABEL, LEGACY_INTERNAL_URL, secret)]
-    # Staging vem primeiro somente para um Charge ID novo. Cache e override de
-    # Produção sempre ganham depois da promoção.
-    definitions = (
-        ("staging", BETA_INTERNAL_URL, configured_secret("beta")),
-        ("production", PRODUCTION_INTERNAL_URL, configured_secret("production")),
-    )
-    for name, url, secret in definitions:
-        if url and secret and all(existing.url != url for existing in targets):
-            targets.append(ApiTarget(name, url, secret))
-    return targets
+        if url and secret and all(existing.url != url for existing in candidates):
+            candidates.append(ApiTarget(name, url, secret))
+    if len(candidates) > 1:
+        raise RuntimeError("OCPP ambíguo: defina LEAPHUB_ENVIRONMENT como staging ou production.")
+    return candidates
 
 
 API_TARGETS = configured_targets()
 TARGETS_BY_NAME = {target.name: target for target in API_TARGETS}
 STATE_DB = Path(os.getenv("LEAPHUB_OCPP_STATE_DB", str(RUNTIME_DIR / "ocpp-state.sqlite")))
+STATE_DB_INIT_LOCK = threading.Lock()
+STATE_DB_INITIALIZED = False
+QUEUE_LAST_REPLAY_AT = 0.0
+QUEUE_LAST_REPLAY_ERROR = ""
 ROUTE_CACHE_SECONDS = max(3600, int(os.getenv("LEAPHUB_OCPP_ROUTE_CACHE_SECONDS", str(14 * 86400))))
 RESILIENT_ACTIONS = {
     "BootNotification",
@@ -133,44 +159,88 @@ RESILIENT_ACTIONS = {
 
 
 def state_db() -> sqlite3.Connection:
+    global STATE_DB_INITIALIZED
     STATE_DB.parent.mkdir(parents=True, exist_ok=True)
-    db = sqlite3.connect(STATE_DB, timeout=3.0)
-    db.execute("PRAGMA journal_mode=WAL")
-    db.execute("PRAGMA busy_timeout=3000")
-    db.execute("""CREATE TABLE IF NOT EXISTS routes (
-        identity TEXT PRIMARY KEY,
-        target_name TEXT NOT NULL,
-        updated_at REAL NOT NULL
-    )""")
-    db.execute("""CREATE TABLE IF NOT EXISTS event_queue (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        target_name TEXT NOT NULL,
-        identity TEXT NOT NULL,
-        message_id TEXT NOT NULL,
-        ocpp_action TEXT NOT NULL,
-        payload_json TEXT NOT NULL,
-        attempts INTEGER NOT NULL DEFAULT 0,
-        available_at REAL NOT NULL,
-        created_at REAL NOT NULL,
-        last_error TEXT NULL,
-        UNIQUE(target_name, identity, message_id, ocpp_action)
-    )""")
-    db.execute("""CREATE TABLE IF NOT EXISTS command_result_queue (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        target_name TEXT NOT NULL,
-        identity TEXT NOT NULL,
-        command_id INTEGER NOT NULL,
-        status TEXT NOT NULL,
-        payload_json TEXT NOT NULL,
-        error_text TEXT NOT NULL,
-        attempts INTEGER NOT NULL DEFAULT 0,
-        available_at REAL NOT NULL,
-        created_at REAL NOT NULL,
-        last_error TEXT NULL,
-        UNIQUE(target_name, identity, command_id)
-    )""")
-    db.commit()
+    db = sqlite3.connect(STATE_DB, timeout=5.0)
+    db.execute("PRAGMA busy_timeout=5000")
+    db.execute("PRAGMA foreign_keys=ON")
+    if not STATE_DB_INITIALIZED:
+        with STATE_DB_INIT_LOCK:
+            if not STATE_DB_INITIALIZED:
+                db.execute("PRAGMA journal_mode=WAL")
+                db.execute("PRAGMA synchronous=NORMAL")
+                db.execute("""CREATE TABLE IF NOT EXISTS routes (
+                    identity TEXT PRIMARY KEY,
+                    target_name TEXT NOT NULL,
+                    updated_at REAL NOT NULL
+                )""")
+                db.execute("""CREATE TABLE IF NOT EXISTS event_queue (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    target_name TEXT NOT NULL,
+                    identity TEXT NOT NULL,
+                    message_id TEXT NOT NULL,
+                    ocpp_action TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    available_at REAL NOT NULL,
+                    created_at REAL NOT NULL,
+                    last_error TEXT NULL,
+                    UNIQUE(target_name, identity, message_id, ocpp_action)
+                )""")
+                db.execute("""CREATE TABLE IF NOT EXISTS command_result_queue (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    target_name TEXT NOT NULL,
+                    identity TEXT NOT NULL,
+                    command_id INTEGER NOT NULL,
+                    status TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    error_text TEXT NOT NULL,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    available_at REAL NOT NULL,
+                    created_at REAL NOT NULL,
+                    last_error TEXT NULL,
+                    UNIQUE(target_name, identity, command_id)
+                )""")
+                db.execute("CREATE INDEX IF NOT EXISTS idx_ocpp_event_due ON event_queue(available_at,id)")
+                db.execute("CREATE INDEX IF NOT EXISTS idx_ocpp_event_identity ON event_queue(target_name,identity,id)")
+                db.execute("CREATE INDEX IF NOT EXISTS idx_ocpp_result_due ON command_result_queue(available_at,id)")
+                db.commit()
+                STATE_DB_INITIALIZED = True
     return db
+
+
+def prune_queues(db: sqlite3.Connection) -> None:
+    cutoff = time.time() - EVENT_QUEUE_RETENTION_SECONDS
+    db.execute("DELETE FROM event_queue WHERE created_at < ?", (cutoff,))
+    db.execute("DELETE FROM command_result_queue WHERE created_at < ?", (cutoff,))
+    total = int(db.execute("SELECT COUNT(*) FROM event_queue").fetchone()[0])
+    if total > EVENT_QUEUE_MAX:
+        excess = total - EVENT_QUEUE_MAX
+        # Heartbeat/MeterValues são reconstruídos naturalmente; descarte-os antes
+        # de eventos de transação, boot ou estado quando a fila atingir o limite.
+        db.execute(
+            "DELETE FROM event_queue WHERE id IN (SELECT id FROM event_queue "
+            "ORDER BY CASE WHEN ocpp_action IN ('Heartbeat','MeterValues') THEN 0 ELSE 1 END, id ASC LIMIT ?)",
+            (excess,),
+        )
+    result_total = int(db.execute("SELECT COUNT(*) FROM command_result_queue").fetchone()[0])
+    if result_total > EVENT_QUEUE_MAX:
+        db.execute(
+            "DELETE FROM command_result_queue WHERE id IN "
+            "(SELECT id FROM command_result_queue ORDER BY id ASC LIMIT ?)",
+            (result_total - EVENT_QUEUE_MAX,),
+        )
+
+
+def has_pending_event(target: ApiTarget, identity: str) -> bool:
+    try:
+        with state_db() as db:
+            return db.execute(
+                "SELECT 1 FROM event_queue WHERE target_name=? AND identity=? LIMIT 1",
+                (target.name, identity),
+            ).fetchone() is not None
+    except sqlite3.Error:
+        return False
 
 
 def cached_target(identity: str) -> ApiTarget | None:
@@ -201,14 +271,14 @@ def remember_route(identity: str, target_name: str) -> None:
             db.execute(
                 "INSERT OR IGNORE INTO event_queue(target_name,identity,message_id,ocpp_action,payload_json,attempts,available_at,created_at,last_error) "
                 "SELECT ?,identity,message_id,ocpp_action,payload_json,attempts,available_at,created_at,last_error "
-                "FROM event_queue WHERE identity=? AND target_name<>?",
+                "FROM event_queue WHERE identity=? AND target_name<>? ORDER BY id ASC",
                 (target_name, identity, target_name),
             )
             db.execute("DELETE FROM event_queue WHERE identity=? AND target_name<>?", (identity, target_name))
             db.execute(
                 "INSERT OR IGNORE INTO command_result_queue(target_name,identity,command_id,status,payload_json,error_text,attempts,available_at,created_at,last_error) "
                 "SELECT ?,identity,command_id,status,payload_json,error_text,attempts,available_at,created_at,last_error "
-                "FROM command_result_queue WHERE identity=? AND target_name<>?",
+                "FROM command_result_queue WHERE identity=? AND target_name<>? ORDER BY id ASC",
                 (target_name, identity, target_name),
             )
             db.execute("DELETE FROM command_result_queue WHERE identity=? AND target_name<>?", (identity, target_name))
@@ -220,11 +290,17 @@ def remember_route(identity: str, target_name: str) -> None:
 def queue_event(target: ApiTarget, identity: str, message_id: str, action: str, payload: dict[str, Any], error: str) -> None:
     try:
         with state_db() as db:
+            if action == "Heartbeat":
+                db.execute(
+                    "DELETE FROM event_queue WHERE target_name=? AND identity=? AND ocpp_action='Heartbeat'",
+                    (target.name, identity),
+                )
             db.execute(
                 "INSERT OR IGNORE INTO event_queue(target_name,identity,message_id,ocpp_action,payload_json,attempts,available_at,created_at,last_error) "
                 "VALUES(?,?,?,?,?,0,?,?,?)",
                 (target.name, identity, message_id, action, json.dumps(payload, ensure_ascii=False, separators=(",", ":")), time.time(), time.time(), error[:300]),
             )
+            prune_queues(db)
             db.commit()
     except sqlite3.Error as exc:
         LOG.error("Could not queue OCPP event %s for %s: %s", action, identity, exc)
@@ -239,6 +315,7 @@ def queue_command_result(target: ApiTarget, identity: str, command_id: int, stat
                 "status=excluded.status,payload_json=excluded.payload_json,error_text=excluded.error_text,available_at=excluded.available_at,last_error=excluded.last_error",
                 (target.name, identity, command_id, status, json.dumps(payload, ensure_ascii=False, separators=(",", ":")), error[:500], time.time(), time.time(), last_error[:300]),
             )
+            prune_queues(db)
             db.commit()
     except sqlite3.Error as exc:
         LOG.error("Could not queue OCPP command result %s for %s: %s", command_id, identity, exc)
@@ -253,6 +330,24 @@ def queue_counts() -> tuple[int, int, int]:
         return pending, command_results, routes
     except sqlite3.Error:
         return 0, 0, 0
+
+
+def queue_diagnostics() -> dict[str, Any]:
+    try:
+        with state_db() as db:
+            now = time.time()
+            event = db.execute("SELECT COUNT(*),MIN(created_at),MAX(attempts) FROM event_queue").fetchone()
+            result = db.execute("SELECT COUNT(*),MIN(created_at),MAX(attempts) FROM command_result_queue").fetchone()
+        return {
+            "oldest_event_age_seconds": max(0, int(now - float(event[1]))) if event and event[1] is not None else 0,
+            "oldest_result_age_seconds": max(0, int(now - float(result[1]))) if result and result[1] is not None else 0,
+            "max_event_attempts": int(event[2] or 0) if event else 0,
+            "max_result_attempts": int(result[2] or 0) if result else 0,
+            "last_replay_at": QUEUE_LAST_REPLAY_AT,
+            "last_replay_error": QUEUE_LAST_REPLAY_ERROR[:200],
+        }
+    except sqlite3.Error:
+        return {}
 
 
 def local_response(action: str, authorization: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -276,34 +371,129 @@ def safe_http_error_detail(code: int, raw: bytes) -> str:
     return f"HTTP {code}: {re.sub(r'\s+', ' ', text)[:180]}"
 
 
+def _api_connection_state(target: ApiTarget) -> dict[str, Any]:
+    # Uma conexão persistente por worker evita handshakes repetidos sem
+    # serializar todas as wallboxes em um único socket.
+    key = (target.url, threading.get_ident())
+    with API_CONNECTIONS_GUARD:
+        state = API_CONNECTIONS.get(key)
+        if state is None:
+            state = {"connection": None, "lock": threading.RLock()}
+            API_CONNECTIONS[key] = state
+        return state
+
+
+def _drop_api_connection(target: ApiTarget) -> None:
+    state = _api_connection_state(target)
+    with state["lock"]:
+        connection = state.get("connection")
+        state["connection"] = None
+        if connection is not None:
+            try:
+                connection.close()
+            except OSError:
+                pass
+
+
+def _new_api_connection(target: ApiTarget, timeout: float) -> tuple[http.client.HTTPConnection, str]:
+    parsed = urllib.parse.urlsplit(target.url)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise RuntimeError(f"Internal API {target.name} has an invalid URL")
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    path = urllib.parse.urlunsplit(("", "", parsed.path or "/", parsed.query, ""))
+    if parsed.scheme == "https":
+        connection: http.client.HTTPConnection = http.client.HTTPSConnection(
+            parsed.hostname, port, timeout=timeout, context=API_SSL_CONTEXT
+        )
+    else:
+        connection = http.client.HTTPConnection(parsed.hostname, port, timeout=timeout)
+    return connection, path
+
+
 def api_call(target: ApiTarget, payload: dict[str, Any], timeout: float = 8.0) -> dict[str, Any]:
-    body=json.dumps(payload,ensure_ascii=False,separators=(",",":")).encode("utf-8"); timestamp=str(int(time.time())); nonce=secrets.token_hex(16)
-    path=urllib.parse.urlsplit(target.url).path or "/api/internal/ocpp"; canonical=f"POST\n{path}\n{timestamp}\n{nonce}\n{hashlib.sha256(body).hexdigest()}".encode("utf-8")
-    signature=hmac.new(target.secret.encode("utf-8"),canonical,hashlib.sha256).hexdigest()
-    request=urllib.request.Request(target.url,data=body,method="POST",headers={"Content-Type":"application/json","Accept":"application/json","X-LeapHub-Timestamp":timestamp,"X-LeapHub-Nonce":nonce,"X-LeapHub-Signature":signature,"User-Agent":f"LeapHub-OCPP-Gateway/{GATEWAY_VERSION}"})
-    try:
-        with urllib.request.urlopen(request,timeout=timeout) as response: raw=response.read(1024*1024)
-    except urllib.error.HTTPError as exc: raise RuntimeError(f"Internal API {target.name} rejected request: {safe_http_error_detail(exc.code,exc.read(4096))}") from exc
-    except (TimeoutError,OSError) as exc:
-        detail="read operation timed out" if "timed out" in str(exc).lower() else str(exc)
-        raise RuntimeError(f"Internal API {target.name} unavailable: {detail}") from exc
-    try: decoded=json.loads(raw.decode("utf-8"))
-    except (UnicodeDecodeError,json.JSONDecodeError) as exc: raise RuntimeError(f"Internal API {target.name} returned a non-JSON response") from exc
-    if not isinstance(decoded,dict) or not decoded.get("ok"):
-        message=str(decoded.get("message","Internal API returned an invalid response.")) if isinstance(decoded,dict) else "Invalid response"
-        raise RuntimeError(f"Internal API {target.name}: {message[:200]}")
-    return decoded
+    body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    parsed_path = urllib.parse.urlsplit(target.url).path or "/api/internal/ocpp"
+    state = _api_connection_state(target)
+    last_error: Exception | None = None
+    with state["lock"]:
+        for attempt in range(2):
+            timestamp = str(int(time.time()))
+            nonce = secrets.token_hex(16)
+            canonical = f"POST\n{parsed_path}\n{timestamp}\n{nonce}\n{hashlib.sha256(body).hexdigest()}".encode("utf-8")
+            signature = hmac.new(target.secret.encode("utf-8"), canonical, hashlib.sha256).hexdigest()
+            headers = {
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "Connection": "keep-alive",
+                "X-LeapHub-Timestamp": timestamp,
+                "X-LeapHub-Nonce": nonce,
+                "X-LeapHub-Signature": signature,
+                "User-Agent": f"LeapHub-OCPP-Gateway/{GATEWAY_VERSION}",
+            }
+            connection = state.get("connection")
+            path = ""
+            try:
+                if connection is None:
+                    connection, path = _new_api_connection(target, timeout)
+                    state["connection"] = connection
+                else:
+                    path = urllib.parse.urlunsplit(("", "", urllib.parse.urlsplit(target.url).path or "/", urllib.parse.urlsplit(target.url).query, ""))
+                    connection.timeout = timeout
+                    if connection.sock is not None:
+                        connection.sock.settimeout(timeout)
+                connection.request("POST", path, body=body, headers=headers)
+                response = connection.getresponse()
+                raw = response.read(1024 * 1024 + 1)
+                if len(raw) > 1024 * 1024:
+                    raise RuntimeError(f"Internal API {target.name} returned a response above the limit")
+                if response.will_close or response.getheader("Connection", "").lower() == "close":
+                    state["connection"] = None
+                    connection.close()
+                if response.status < 200 or response.status >= 300:
+                    raise RuntimeError(
+                        f"Internal API {target.name} rejected request: {safe_http_error_detail(response.status, raw[:4096])}"
+                    )
+                try:
+                    decoded = json.loads(raw.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                    raise RuntimeError(f"Internal API {target.name} returned a non-JSON response") from exc
+                if not isinstance(decoded, dict) or not decoded.get("ok"):
+                    message = str(decoded.get("message", "Internal API returned an invalid response.")) if isinstance(decoded, dict) else "Invalid response"
+                    raise RuntimeError(f"Internal API {target.name}: {message[:200]}")
+                return decoded
+            except (TimeoutError, OSError, http.client.HTTPException) as exc:
+                last_error = exc
+                state["connection"] = None
+                try:
+                    connection.close()
+                except (AttributeError, OSError):
+                    pass
+                if attempt == 0:
+                    continue
+                detail = "read operation timed out" if "timed out" in str(exc).lower() else str(exc)
+                raise RuntimeError(f"Internal API {target.name} unavailable: {detail}") from exc
+    raise RuntimeError(f"Internal API {target.name} unavailable: {last_error or 'unknown transport error'}")
 
 
 def resolve_route(identity: str, password: str, remote_ip: str) -> tuple[ApiTarget, dict[str, Any]]:
-    unavailable: list[str] = []
-    ordered: list[ApiTarget] = []
     cached = cached_target(identity)
     if cached is not None:
-        ordered.append(cached)
-    ordered.extend(target for target in API_TARGETS if target not in ordered)
+        try:
+            result = api_call(cached, {"action": "authorize_connection", "identity": identity, "password": password, "remote_ip": remote_ip}, 4.0)
+        except RuntimeError as exc:
+            # Uma rota conhecida indisponível não é falha de senha e não deve
+            # fazer a wallbox alternar entre Beta e Produção.
+            raise RuntimeError(str(exc)) from exc
+        if result.get("accepted"):
+            remember_route(identity, cached.name)
+            return cached, result
+        candidates = [target for target in API_TARGETS if target != cached]
+    else:
+        candidates = list(API_TARGETS)
+
+    unavailable: list[str] = []
     rejected = 0
-    for target in ordered:
+    for target in candidates:
         try:
             result = api_call(target, {"action": "authorize_connection", "identity": identity, "password": password, "remote_ip": remote_ip}, 4.0)
         except RuntimeError as exc:
@@ -313,9 +503,11 @@ def resolve_route(identity: str, password: str, remote_ip: str) -> tuple[ApiTarg
             remember_route(identity, target.name)
             return target, result
         rejected += 1
-    if unavailable and rejected == 0:
+    if unavailable:
         raise RuntimeError("; ".join(unavailable[:2]))
-    raise PermissionError("Charge point is not approved")
+    if rejected > 0 or cached is not None:
+        raise PermissionError("Charge point is not approved")
+    raise RuntimeError("No OCPP API target is currently available")
 
 
 def parse_headers(raw: bytes) -> tuple[str, str, dict[str, str]]:
@@ -513,6 +705,11 @@ class ChargePointConnection:
     writer_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     pending_calls: dict[str, asyncio.Future[list[Any]]] = field(default_factory=dict)
     closed: bool = False
+    connection_id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    connected_at: float = field(default_factory=time.monotonic)
+    last_rx_at: float = field(default_factory=time.monotonic)
+    last_pong_at: float = field(default_factory=time.monotonic)
+    last_ping_at: float = 0.0
 
     async def send_json(self, value: list[Any]) -> None:
         raw = json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
@@ -520,6 +717,8 @@ class ChargePointConnection:
             await write_frame(self.writer, 0x1, raw)
 
     async def send_call(self, action: str, payload: dict[str, Any], timeout: float = 35.0) -> list[Any]:
+        if self.closed or self.writer.is_closing():
+            raise ConnectionError("O carregador desconectou antes do envio do comando.")
         message_id = uuid.uuid4().hex
         future: asyncio.Future[list[Any]] = asyncio.get_running_loop().create_future()
         self.pending_calls[message_id] = future
@@ -555,6 +754,11 @@ class ChargePointConnection:
             "ocpp_action": action,
             "payload": payload,
         }
+        if action in RESILIENT_ACTIONS and await asyncio.to_thread(has_pending_event, self.target, self.identity):
+            queue_event(self.target, self.identity, message_id, action, payload, "Aguardando eventos anteriores da mesma wallbox.")
+            await self.send_json([3, message_id, local_response(action, self.authorization)])
+            LOG.info("Queued %s from %s to preserve event order.", action, self.identity)
+            return
         try:
             result = await asyncio.to_thread(api_call, self.target, request_payload, 5.0)
         except Exception as exc:  # noqa: BLE001
@@ -574,7 +778,8 @@ class ChargePointConnection:
             await self.send_json([3, message_id, response_payload if isinstance(response_payload, dict) else {}])
 
     async def command_loop(self) -> None:
-        delay = COMMAND_POLL_SECONDS
+        identity_jitter = (int(hashlib.sha256(self.identity.encode("utf-8")).hexdigest()[:8], 16) % 1500) / 1000.0
+        delay = COMMAND_POLL_SECONDS + identity_jitter
         while not self.closed:
             await asyncio.sleep(delay)
             try:
@@ -582,10 +787,10 @@ class ChargePointConnection:
                 commands = result.get("commands")
                 if not isinstance(commands, list): delay = COMMAND_IDLE_POLL_SECONDS; continue
                 if commands:
-                    delay = COMMAND_POLL_SECONDS
+                    delay = COMMAND_POLL_SECONDS + identity_jitter
                     for command in commands:
                         if isinstance(command, dict): await self.execute_command(command)
-                else: delay = min(COMMAND_IDLE_POLL_SECONDS, max(COMMAND_POLL_SECONDS, delay * 1.6))
+                else: delay = min(COMMAND_IDLE_POLL_SECONDS + identity_jitter, max(COMMAND_POLL_SECONDS + identity_jitter, delay * 1.6))
             except asyncio.CancelledError: raise
             except Exception as exc:
                 delay = min(60.0, max(COMMAND_IDLE_POLL_SECONDS, delay * 2.0))
@@ -634,7 +839,11 @@ class ChargePointConnection:
 
     async def ping_loop(self) -> None:
         while not self.closed:
-            await asyncio.sleep(30)
+            await asyncio.sleep(PING_INTERVAL_SECONDS)
+            now = time.monotonic()
+            if now - self.last_rx_at >= LIVENESS_TIMEOUT_SECONDS:
+                raise ConnectionError("O carregador não respondeu aos testes de conexão.")
+            self.last_ping_at = now
             async with self.writer_lock:
                 await write_frame(self.writer, 0x9, os.urandom(4))
 
@@ -645,7 +854,19 @@ class ChargePointConnection:
         fragmented = bytearray()
         try:
             while True:
-                fin, opcode, payload = await read_frame(self.reader)
+                if ping_task.done():
+                    error = ping_task.exception()
+                    if error is not None:
+                        raise error
+                try:
+                    fin, opcode, payload = await asyncio.wait_for(
+                        read_frame(self.reader), timeout=PING_INTERVAL_SECONDS + 15.0
+                    )
+                except asyncio.TimeoutError:
+                    if time.monotonic() - self.last_rx_at >= LIVENESS_TIMEOUT_SECONDS:
+                        raise ConnectionError("Conexão OCPP sem tráfego por tempo excessivo.")
+                    continue
+                self.last_rx_at = time.monotonic()
                 if opcode == 0x8:
                     async with self.writer_lock:
                         await write_frame(self.writer, 0x8, payload[:125])
@@ -655,6 +876,7 @@ class ChargePointConnection:
                         await write_frame(self.writer, 0xA, payload[:125])
                     continue
                 if opcode == 0xA:
+                    self.last_pong_at = time.monotonic()
                     continue
                 if opcode in (0x1, 0x2):
                     if fin:
@@ -677,6 +899,11 @@ class ChargePointConnection:
             pass
         finally:
             self.closed = True
+            disconnect_error = ConnectionError("A conexão com o carregador foi encerrada.")
+            for future in list(self.pending_calls.values()):
+                if not future.done():
+                    future.set_exception(disconnect_error)
+            self.pending_calls.clear()
             command_task.cancel()
             ping_task.cancel()
             for task in (command_task, ping_task):
@@ -744,12 +971,19 @@ STOP_EVENT = asyncio.Event()
 
 
 def normalize_remote_ip(headers: dict[str, str], peer_ip: str) -> str:
-    candidates = [
-        headers.get("cf-connecting-ip", ""),
-        headers.get("x-real-ip", ""),
-        headers.get("x-forwarded-for", "").split(",", 1)[0].strip(),
-        peer_ip,
-    ]
+    """Aceita cabeçalhos de proxy somente de um peer local/privado confiável."""
+    try:
+        peer = ipaddress.ip_address(str(peer_ip).strip())
+    except ValueError:
+        peer = None
+    candidates: list[str] = []
+    if peer is not None and (peer.is_loopback or peer.is_private):
+        candidates.extend([
+            headers.get("cf-connecting-ip", ""),
+            headers.get("x-real-ip", ""),
+            headers.get("x-forwarded-for", "").split(",", 1)[0].strip(),
+        ])
+    candidates.append(peer_ip)
     for candidate in candidates:
         candidate = candidate.strip()
         if not candidate:
@@ -851,10 +1085,16 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
         if len(decoded_key) != 16:
             await http_error(writer, 400, "Bad Request")
             return
-        if len(CONNECTIONS) >= MAX_CONNECTIONS:
+        existing_connection = CONNECTIONS.get(identity)
+        replacing_existing = existing_connection is not None and not existing_connection.closed
+        effective_connections = len(CONNECTIONS) - (1 if replacing_existing else 0)
+        effective_ip_connections = ACTIVE_BY_IP.get(remote_ip, 0)
+        if replacing_existing and existing_connection.remote_ip == remote_ip:
+            effective_ip_connections = max(0, effective_ip_connections - 1)
+        if effective_connections >= MAX_CONNECTIONS:
             await http_error(writer, 503, "Service Unavailable")
             return
-        if ACTIVE_BY_IP.get(remote_ip, 0) >= MAX_CONNECTIONS_PER_IP:
+        if effective_ip_connections >= MAX_CONNECTIONS_PER_IP:
             await http_error(writer, 429, "Too Many Requests")
             return
 
@@ -916,17 +1156,32 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 ACTIVE_BY_IP.pop(remote_ip, None)
         if is_current_connection:
             CONNECTIONS.pop(identity, None)
-            try:
-                await asyncio.to_thread(api_call, connection.target, {"action": "disconnect", "identity": identity}, 5.0)
-            except Exception as exc:  # noqa: BLE001
-                LOG.warning("Could not record disconnect for %s: %s", identity, exc)
-            LOG.info("Charge point disconnected: %s", identity)
+            disconnected_at = time.time()
+            if DISCONNECT_GRACE_SECONDS > 0:
+                await asyncio.sleep(DISCONNECT_GRACE_SECONDS)
+            replacement = CONNECTIONS.get(identity)
+            if replacement is not None and not replacement.closed:
+                LOG.info("Charge point %s reconnected inside the grace window; offline transition suppressed.", identity)
+            else:
+                try:
+                    await asyncio.to_thread(api_call, connection.target, {
+                        "action": "disconnect",
+                        "identity": identity,
+                        "connection_id": connection.connection_id,
+                        "connected_for_seconds": max(0, int(time.monotonic() - connection.connected_at)),
+                        "disconnected_at_epoch": disconnected_at,
+                    }, 5.0)
+                except Exception as exc:  # noqa: BLE001
+                    LOG.warning("Could not record disconnect for %s: %s", identity, exc)
+                LOG.info("Charge point disconnected: %s", identity)
 
 
 def replay_command_results_once(limit: int = 25) -> int:
     now = time.time()
     try:
         with state_db() as db:
+            prune_queues(db)
+            db.commit()
             rows = db.execute(
                 "SELECT id,target_name,identity,command_id,status,payload_json,error_text,attempts FROM command_result_queue WHERE available_at<=? ORDER BY id LIMIT ?",
                 (now, limit),
@@ -954,7 +1209,27 @@ def replay_command_results_once(limit: int = 25) -> int:
     return delivered
 
 
+def has_older_queued_event(target_name: str, identity: str, event_id: int) -> bool:
+    """Return True while an older event for the same wallbox is still queued.
+
+    Strict per-identity FIFO prevents an event that is already due from
+    overtaking an older event that is temporarily in backoff. Other wallboxes
+    remain independent and can continue replaying normally.
+    """
+    try:
+        with state_db() as db:
+            return db.execute(
+                "SELECT 1 FROM event_queue WHERE target_name=? AND identity=? AND id<? LIMIT 1",
+                (target_name, identity, event_id),
+            ).fetchone() is not None
+    except sqlite3.Error as exc:
+        LOG.warning("OCPP FIFO guard unavailable for %s: %s", identity, exc)
+        # Fail closed: if ordering cannot be proven, do not overtake.
+        return True
+
+
 def replay_queue_once(limit: int = 25) -> int:
+    global QUEUE_LAST_REPLAY_AT, QUEUE_LAST_REPLAY_ERROR
     now = time.time()
     try:
         with state_db() as db:
@@ -968,6 +1243,8 @@ def replay_queue_once(limit: int = 25) -> int:
     delivered = 0
     for row in rows:
         event_id, target_name, identity, message_id, action, payload_json, attempts = row
+        if has_older_queued_event(str(target_name), str(identity), int(event_id)):
+            continue
         target = TARGETS_BY_NAME.get(str(target_name))
         if target is None:
             continue
@@ -975,13 +1252,20 @@ def replay_queue_once(limit: int = 25) -> int:
             payload = json.loads(str(payload_json))
             api_call(target, {"action": "ocpp_call", "identity": identity, "message_id": message_id, "ocpp_action": action, "payload": payload, "gateway_replay": True}, 6.0)
             with state_db() as db:
-                db.execute("DELETE FROM event_queue WHERE id=?", (event_id,)); db.commit()
+                db.execute("DELETE FROM event_queue WHERE id=?", (event_id,))
+                prune_queues(db)
+                db.commit()
+            QUEUE_LAST_REPLAY_AT = time.time()
+            QUEUE_LAST_REPLAY_ERROR = ""
             delivered += 1
         except Exception as exc:  # noqa: BLE001
             attempt_count = int(attempts) + 1
             delay = min(900.0, 5.0 * (2 ** min(attempt_count, 7)))
             with state_db() as db:
-                db.execute("UPDATE event_queue SET attempts=?,available_at=?,last_error=? WHERE id=?", (attempt_count, time.time()+delay, str(exc)[:300], event_id)); db.commit()
+                db.execute("UPDATE event_queue SET attempts=?,available_at=?,last_error=? WHERE id=?", (attempt_count, time.time()+delay, str(exc)[:300], event_id))
+                prune_queues(db)
+                db.commit()
+            QUEUE_LAST_REPLAY_ERROR = str(exc)[:300]
     return delivered
 
 
@@ -1025,6 +1309,8 @@ async def status_loop() -> None:
     last_logged: dict[str, float] = {}
     while not STOP_EVENT.is_set():
         pending_events, pending_command_results, cached_routes = queue_counts()
+        queue_status = queue_diagnostics()
+        now_mono = time.monotonic()
         status = {
             "pid": os.getpid(), "connections": len(CONNECTIONS),
             "connections_by_route": {target.name: sum(1 for connection in CONNECTIONS.values() if connection.target.name == target.name) for target in API_TARGETS},
@@ -1032,7 +1318,15 @@ async def status_loop() -> None:
             "max_connections": MAX_CONNECTIONS, "port": PORT, "started_at": STARTED_AT, "gateway_mode": GATEWAY_MODE,
             "provider": GATEWAY_PROVIDER, "service_name": SERVICE_NAME, "deployment_id": DEPLOYMENT_ID,
             "railway_environment": RAILWAY_ENVIRONMENT, "public_domain": PUBLIC_DOMAIN, "version": GATEWAY_VERSION,
-            "unified_endpoint": True, "queued_events": pending_events, "queued_command_results": pending_command_results, "cached_routes": cached_routes,
+            "unified_endpoint": True, "active_environment": ENVIRONMENT_LABEL, "target_count": len(API_TARGETS),
+            "queued_events": pending_events, "queued_command_results": pending_command_results, "cached_routes": cached_routes,
+            "connection_liveness": {
+                "oldest_rx_age_seconds": max([int(now_mono - c.last_rx_at) for c in CONNECTIONS.values()] or [0]),
+                "pending_calls": sum(len(c.pending_calls) for c in CONNECTIONS.values()),
+                "ping_interval_seconds": int(PING_INTERVAL_SECONDS),
+                "liveness_timeout_seconds": int(LIVENESS_TIMEOUT_SECONDS),
+            },
+            "queue_diagnostics": queue_status,
             "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         }
         temporary = STATUS_FILE.with_suffix(STATUS_FILE.suffix + ".tmp")
@@ -1045,7 +1339,7 @@ async def status_loop() -> None:
             try:
                 result = await asyncio.to_thread(api_call, target, {"action": "gateway_status", **status}, 4.0)
                 apply_route_overrides(target, result)
-                failures[target.name] = 0; next_attempt[target.name] = now + 15.0; last_errors.pop(target.name, None)
+                failures[target.name] = 0; next_attempt[target.name] = now + STATUS_REPORT_SECONDS; last_errors.pop(target.name, None)
             except Exception as exc:  # noqa: BLE001
                 failures[target.name] = failures.get(target.name, 0) + 1
                 delay = min(900.0, 60.0 * (2 ** min(failures[target.name] - 1, 4)))
@@ -1054,7 +1348,7 @@ async def status_loop() -> None:
                     LOG.warning("Gateway status API %s failed; retry in %.0fs: %s", target.name, delay, message)
                     last_errors[target.name] = message; last_logged[target.name] = now
         try:
-            await asyncio.wait_for(STOP_EVENT.wait(), timeout=15)
+            await asyncio.wait_for(STOP_EVENT.wait(), timeout=STATUS_REPORT_SECONDS)
         except asyncio.TimeoutError:
             pass
 

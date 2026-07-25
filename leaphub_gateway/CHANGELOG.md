@@ -1,3 +1,123 @@
+## 1.12.24
+- Garante FIFO estrito por Charge ID no replay da fila OCPP: um evento em backoff nunca é ultrapassado pelo próximo da mesma wallbox.
+- Mantém wallboxes diferentes independentes, preservando paralelismo sem sacrificar a ordem de cada estação.
+- Preserva a ordem também quando uma identidade é promovida entre Beta e Produção.
+- Compatível com a 1.12.208 do Leap Hub, que passa a rejeitar estados e medições atrasados no núcleo Wallbox.
+
+## 1.12.23
+- Reserva uma janela curta para comandos manuais antes da telemetria de confirmação.
+- Impede que abrir/fechar ou travar/destravar em sequência fique atrás de uma leitura automática longa.
+- Mantém a confirmação adaptativa em segundo plano sem transformar entrega em estado físico confirmado.
+
+## 1.12.22
+- Amplia de três para cinco as leituras adaptativas de confirmação após comandos remotos.
+- Corrige instalações atualizadas que mantinham o limite legado de três leituras.
+- Encerra todas as respostas privadas assinadas, eliminando timeouts ociosos após HTTP 200.
+- Mantém a fila idempotente: trava, destrava, abertura e fechamento continuam sem repetição automática.
+
+## 1.12.21
+
+- Encerra respostas de saúde depois do envio para evitar conexões ociosas e falsos timeouts de 15 segundos.
+- Mantém `confirmation_pending` coerente quando a nuvem aceitou o comando, mas a telemetria ainda não confirmou o estado.
+- Preserva sessão única, idempotência, telemetria adaptativa, OCPP e diagnóstico sanitizado.
+
+## 1.12.20
+
+- Saúde sanitizada de Connector, OCPP e Tunnel no diagnóstico privado.
+- Detecção de estado desatualizado sem exposição de logs ou identificadores.
+
+## 1.12.19
+
+- Mantém assinaturas habilitadas em coleta adaptativa mesmo sem nenhuma tela do Leap Hub aberta.
+- Usa a janela de presença somente para aumentar temporariamente a frequência das leituras.
+- Limita o intervalo econômico em segundo plano a cinco minutos por padrão para detectar viagens e recargas.
+- Preserva sessão, fila SQLite, cooldown, idempotência e confirmação rápida de comandos já existentes.
+- Expõe no diagnóstico se o monitoramento de fundo está ativo e corrige os textos dos intervalos padrão.
+
+## 1.12.18.2
+
+- Pacote de recuperação por build local, sem dependência da tag GHCR.
+
+## 1.12.18
+
+- Atualização rápida por imagem GHCR pré-compilada, com build local mantido em pacote de recuperação.
+- Workflow com cache Buildx, autoteste e confirmação do manifesto antes de considerar a publicação concluída.
+- Cloudflared deixou de ser baixado em todas as compilações e agora é preparado somente quando o túnel embutido está ativo, com SHA-256 fixo.
+
+## 1.12.17
+
+
+- Corrige o OCPP único para carregar somente o ambiente realmente ativado; o ambiente desativado não é mais consultado.
+- Bloqueia configuração com Beta e Produção OCPP ativos simultaneamente, evitando eventos e comandos concorrentes.
+- Usa o limite de conexões do ambiente ativo e reduz o padrão para 20.
+- Reseta o backoff de reinício após cinco minutos estáveis e rotaciona logs locais para evitar lentidão e disco cheio.
+- Confia em cabeçalhos de IP encaminhado somente quando a conexão veio de proxy local/privado.
+- Distribui as consultas de comandos OCPP com jitter e reduz o envio de status do Gateway para cada 30 segundos.
+- Preserva API v2, telemetria, 25 comandos, filas SQLite, porta pública 8092 e build local do Home Assistant.
+
+## 1.12.16
+
+- Reutiliza conexões HTTP(S) entre o OCPP Gateway e o Leap Hub, reduzindo DNS, TCP e TLS repetidos.
+- Diferencia indisponibilidade temporária de credencial recusada durante a resolução Beta/Produção.
+- Permite reconexão da mesma wallbox mesmo quando o limite de conexões está ocupado.
+- Consolida Heartbeats pendentes durante indisponibilidade para evitar crescimento sem utilidade da fila.
+- Tenta um único refresh de sessão também quando a leitura de mensagens detecta expiração.
+- Reduz a permanência em consulta de estacionado antes do intervalo de repouso, sem alterar a confirmação de estados.
+- Mantém build local do Home Assistant, API v2, OCPP 1.6, 25 comandos, SQLite e configurações existentes.
+
+## 1.12.15.1
+
+- Hotfix de instalação: build local pelo Home Assistant sem depender de tag GHCR ausente.
+- Código funcional idêntico à 1.12.15.
+
+## 1.12.15
+
+- Preserva os backoffs legítimos de até 30 minutos no diário idempotente de comandos.
+- Bloqueia retomadas enquanto o cooldown global da conta ainda estiver ativo.
+- Executa somente um refresh lógico por falha de sessão.
+- Habilita HTTP/1.1 keepalive no Connector sem alterar HMAC ou API v2.
+
+## 1.12.14
+
+- Mantém sessões Leapmotor saudáveis após o fim da janela ativa.
+- Reduz chamadas repetidas de lista de veículos e mensagens.
+- Trata expiração real de sessão com uma única reconexão coordenada.
+- Detecta conexões OCPP mortas, acelera falha de comandos e aplica graça de reconexão.
+- Preserva ordem e limita retenção da fila OCPP.
+
+## 1.12.13
+
+- Mantém integralmente os contratos, comandos, OCPP e recursos da 1.12.12.
+- Remove expiração artificial de sessão e tenta refresh antes de novo login.
+- Adiciona cooldown global persistente e uma única autenticação por conta.
+- Deduplica assinaturas idênticas sem acordar o veículo ou alterar a agenda.
+- Estabiliza estados de telemetria e aplica intervalos adaptativos de repouso.
+- Corrige compatibilidade do comando de destino entre versões da biblioteca.
+- Centraliza a sanitização de identificadores e segredos nos logs.
+- Fecha conexões SQLite após cada operação.
+
+## 1.12.12
+
+- Classificação de cooldown e trava persistente contra logins automáticos repetidos.
+- Recuperação automática moderada após bloqueio curto da nuvem.
+- Sem mudança em comandos físicos ou OCPP.
+
+## 1.12.11
+
+- Volante e retrovisores aquecidos orientados por capacidade.
+- Metadados completos de permissões e confirmação por telemetria.
+- Sem alteração em fila, cooldown ou OCPP.
+
+## 1.12.10
+
+- Contrato automatizado para todos os comandos remotos.
+- Testes de cooldown, redaction e pares de ações opostas.
+- Sem alteração no comportamento operacional do Gateway.
+
+## 1.12.09
+
+- Contrato versionado, rastreabilidade e diagnóstico de compatibilidade Hub ↔ Gateway.
+
 ## 1.12.08
 
 - Telemetria opcional de temperatura por pneu, sem estimativas.
@@ -371,3 +491,6 @@ A janela interativa encerra ao fechar a última aba. Timeouts temporários prese
 - Corrige a classificação de `Failed to issue certificate`: falha temporária da nuvem não bloqueia mais a conta como senha incorreta.
 - Permite limpar com segurança um `auth_required` preso quando o Leap Hub comprova uma sincronização manual bem-sucedida.
 - Corrige a composição oficial do veículo com portas abertas, removendo o reflexo do vidro fechado que aparecia deslocado na frente da porta.
+
+## 1.12.18.2
+- Recuperação por build local quando a imagem GHCR não estiver publicada.

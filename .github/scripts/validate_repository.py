@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import py_compile
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -32,7 +33,7 @@ for key in ("name", "url", "maintainer"):
         fail(f"repository.yaml não contém {key}.")
 
 config = load_yaml(APP / "config.yaml")
-required = ("name", "version", "slug", "description", "arch", "image")
+required = ("name", "version", "slug", "description", "arch")
 for key in required:
     if not config.get(key):
         fail(f"config.yaml não contém {key}.")
@@ -41,8 +42,11 @@ version = str(config["version"])
 if not re.fullmatch(r"\d+\.\d+\.\d+(?:\.\d+)?", version):
     fail(f"Versão inválida: {version}")
 
-if config["image"] != "ghcr.io/jorgemartim/leaphub-gateway":
+image = str(config.get("image") or "").strip()
+if image and image != "ghcr.io/jorgemartim/leaphub-gateway":
     fail("A imagem do config.yaml não aponta para o GHCR oficial.")
+if not image and not (APP / "Dockerfile").is_file():
+    fail("Build local exige Dockerfile quando config.yaml não contém image.")
 
 architectures = set(config["arch"])
 if architectures != {"amd64"}:
@@ -65,6 +69,7 @@ for filename in (
     "telemetry_engine.py",
     "ocpp_gateway.py",
     "gateway_manager.py",
+    "privacy.py",
 ):
     path = APP / filename
     py_compile.compile(str(path), doraise=True)
@@ -77,9 +82,10 @@ for filename in (
 dockerfile = (APP / "Dockerfile").read_text(encoding="utf-8")
 server_source = (APP / "connector_server.py").read_text(encoding="utf-8")
 for marker in (
-    "COPY connector.py telemetry_engine.py /app/",
+    "COPY connector.py telemetry_engine.py privacy.py /app/",
     "leaphub_connector.py",
     "leaphub_telemetry_engine.py",
+    "leaphub_privacy.py",
     "Autoteste de importação de Connector e telemetria concluído",
 ):
     if marker not in dockerfile:
@@ -126,5 +132,20 @@ for translation in (APP / "translations").glob("*.yaml"):
 changelog = (APP / "CHANGELOG.md").read_text(encoding="utf-8")
 if f"## {version}" not in changelog:
     fail(f"CHANGELOG.md não contém a versão {version}.")
+
+for test_file in (
+    ROOT / "tests" / "test_contracts.py",
+    ROOT / "tests" / "test_remote_command_matrix.py",
+    ROOT / "tests" / "test_comfort_contract.py",
+    ROOT / "tests" / "test_auth_recovery_contract.py",
+    ROOT / "tests" / "test_gateway_1_12_14.py",
+    ROOT / "tests" / "test_resilience_1_12_14.py",
+    ROOT / "tests" / "test_connection_resilience_1_12_15.py",
+    ROOT / "tests" / "test_full_resilience_1_12_16.py",
+    ROOT / "tests" / "test_single_ocpp_1_12_17.py",
+    ROOT / "tests" / "test_fast_install_1_12_18.py",
+    ROOT / "tests" / "test_background_telemetry_1_12_19.py",
+):
+    subprocess.run([sys.executable, str(test_file)], cwd=ROOT, check=True)
 
 print(f"Repositório válido. Leap Hub Gateway {version}.")

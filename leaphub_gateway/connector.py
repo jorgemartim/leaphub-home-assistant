@@ -10,6 +10,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import io
+import inspect
 import json
 import logging
 import os
@@ -27,7 +28,21 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable
 
-CONNECTOR_VERSION = "1.12.08"
+try:
+    from leaphub_privacy import sanitize_log
+except ImportError:
+    try:
+        from privacy import sanitize_log
+    except ImportError:
+        import importlib.util as _importlib_util
+        _privacy_spec = _importlib_util.spec_from_file_location("leaphub_privacy_local", Path(__file__).with_name("privacy.py"))
+        if _privacy_spec is None or _privacy_spec.loader is None:
+            raise
+        _privacy_module = _importlib_util.module_from_spec(_privacy_spec)
+        _privacy_spec.loader.exec_module(_privacy_module)
+        sanitize_log = _privacy_module.sanitize_log
+
+CONNECTOR_VERSION = "1.12.24"
 MAX_INPUT_BYTES = 1024 * 1024
 logging.getLogger("leapmotor_api").setLevel(logging.WARNING)
 LOGGER = logging.getLogger("leaphub.connector")
@@ -66,6 +81,10 @@ COMMAND_METHODS: dict[str, str] = {
     "unlock_charger": "unlock_charger",
     "set_charge_limit": "set_charge_limit",
     "send_destination": "send_destination",
+    "steering_wheel_heat_on": "steering_wheel_heat_on",
+    "steering_wheel_heat_off": "steering_wheel_heat_off",
+    "rearview_mirror_heat_on": "rearview_mirror_heat_on",
+    "rearview_mirror_heat_off": "rearview_mirror_heat_off",
 }
 
 
@@ -85,17 +104,7 @@ def json_default(value: Any) -> Any:
 
 
 def clean_message(message: str) -> str:
-    text = " ".join(str(message).replace("\x00", " ").split())
-    for marker in ("-----BEGIN", "-----END"):
-        if marker in text:
-            return "Falha de autenticação ou certificado inválido."
-    # Nunca exponha VIN, tokens ou valores criptográficos de comando.
-    text = re.sub(r"(?i)(operatePassword|operation_password|password|token|authorization)=([^&\s]+)", r"\1=[protegido]", text)
-    text = re.sub(r'(?i)("(?:operatePassword|operation_password|password|token|authorization)"\s*:\s*")[^"]+("?)', r'\1[protegido]\2', text)
-    text = re.sub(r"(?i)(vin)=([^&\s]+)", r"\1=[VIN protegido]", text)
-    text = re.sub(r'(?i)("vin"\s*:\s*")[^"]+("?)', r'\1[VIN protegido]\2', text)
-    text = re.sub(r"\b[A-HJ-NPR-Z0-9]{17}\b", "[VIN protegido]", text, flags=re.IGNORECASE)
-    return text[:900] or "Falha desconhecida no conector."
+    return sanitize_log(message, 900)
 
 
 class ConnectorTemporaryError(RuntimeError):
@@ -106,14 +115,18 @@ class ConnectorAuthenticationError(RuntimeError):
     """Credencial realmente recusada depois das tentativas de reautenticação."""
 
 
+class ConnectorSessionExpiredError(ConnectorTemporaryError):
+    """A sessão/token expirou, mas as credenciais não foram recusadas."""
+
+
 class ConnectorLoginCooldownError(ConnectorTemporaryError):
     """A nuvem bloqueou novos logins temporariamente; não é senha inválida."""
 
     def __init__(self, message: str, retry_after_seconds: int = 135) -> None:
         super().__init__(message)
-        # Bloqueios de login informados pela Leapmotor são curtos. Nunca deixe
-        # uma mensagem de 2 minutos virar 30 minutos ou 6 horas localmente.
-        self.retry_after_seconds = max(30, min(300, int(retry_after_seconds or 135)))
+        # O valor imediato informado pela Leapmotor é preservado, enquanto o
+        # coordenador global pode ampliar bloqueios consecutivos até 30 minutos.
+        self.retry_after_seconds = max(30, min(1800, int(retry_after_seconds or 135)))
 
 
 LOGIN_COOLDOWN_MARKERS = (
@@ -231,6 +244,14 @@ AUTHENTICATION_MARKERS = (
 def is_transient_cloud_error(value: Any) -> bool:
     message = clean_message(str(value)).lower()
     return any(marker in message for marker in TRANSIENT_CLOUD_MARKERS)
+
+
+def is_session_expired_error(value: Any) -> bool:
+    message = clean_message(str(value)).lower()
+    return any(marker in message for marker in (
+        "token expired", "session expired", "login expired", "invalid token",
+        "token is invalid", "expired token", "authentication token expired",
+    ))
 
 
 def is_authentication_error(value: Any) -> bool:
@@ -1685,9 +1706,23 @@ def serialize_vehicle(
     raw_abilities = attribute(vehicle, "abilities", []) or []
     raw_rights = attribute(vehicle, "rights", []) or []
     raw_module_rights = attribute(vehicle, "module_rights", []) or []
-    abilities = [str(value_of(item)) for item in raw_abilities]
-    rights = [str(value_of(item)) for item in raw_rights]
-    module_rights = [str(value_of(item)) for item in raw_module_rights]
+
+    def capability_label(item: Any) -> str:
+        parts: list[str] = []
+        for candidate in (
+            value_of(item),
+            attribute(item, "name"),
+            attribute(item, "description"),
+            str(item),
+        ):
+            value = " ".join(str(candidate or "").split()).strip()
+            if value and value not in parts:
+                parts.append(value[:120])
+        return " | ".join(parts)[:240]
+
+    abilities = [label for item in raw_abilities if (label := capability_label(item))]
+    rights = [label for item in raw_rights if (label := capability_label(item))]
+    module_rights = [label for item in raw_module_rights if (label := capability_label(item))]
     vehicle_scalars = object_scalar_map(vehicle)
     exterior_color = first_text(
         attribute(vehicle, "out_color"),
@@ -2256,39 +2291,51 @@ def create_client(credentials: dict[str, Any], temp_dir: Path, operation_passwor
     )
 
 
-def handle_account(payload: dict[str, Any], sync: bool) -> dict[str, Any]:
+def handle_account(
+    payload: dict[str, Any],
+    sync: bool,
+    borrowed_client: Any | None = None,
+    borrowed_vehicles: list[Any] | None = None,
+) -> dict[str, Any]:
     credentials_value = payload.get("credentials") if sync else payload
     credentials = credentials_value if isinstance(credentials_value, dict) else {}
     vehicle_id = str(payload.get("vehicle_id") or "").strip() if sync else ""
     force_visual_bytes = bool(payload.get("force_visual_bytes")) if sync else False
     force_debug_package = bool(payload.get("force_debug_package")) if sync else False
     force_package_refresh = bool(payload.get("force_package_refresh")) if sync else False
-    temp_dir = secure_temp_directory()
-    client = None
+    client = borrowed_client
+    client_is_borrowed = borrowed_client is not None
+    temp_dir: Path | None = None
     try:
         try:
-            attempt_dir = temp_dir / "attempt-1"
-            attempt_dir.mkdir(mode=0o700, parents=True, exist_ok=False)
-            client = create_client(credentials, attempt_dir, None)
-            # Uma solicitação gera no máximo um login. Falhas transitórias são
-            # devolvidas ao scheduler, que aplica espera progressiva antes de
-            # qualquer nova autenticação.
-            client.login()
-            vehicles_value = client.get_vehicle_list()
-            vehicles = vehicles_value if isinstance(vehicles_value, list) else list(vehicles_value or [])
+            if client is None:
+                temp_dir = secure_temp_directory()
+                attempt_dir = temp_dir / "attempt-1"
+                attempt_dir.mkdir(mode=0o700, parents=True, exist_ok=False)
+                client = create_client(credentials, attempt_dir, None)
+                # Uma solicitação gera no máximo um login. Falhas transitórias são
+                # devolvidas ao coordenador global, que persiste o próximo prazo.
+                client.login()
+                vehicles_value = client.get_vehicle_list()
+                vehicles = vehicles_value if isinstance(vehicles_value, list) else list(vehicles_value or [])
+            else:
+                vehicles = list(borrowed_vehicles) if isinstance(borrowed_vehicles, list) and borrowed_vehicles else []
+                if not vehicles:
+                    vehicles_value = client.get_vehicle_list()
+                    vehicles = vehicles_value if isinstance(vehicles_value, list) else list(vehicles_value or [])
         except Exception as exc:  # noqa: BLE001
             cooldown = login_cooldown_seconds(exc)
             if cooldown > 0:
                 raise ConnectorLoginCooldownError(
-                    "A Leapmotor limitou temporariamente novas autenticações. O comando continuará protegido até a próxima tentativa permitida.",
+                    "A Leapmotor limitou temporariamente novas autenticações. A solicitação continuará protegida até a próxima tentativa permitida.",
                     cooldown,
                 ) from exc
             if is_transient_cloud_error(exc):
                 raise ConnectorTemporaryError(reconnect_message(exc)) from exc
             if is_authentication_error(exc):
                 raise ConnectorAuthenticationError(
-                    "A conta Leapmotor recusou a autenticação. "
-                    "Nenhuma nova tentativa automática será feita até a conta ser confirmada."
+                    "A sessão ou a conta Leapmotor recusou a autenticação. "
+                    "Nenhuma repetição paralela será iniciada."
                 ) from exc
             raise RuntimeError(clean_message(str(exc))) from exc
 
@@ -2330,16 +2377,18 @@ def handle_account(payload: dict[str, Any], sync: bool) -> dict[str, Any]:
             "vehicles": serialized,
             "connector_version": CONNECTOR_VERSION,
             "library_version": package_version(),
-            "login_attempts": 1,
+            "login_attempts": 0 if client_is_borrowed else 1,
             "reconnected": False,
+            "session_reused": client_is_borrowed,
         }
     finally:
-        if client is not None:
+        if client is not None and not client_is_borrowed:
             try:
                 client.close()
             except Exception:
                 pass
-        shutil.rmtree(temp_dir, ignore_errors=True)
+        if temp_dir is not None:
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 
@@ -2492,7 +2541,38 @@ def execute_vehicle_command(
         longitude = float(parameters.get("longitude"))
         if latitude < -90 or latitude > 90 or longitude < -180 or longitude > 180:
             raise ValueError("Coordenadas inválidas.")
-        return method(vehicle_id, name=name, address=address, latitude=latitude, longitude=longitude)
+        values = {
+            "name": name, "title": name, "poi_name": name, "destination_name": name,
+            "address": address, "addr": address,
+            "latitude": latitude, "lat": latitude,
+            "longitude": longitude, "lon": longitude, "lng": longitude,
+        }
+        try:
+            signature = inspect.signature(method)
+        except (TypeError, ValueError):
+            return method(vehicle_id, address=address, latitude=latitude, longitude=longitude)
+        positional: list[Any] = [vehicle_id]
+        keyword: dict[str, Any] = {}
+        exposed = list(signature.parameters.values())
+        remaining = exposed[1:] if exposed else []
+        accepts_var_keyword = any(item.kind == inspect.Parameter.VAR_KEYWORD for item in remaining)
+        for item in remaining:
+            if item.kind in {inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD}:
+                continue
+            if item.name not in values:
+                if item.default is inspect.Parameter.empty:
+                    raise RuntimeError("Parâmetro de destino ainda não suportado pela biblioteca: " + item.name)
+                continue
+            if item.kind == inspect.Parameter.POSITIONAL_ONLY:
+                positional.append(values[item.name])
+            else:
+                keyword[item.name] = values[item.name]
+        if accepts_var_keyword:
+            keyword.setdefault("address", address)
+            keyword.setdefault("latitude", latitude)
+            keyword.setdefault("longitude", longitude)
+        signature.bind(*positional, **keyword)
+        return method(*positional, **keyword)
     return method(vehicle_id)
 
 
@@ -3128,6 +3208,12 @@ def handle_command(
             # terminal for this request: do not pretend success and do not issue a
             # third delivery. A later user action receives a new request id.
             confirmation_pending = False
+        elif verified_by_gateway:
+            confirmation_pending = False
+        elif command_dispatched or cloud_accepted:
+            # Uma ação aceita, mas ainda não verificada, deve manter o mesmo
+            # estado em todo o resultado e no diário do Gateway.
+            confirmation_pending = True
         if verified_by_gateway:
             message = "A ação foi executada e confirmada por uma leitura nova do veículo."
         elif not_applied:

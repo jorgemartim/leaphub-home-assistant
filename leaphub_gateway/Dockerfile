@@ -2,9 +2,6 @@ FROM python:3.12-slim-bookworm
 
 ARG BUILD_ARCH=amd64
 ARG BUILD_VERSION=dev
-ARG CLOUDFLARED_VERSION=2026.7.1
-ARG CLOUDFLARED_SHA256_AMD64=79a0ade7fc854f62c1aaef48424d9d979e8c2fcd039189d24db82b84cd146be1
-
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
@@ -16,28 +13,24 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 
 RUN apt-get update \
-    && apt-get install --yes --no-install-recommends ca-certificates curl libstdc++6 \
+    && apt-get install --yes --no-install-recommends ca-certificates libstdc++6 \
     && rm -rf /var/lib/apt/lists/*
 
 RUN set -eux; \
     if [ "${BUILD_ARCH}" != "amd64" ]; then \
       echo "Arquitetura ainda não suportada nesta versão: ${BUILD_ARCH}" >&2; \
       exit 1; \
-    fi; \
-    curl --fail --location --retry 3 --retry-delay 2 \
-      --connect-timeout 20 --max-time 300 \
-      "https://github.com/cloudflare/cloudflared/releases/download/${CLOUDFLARED_VERSION}/cloudflared-linux-amd64" \
-      --output /usr/local/bin/cloudflared; \
-    echo "${CLOUDFLARED_SHA256_AMD64}  /usr/local/bin/cloudflared" | sha256sum -c -; \
-    chmod 0755 /usr/local/bin/cloudflared; \
-    /usr/local/bin/cloudflared --version
+    fi
+
+# O cloudflared é obtido com checksum somente quando o túnel embutido é ativado.
+# Assim atualizações normais não baixam um binário grande durante o build local.
 
 COPY requirements.txt /app/requirements.txt
 RUN python3 -m pip install --requirement /app/requirements.txt
 
 # Os módulos críticos ficam em /app e também em site-packages com nomes exclusivos.
 # Isso evita falhas de importação mesmo que o diretório de trabalho mude em runtime.
-COPY connector.py telemetry_engine.py /app/
+COPY connector.py telemetry_engine.py privacy.py /app/
 RUN python3 - <<'PY'
 from pathlib import Path
 import shutil
@@ -47,6 +40,7 @@ target_dir = Path(site.getsitepackages()[0])
 modules = {
     'connector.py': 'leaphub_connector.py',
     'telemetry_engine.py': 'leaphub_telemetry_engine.py',
+    'privacy.py': 'leaphub_privacy.py',
 }
 for source_name, target_name in modules.items():
     source = base / source_name
@@ -65,11 +59,13 @@ from pathlib import Path
 import importlib.util
 import leaphub_connector
 import leaphub_telemetry_engine
+import leaphub_privacy
 from leaphub_telemetry_engine import TelemetryEngine
 assert Path('/app/connector.py').is_file()
 assert Path('/app/telemetry_engine.py').is_file()
 assert leaphub_connector.CONNECTOR_VERSION
 assert leaphub_telemetry_engine.ENGINE_VERSION
+assert leaphub_privacy.PRIVACY_VERSION
 assert TelemetryEngine is not None
 import os
 import sqlite3
