@@ -28,6 +28,8 @@ expected_methods = {
     "windshield_defrost": "windshield_defrost",
     "battery_preheat_on": "battery_preheat",
     "battery_preheat_off": "battery_preheat_off",
+    "sentry_on": "sentry_mode_on",
+    "sentry_off": "sentry_mode_off",
     "start_charging": "start_charging",
     "stop_charging": "stop_charging",
     "unlock_charger": "unlock_charger",
@@ -45,10 +47,12 @@ def check(condition: bool, message: str) -> None:
     if not condition:
         failures.append(message)
 
-check(connector.CONNECTOR_VERSION == "1.12.24", "Versão do Connector divergente")
+check(connector.CONNECTOR_VERSION == "1.12.25", "Versão do Connector divergente")
 check(connector.COMMAND_METHODS == expected_methods, "Matriz COMMAND_METHODS divergente")
-check(len(connector.COMMAND_METHODS) == 25, "A matriz precisa conter 25 comandos")
+check(len(connector.COMMAND_METHODS) == 27, "A matriz precisa conter 27 comandos")
 check(connector.CLIMATE_VERIFY_COMMANDS == {"climate_on", "climate_off", "quick_cool", "quick_heat"}, "Conjunto de confirmação climática divergente")
+check(connector.SENTRY_VERIFY_COMMANDS == {"sentry_on", "sentry_off"}, "Conjunto de confirmação do Sentinela divergente")
+check(connector.EXPERIMENTAL_COMMANDS == {"sentry_on", "sentry_off"}, "Comandos experimentais divergentes")
 check(connector.SAFE_STATE_RETRY_COMMANDS == {"climate_on", "climate_off"}, "Retry seguro climático divergente")
 
 pairs = [
@@ -57,6 +61,7 @@ pairs = [
     ("windows_open", "windows_close"),
     ("sunshade_open", "sunshade_close"),
     ("battery_preheat_on", "battery_preheat_off"),
+    ("sentry_on", "sentry_off"),
     ("start_charging", "stop_charging"),
     ("climate_on", "climate_off"),
     ("steering_wheel_heat_on", "steering_wheel_heat_off"),

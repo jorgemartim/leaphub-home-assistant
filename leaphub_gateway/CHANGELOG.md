@@ -1,3 +1,10 @@
+## 1.12.25
+- Adiciona suporte experimental controlado ao Modo Sentinela usando os métodos nativos `sentry_mode_on` e `sentry_mode_off` da biblioteca `leapmotor-api==0.3.2`.
+- Mantém Sentinela fora da lista normal de comandos e o publica separadamente em `experimental_commands`.
+- Exige `experimental_confirmed=true` antes do envio, evitando ativação acidental por interfaces antigas.
+- Confirma o resultado por `status.security.sentry_mode` sem repetir automaticamente o comando.
+- Preserva sessão, fila idempotente, telemetria adaptativa, OCPP e todos os 25 comandos estáveis anteriores.
+
 ## 1.12.24
 - Garante FIFO estrito por Charge ID no replay da fila OCPP: um evento em backoff nunca é ultrapassado pelo próximo da mesma wallbox.
 - Mantém wallboxes diferentes independentes, preservando paralelismo sem sacrificar a ordem de cada estação.

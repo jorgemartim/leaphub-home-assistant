@@ -42,7 +42,7 @@ except ImportError:
         _privacy_spec.loader.exec_module(_privacy_module)
         sanitize_log = _privacy_module.sanitize_log
 
-CONNECTOR_VERSION = "1.12.24"
+CONNECTOR_VERSION = "1.12.25"
 MAX_INPUT_BYTES = 1024 * 1024
 logging.getLogger("leapmotor_api").setLevel(logging.WARNING)
 LOGGER = logging.getLogger("leaphub.connector")
@@ -57,6 +57,8 @@ def connector_log(level: int, message: str, *args: Any) -> None:
 
 
 CLIMATE_VERIFY_COMMANDS = {"climate_on", "climate_off", "quick_cool", "quick_heat"}
+SENTRY_VERIFY_COMMANDS = {"sentry_on", "sentry_off"}
+EXPERIMENTAL_COMMANDS = set(SENTRY_VERIFY_COMMANDS)
 SAFE_STATE_RETRY_COMMANDS = {"climate_on", "climate_off"}
 
 COMMAND_METHODS: dict[str, str] = {
@@ -76,6 +78,8 @@ COMMAND_METHODS: dict[str, str] = {
     "windshield_defrost": "windshield_defrost",
     "battery_preheat_on": "battery_preheat",
     "battery_preheat_off": "battery_preheat_off",
+    "sentry_on": "sentry_mode_on",
+    "sentry_off": "sentry_mode_off",
     "start_charging": "start_charging",
     "stop_charging": "stop_charging",
     "unlock_charger": "unlock_charger",
@@ -1735,7 +1739,11 @@ def serialize_vehicle(
     )))
     supported_commands = [
         key for key, method in COMMAND_METHODS.items()
-        if callable(getattr(client, method, None))
+        if key not in EXPERIMENTAL_COMMANDS and callable(getattr(client, method, None))
+    ]
+    experimental_commands = [
+        key for key, method in COMMAND_METHODS.items()
+        if key in EXPERIMENTAL_COMMANDS and callable(getattr(client, method, None))
     ]
 
     result: dict[str, Any] = {
@@ -1753,6 +1761,7 @@ def serialize_vehicle(
             "rights": rights,
             "module_rights": module_rights,
             "supported_commands": supported_commands,
+            "experimental_commands": experimental_commands,
         },
     }
     if not include_status:
@@ -2681,7 +2690,7 @@ def read_command_state(
     vehicles: list[Any] | None = None,
 ) -> dict[str, Any]:
     """Read one state sample and keep freshness separate from command acceptance."""
-    if command not in CLIMATE_VERIFY_COMMANDS:
+    if command not in CLIMATE_VERIFY_COMMANDS and command not in SENTRY_VERIFY_COMMANDS:
         return {
             "matched": False,
             "evaluable": False,
@@ -2700,6 +2709,27 @@ def read_command_state(
         }
     status = client.get_vehicle_status(selected)
     captured_epoch = _status_capture_epoch(status)
+
+    if command in SENTRY_VERIFY_COMMANDS:
+        security = attribute(status, "security")
+        state = bool_or_none(attribute(security, "sentry_mode"))
+        if state is None:
+            return {
+                "matched": False,
+                "evaluable": False,
+                "state": "sentry_unknown",
+                "captured_epoch": captured_epoch,
+                "vehicles": available,
+            }
+        expected = command == "sentry_on"
+        return {
+            "matched": state is expected,
+            "evaluable": True,
+            "state": "sentry_on" if state else "sentry_off",
+            "captured_epoch": captured_epoch,
+            "vehicles": available,
+        }
+
     climate = attribute(status, "climate")
     profile = climate_profile_from_status(climate)
     state = bool_or_none(attribute(climate, "ac_switch"))
@@ -2744,6 +2774,7 @@ def wait_for_command_state(
     report: Callable[[str, str, dict[str, Any] | None], None],
     stage: str,
     vehicles: list[Any] | None = None,
+    return_on_fresh_mismatch: bool = True,
 ) -> dict[str, Any]:
     """Wait for a fresh sample without issuing another remote command."""
     timeout_seconds = max(4, min(40, int(timeout_seconds or 20)))
@@ -2792,7 +2823,7 @@ def wait_for_command_state(
                 return sample
             # A fresh evaluable sample is enough to prove that the vehicle is
             # awake and available for the second idempotent climate delivery.
-            if fresh and bool(sample.get("evaluable")):
+            if return_on_fresh_mismatch and fresh and bool(sample.get("evaluable")):
                 return sample
         except Exception as exc:  # noqa: BLE001
             cooldown = login_cooldown_seconds(exc)
@@ -2856,6 +2887,8 @@ def handle_command(
         parameters = {}
     if command not in COMMAND_METHODS:
         raise ValueError("Comando remoto não suportado pelo conector.")
+    if command in EXPERIMENTAL_COMMANDS and parameters.get("experimental_confirmed") is not True:
+        raise ValueError("Comando experimental bloqueado. Confirme explicitamente o teste de compatibilidade antes de executar.")
     operation_password = require_text(credentials, "operation_password", "o PIN do veículo", 20)
     wake_on_sleep = bool(payload.get("wake_before", True))
     verify_after = bool(payload.get("verify_after", True))
@@ -3014,6 +3047,7 @@ def handle_command(
             raise_classified(exc)
 
         is_climate_state_command = command in CLIMATE_VERIFY_COMMANDS
+        is_sentry_state_command = command in SENTRY_VERIFY_COMMANDS
         can_safe_retry = command in SAFE_STATE_RETRY_COMMANDS
         if command == "climate_off":
             profile_hint = str(parameters.get("climate_profile") or "").strip().lower()
@@ -3192,6 +3226,37 @@ def handle_command(
                     execution_warning = "climate_not_applied_after_safe_retry"
                 else:
                     confirmation_reason = confirmation_reason or "verification_unavailable"
+        elif is_sentry_state_command and verify_after:
+            sentry_sample = wait_for_command_state(
+                client,
+                resolved_vehicle_id,
+                command,
+                parameters,
+                command_started_at,
+                min(wake_timeout, 30),
+                report,
+                "sentry_verifying",
+                resolved_list,
+                return_on_fresh_mismatch=False,
+            )
+            verification_samples += int(sentry_sample.get("samples") or 0)
+            verification_state = str(sentry_sample.get("state") or "unknown")
+            if bool(sentry_sample.get("matched")):
+                verified_by_gateway = True
+                confirmation_pending = False
+                confirmation_reason = None
+                report(
+                    "verifying",
+                    "Modo Sentinela confirmado por uma leitura nova do veículo.",
+                    {"verified_by_gateway": True, "experimental": True},
+                )
+            else:
+                confirmation_pending = True
+                confirmation_reason = (
+                    "sentry_state_pending"
+                    if bool(sentry_sample.get("evaluable"))
+                    else "sentry_state_unavailable"
+                )
         elif first_error is not None:
             raise_classified(first_error)
 
@@ -3256,6 +3321,8 @@ def handle_command(
             ),
             "stale_snapshot_received": stale_snapshot,
             "intended_climate_on": (command != "climate_off") if is_climate_state_command else None,
+            "intended_sentry_on": (command == "sentry_on") if is_sentry_state_command else None,
+            "experimental_command": command in EXPERIMENTAL_COMMANDS,
             "attempts": command_attempts,
             "session_attempts": session_attempts,
             "verification_requested": bool(verify_after),
