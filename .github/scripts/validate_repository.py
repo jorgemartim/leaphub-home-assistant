@@ -43,10 +43,8 @@ if not re.fullmatch(r"\d+\.\d+\.\d+(?:\.\d+)?", version):
     fail(f"Versão inválida: {version}")
 
 image = str(config.get("image") or "").strip()
-if image and image != "ghcr.io/jorgemartim/leaphub-gateway":
-    fail("A imagem do config.yaml não aponta para o GHCR oficial.")
-if not image and not (APP / "Dockerfile").is_file():
-    fail("Build local exige Dockerfile quando config.yaml não contém image.")
+if image != "ghcr.io/jorgemartim/leaphub-gateway":
+    fail("A distribuição normal precisa usar a imagem GHCR oficial pré-compilada.")
 
 architectures = set(config["arch"])
 if architectures != {"amd64"}:
@@ -130,8 +128,9 @@ for translation in (APP / "translations").glob("*.yaml"):
     load_yaml(translation)
 
 changelog = (APP / "CHANGELOG.md").read_text(encoding="utf-8")
-if f"## {version}" not in changelog:
-    fail(f"CHANGELOG.md não contém a versão {version}.")
+headings = re.findall(r"^##\s+(.+)$", changelog, flags=re.MULTILINE)
+if headings != [version]:
+    fail(f"CHANGELOG.md deve conter somente o release atual {version}; encontrado: {headings}.")
 
 for test_file in (
     ROOT / "tests" / "test_contracts.py",
@@ -145,6 +144,7 @@ for test_file in (
     ROOT / "tests" / "test_single_ocpp_1_12_17.py",
     ROOT / "tests" / "test_fast_install_1_12_18.py",
     ROOT / "tests" / "test_background_telemetry_1_12_19.py",
+    ROOT / "tests" / "test_prebuilt_distribution_1_12_31.py",
 ):
     subprocess.run([sys.executable, str(test_file)], cwd=ROOT, check=True)
 

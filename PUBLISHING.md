@@ -1,42 +1,28 @@
-# Publicação de novas versões
+# Publicação do Leap Hub Gateway
 
-## Fluxo rápido normal
+## Fluxo normal — imagem pré-compilada
 
-1. Atualize `leaphub_gateway/` e o número de `version` em `config.yaml`.
-2. Envie o repositório para a branch `main`.
-3. Abra **Actions → Build and publish Leap Hub Gateway**.
-4. Aguarde a etapa **Verify published manifest** ficar verde.
-5. Abra **Packages → leaphub-gateway** e confirme que a versão está pública.
-6. Somente depois recarregue o repositório no Home Assistant.
+1. Atualize o código e `version` em `leaphub_gateway/config.yaml`.
+2. Mantenha obrigatoriamente:
 
-O Home Assistant solicitará exatamente:
-
-```text
-ghcr.io/jorgemartim/leaphub-gateway:<version>
+```yaml
+image: "ghcr.io/jorgemartim/leaphub-gateway"
 ```
 
-A atualização só deve aparecer na Loja depois que essa tag existir. Isso impede o erro `manifest unknown`.
+3. Envie para `main`.
+4. O GitHub Actions valida o repositório e constrói a imagem `amd64`.
+5. O build usa cache de camadas. Como `requirements.txt` é copiado antes do código, mudanças normais de Python não recompilam/rebaixam as dependências.
+6. A imagem exata é testada antes da publicação.
+7. São publicadas as tags `<version>` e `latest`.
+8. O workflow encerra a autenticação do GHCR e confirma que a tag versionada pode ser consultada anonimamente.
+9. Somente após o workflow verde, recarregue a Loja de Apps do Home Assistant.
 
-## Visibilidade do GHCR
+O Home Assistant usa automaticamente a tag igual ao campo `version` do `config.yaml`.
 
-Na primeira publicação ou depois de recriar o pacote:
+## Release notes
 
-1. Abra **Packages → leaphub-gateway** no GitHub.
-2. Entre em **Package settings**.
-3. Defina a visibilidade como **Public**.
+`leaphub_gateway/CHANGELOG.md` deve conter **somente a versão atual**. O histórico permanece no Git/GitHub e não é repetido na tela de atualização do Home Assistant.
 
-O Home Assistant não possui credenciais do seu GitHub e precisa baixar a imagem publicamente.
+## Visibilidade
 
-## Cache e validação
-
-O workflow usa cache Buildx. Depois da primeira compilação, versões que alteram apenas o código reaproveitam as camadas de dependências. Antes da publicação definitiva, o workflow:
-
-- valida o repositório;
-- compila a imagem `amd64`;
-- executa o autoteste dentro da imagem exata;
-- publica as tags de versão e `latest`;
-- confirma que o manifesto `linux/amd64` está disponível no GHCR.
-
-## Recuperação
-
-Se a publicação GHCR falhar, use o pacote separado `1.12.18.2-recuperacao`, que não possui `image:` e permite build local. Não altere o pacote rápido removendo o campo manualmente.
+O pacote GHCR precisa ser público. O Home Assistant não deve depender de token pessoal ou credenciais do GitHub para instalar o Gateway.

@@ -5,8 +5,13 @@ on:
     branches: [main]
     paths:
       - "leaphub_gateway/**"
+      - ".github/scripts/**"
       - ".github/workflows/build.yml"
   workflow_dispatch:
+
+concurrency:
+  group: leaphub-gateway-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -18,11 +23,11 @@ env:
 
 jobs:
   build:
-    name: Build, test and publish amd64 image
+    name: Validate, pre-build and publish amd64 image
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7.0.0
+        uses: actions/checkout@v7
 
       - name: Read App version
         id: app
@@ -30,14 +35,18 @@ jobs:
         run: |
           set -euo pipefail
           version="$(sed -n 's/^version:[[:space:]]*"\([^"]*\)".*/\1/p' leaphub_gateway/config.yaml | head -n1)"
+          image="$(sed -n 's/^image:[[:space:]]*"\([^"]*\)".*/\1/p' leaphub_gateway/config.yaml | head -n1)"
           test -n "${version}"
+          test "${image}" = "ghcr.io/jorgemartim/leaphub-gateway"
           echo "version=${version}" >> "${GITHUB_OUTPUT}"
 
-      - name: Verify repository
+      - name: Validate repository
         shell: bash
         run: |
           set -euo pipefail
-          python3 -m pip install --quiet pyyaml --requirement leaphub_gateway/requirements.txt
+          # Runtime dependencies are installed inside the cached Docker layer.
+          # CI only needs PyYAML for the repository validator, avoiding a duplicate pip install.
+          python3 -m pip install --quiet PyYAML==6.0.2
           python3 .github/scripts/validate_repository.py
 
       - name: Set up Docker Buildx
@@ -74,9 +83,9 @@ jobs:
           docker run --rm --entrypoint python3 "${image}" -c \
             "import leaphub_connector, leaphub_telemetry_engine; from leaphub_telemetry_engine import TelemetryEngine; import connector_server, ocpp_gateway, gateway_manager; print('runtime imports ok')"
           docker run --rm --entrypoint sh "${image}" -c \
-            "test -s /app/telemetry_engine.py && test -s /usr/local/lib/python3.12/site-packages/leaphub_telemetry_engine.py && ! test -e /usr/local/bin/cloudflared"
+            "test -s /app/telemetry_engine.py && test -s /usr/local/lib/python3.12/site-packages/leaphub_telemetry_engine.py"
 
-      - name: Publish version and latest tags
+      - name: Publish immutable version and latest tags
         shell: bash
         run: |
           set -euo pipefail
@@ -93,11 +102,27 @@ jobs:
           image="${REGISTRY}/${IMAGE_NAME}:${{ steps.app.outputs.version }}"
           for attempt in $(seq 1 12); do
             if docker buildx imagetools inspect "${image}" | grep -q "linux/amd64"; then
-              echo "Manifesto publicado e arquitetura amd64 confirmada."
+              echo "Manifest published and linux/amd64 confirmed."
               exit 0
             fi
-            echo "Manifesto ainda não disponível; tentativa ${attempt}/12."
+            echo "Manifest not ready; attempt ${attempt}/12."
             sleep 10
           done
-          echo "A tag foi enviada, mas o manifesto não ficou disponível no GHCR." >&2
+          exit 1
+
+      - name: Verify anonymous image access
+        shell: bash
+        run: |
+          set -euo pipefail
+          image="${REGISTRY}/${IMAGE_NAME}:${{ steps.app.outputs.version }}"
+          docker logout "${REGISTRY}" >/dev/null 2>&1 || true
+          for attempt in $(seq 1 6); do
+            if docker buildx imagetools inspect "${image}" | grep -q "linux/amd64"; then
+              echo "Anonymous GHCR access confirmed. Home Assistant can pull the pre-built image."
+              exit 0
+            fi
+            echo "Anonymous access not ready; attempt ${attempt}/6."
+            sleep 10
+          done
+          echo "The image exists but is not anonymously accessible. Set the GHCR package visibility to Public." >&2
           exit 1

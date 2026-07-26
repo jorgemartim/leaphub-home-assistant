@@ -8,8 +8,8 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 APP = ROOT / "leaphub_gateway"
 config = yaml.safe_load((APP / "config.yaml").read_text(encoding="utf-8"))
-assert config["version"] == "1.12.30"
-assert not config.get("image")
+assert config["version"] == "1.12.31"
+assert config.get("image") == "ghcr.io/jorgemartim/leaphub-gateway"
 assert (APP / "Dockerfile").is_file()
 assert "/data/runtime/bin/cloudflared rix," in (APP / "apparmor.txt").read_text(encoding="utf-8")
 assert len(config.get("options", {})) == 47
@@ -21,7 +21,7 @@ assert "ca-certificates libstdc++6" in dockerfile
 
 manager = (APP / "gateway_manager.py").read_text(encoding="utf-8")
 for marker in (
-    'VERSION = "1.12.30"',
+    'VERSION = "1.12.31"',
     "def resolve_cloudflared()",
     "CLOUDFLARED_SHA256_AMD64",
     "MAX_CLOUDFLARED_BYTES",
@@ -37,7 +37,7 @@ for marker in (
     "--cache-to type=gha",
     "Smoke-test exact runtime image",
     "docker buildx imagetools inspect",
-    "Manifesto publicado",
+    "Verify anonymous image access",
 ):
     assert marker in workflow, marker
 
@@ -48,4 +48,4 @@ ocpp = (APP / "ocpp_gateway.py").read_text(encoding="utf-8")
 for command_marker in ("RemoteStartTransaction", "RemoteStopTransaction", "UnlockConnector", "ChangeAvailability"):
     assert command_marker in ocpp, command_marker
 assert (ROOT / "tests" / "test_remote_command_matrix.py").is_file()
-print("recovery local build 1.12.24 contract ok")
+print("fast prebuilt install current contract ok")
