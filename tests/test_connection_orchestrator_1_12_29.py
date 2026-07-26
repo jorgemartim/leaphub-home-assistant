@@ -53,9 +53,9 @@ def test_command_latency_is_aggregated_without_identifiers() -> None:
 
 
 def test_fast_slow_profiles_and_health_are_wired() -> None:
-    assert 'ENGINE_VERSION = "1.12.35"' in TELEMETRY
-    assert 'CONNECTOR_VERSION = "1.12.35"' in CONNECTOR
-    assert 'VERSION = "1.12.35"' in SERVER
+    assert 'ENGINE_VERSION = "1.12.36"' in TELEMETRY
+    assert 'CONNECTOR_VERSION = "1.12.36"' in CONNECTOR
+    assert 'VERSION = "1.12.36"' in SERVER
     assert '"collection_profile": "slow" if slow_cycle else "fast"' in TELEMETRY
     assert 'include_secondary_network=slow_cycle' in TELEMETRY
     assert 'ORCHESTRATOR.is_degraded(environment)' in TELEMETRY

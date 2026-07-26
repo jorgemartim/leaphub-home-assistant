@@ -1,7 +1,7 @@
-## 1.12.35
+## 1.12.36
 
-- Confirmação de comandos pode iniciar imediatamente após o envio sem ser bloqueada pela reserva pós-comando; novas ações manuais continuam preemptando a telemetria em pontos seguros.
-- Event Transport direciona wake-up ao veículo quando o evento possui identificador, reduzindo assinaturas acordadas sem necessidade.
-- Comandos concluídos geram um hint interno seguro para acelerar a primeira leitura de confirmação, mantendo REST como transporte real e MQTT desativado.
-- Connection Orchestrator passa a medir latência da telemetria FAST/SLOW e quantas coletas cederam prioridade para comandos.
-- Distribuição pré-compilada via GHCR preservada; pipeline GHCR da 1.12.34 foi preservado sem mudanças funcionais.
+- Comandos passam a medir separadamente espera da conta, vaga do Connector, preparo/reuso de sessão, dispatch/result e verificação, permitindo identificar o gargalo real sem registrar credenciais ou VIN.
+- Connection Orchestrator expõe o gargalo p95 dominante por ambiente para orientar otimizações futuras com dados reais.
+- Event Transport coalesce wake-ups equivalentes por conta/veículo em uma janela de 1,5 s, reduzindo leituras redundantes sem aumentar polling e sem descartar o evento original.
+- Confirmação rápida, prioridade manual, REST autenticado e fallback atuais foram preservados; MQTT Leapmotor segue desativado até homologação legítima.
+- Distribuição pré-compilada via GHCR permanece inalterada em relação à 1.12.35.

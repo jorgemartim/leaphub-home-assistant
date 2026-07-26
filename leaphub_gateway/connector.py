@@ -42,7 +42,7 @@ except ImportError:
         _privacy_spec.loader.exec_module(_privacy_module)
         sanitize_log = _privacy_module.sanitize_log
 
-CONNECTOR_VERSION = "1.12.35"
+CONNECTOR_VERSION = "1.12.36"
 MAX_INPUT_BYTES = 1024 * 1024
 logging.getLogger("leapmotor_api").setLevel(logging.WARNING)
 LOGGER = logging.getLogger("leaphub.connector")
@@ -3088,6 +3088,25 @@ def handle_command(
     remote_result_signal_value = "unknown"
     remote_result_evidence = "not_dispatched"
     command_started_at = time.time()
+    phase_latency_ms: dict[str, int] = {
+        "session_prepare_ms": 0,
+        "dispatch_ms": 0,
+        "verification_ms": 0,
+    }
+
+    def timed_remote_call(callable_value: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+        started = time.monotonic()
+        try:
+            return callable_value(*args, **kwargs)
+        finally:
+            phase_latency_ms["dispatch_ms"] += int(round((time.monotonic() - started) * 1000))
+
+    def timed_wait_for_state(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        started = time.monotonic()
+        try:
+            return wait_for_command_state(*args, **kwargs)
+        finally:
+            phase_latency_ms["verification_ms"] += int(round((time.monotonic() - started) * 1000))
 
     def close_client(force: bool = False) -> None:
         nonlocal client, client_is_borrowed
@@ -3178,7 +3197,8 @@ def handle_command(
         })
         command_attempts = max(command_attempts, attempt)
         try:
-            result = execute_vehicle_command(
+            result = timed_remote_call(
+                execute_vehicle_command,
                 method,
                 command,
                 resolved_vehicle_id,
@@ -3210,10 +3230,13 @@ def handle_command(
             else "Preparando uma sessão exclusiva para o comando.",
             {"session_reused": borrowed_client is not None},
         )
+        session_prepare_started = time.monotonic()
         try:
             _, resolved_vehicle_id, resolved_list, method, identifier_source = open_client(1)
         except Exception as exc:  # noqa: BLE001
             raise_classified(exc)
+        finally:
+            phase_latency_ms["session_prepare_ms"] += int(round((time.monotonic() - session_prepare_started) * 1000))
 
         is_climate_state_command = command in CLIMATE_VERIFY_COMMANDS
         can_safe_retry = command in SAFE_STATE_RETRY_COMMANDS
@@ -3245,7 +3268,7 @@ def handle_command(
                 raise ConnectorTemporaryError(
                     str(wake_info.get("message") or "Não foi possível acordar o veículo agora.")
                 ) from first_error
-            wait_sample = wait_for_command_state(
+            wait_sample = timed_wait_for_state(
                 client,
                 resolved_vehicle_id,
                 command,
@@ -3283,7 +3306,7 @@ def handle_command(
 
         if is_climate_state_command and verify_after:
             stage = "vehicle_waking" if stale_snapshot or confirmation_reason == "result_timeout" else "climate_verifying"
-            initial_sample = wait_for_command_state(
+            initial_sample = timed_wait_for_state(
                 client,
                 resolved_vehicle_id,
                 command,
@@ -3342,12 +3365,14 @@ def handle_command(
                 retry_error: Exception | None = None
                 try:
                     if use_mode_aware_close:
-                        result = explicit_close(
+                        result = timed_remote_call(
+                            explicit_close,
                             resolved_vehicle_id,
                             params=climate_close_parameters(retry_profile),
                         )
                     else:
-                        result = execute_vehicle_command(
+                        result = timed_remote_call(
+                            execute_vehicle_command,
                             method,
                             command,
                             resolved_vehicle_id,
@@ -3360,7 +3385,7 @@ def handle_command(
                     if not classify_accepted_ambiguity(exc):
                         retry_error = exc
 
-                final_sample = wait_for_command_state(
+                final_sample = timed_wait_for_state(
                     client,
                     resolved_vehicle_id,
                     command,
@@ -3495,6 +3520,7 @@ def handle_command(
             "verification_state": verification_state,
             "verification_samples": verification_samples,
             "execution_warning": execution_warning,
+            "phase_latency_ms": dict(phase_latency_ms),
         }
     finally:
         if borrowed_client is not None:

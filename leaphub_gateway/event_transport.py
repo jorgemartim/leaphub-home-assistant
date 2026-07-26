@@ -17,6 +17,7 @@ class EventTransportCoordinator:
     """
 
     DEDUPE_SECONDS = 30
+    WAKE_COALESCE_SECONDS = 1.5
     MAX_HINTS = 512
 
     def __init__(self) -> None:
@@ -26,6 +27,8 @@ class EventTransportCoordinator:
         self._accepted = 0
         self._deduplicated = 0
         self._wakeups = 0
+        self._coalesced_wakeups = 0
+        self._last_wake_by_target: dict[str, float] = {}
         self._last_hint_at = 0.0
         self._sources: deque[str] = deque(maxlen=16)
 
@@ -70,15 +73,30 @@ class EventTransportCoordinator:
                 self._sources.append(src)
             callback = self._wake_callback
         woken = False
+        coalesced = False
+        wake_target = self._fingerprint(env, int(account_id), vehicle, "wake", "target")
         if callback is not None and int(account_id) > 0:
-            try:
-                woken = bool(callback(env, int(account_id), vehicle, src))
-            except Exception:
-                woken = False
+            with self._lock:
+                last_wake = float(self._last_wake_by_target.get(wake_target) or 0.0)
+                if last_wake > 0 and now - last_wake < self.WAKE_COALESCE_SECONDS:
+                    coalesced = True
+                    self._coalesced_wakeups += 1
+                else:
+                    self._last_wake_by_target[wake_target] = now
+                    if len(self._last_wake_by_target) > self.MAX_HINTS:
+                        cutoff = now - max(self.DEDUPE_SECONDS, self.WAKE_COALESCE_SECONDS * 4)
+                        stale_targets = [item for item, seen_at in self._last_wake_by_target.items() if seen_at < cutoff]
+                        for item in stale_targets[:256]:
+                            self._last_wake_by_target.pop(item, None)
+            if not coalesced:
+                try:
+                    woken = bool(callback(env, int(account_id), vehicle, src))
+                except Exception:
+                    woken = False
         if woken:
             with self._lock:
                 self._wakeups += 1
-        return {"accepted": True, "deduplicated": False, "woken": woken}
+        return {"accepted": True, "deduplicated": False, "woken": woken, "wake_coalesced": coalesced}
 
     def snapshot(self) -> dict[str, Any]:
         now = time.time()
@@ -99,6 +117,8 @@ class EventTransportCoordinator:
                     "accepted": self._accepted,
                     "deduplicated": self._deduplicated,
                     "wakeups": self._wakeups,
+                    "coalesced_wakeups": self._coalesced_wakeups,
+                    "wake_coalesce_seconds": self.WAKE_COALESCE_SECONDS,
                     "last_hint_seconds_ago": last_age,
                     "sources_seen": len(self._sources),
                 },

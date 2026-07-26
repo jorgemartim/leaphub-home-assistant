@@ -21,7 +21,7 @@ def test_event_hints_are_deduplicated_and_wake_once() -> None:
     coordinator.register_wake_callback(lambda env, account, vehicle, source: calls.append((env, account, vehicle, source)) or True)
     first = coordinator.ingest_hint("staging", 7, "vehicle-x", source="mqtt", event_key="status")
     second = coordinator.ingest_hint("staging", 7, "vehicle-x", source="mqtt", event_key="status")
-    assert first == {"accepted": True, "deduplicated": False, "woken": True}
+    assert first == {"accepted": True, "deduplicated": False, "woken": True, "wake_coalesced": False}
     assert second == {"accepted": True, "deduplicated": True, "woken": False}
     assert len(calls) == 1
 
@@ -38,7 +38,7 @@ def test_mqtt_is_not_claimed_active_before_homologation() -> None:
 
 
 def test_event_layer_is_wired_without_new_physical_command_path() -> None:
-    assert 'ENGINE_VERSION = "1.12.35"' in TELEMETRY
+    assert 'ENGINE_VERSION = "1.12.36"' in TELEMETRY
     assert 'EVENT_TRANSPORT.register_wake_callback(self._wake_from_event)' in TELEMETRY
     assert '"event_transport": EVENT_TRANSPORT.snapshot()' in SERVER
     assert 'event_transport.py' in DOCKER

@@ -112,6 +112,9 @@ class ConnectionOrchestrator:
         connector_slot_ms: float,
         remote_execute_ms: float,
         total_ms: float,
+        session_prepare_ms: float = 0.0,
+        dispatch_ms: float = 0.0,
+        verification_ms: float = 0.0,
     ) -> None:
         env = self._environment(environment)
         sample = {
@@ -119,6 +122,9 @@ class ConnectionOrchestrator:
             "connector_slot_ms": max(0.0, float(connector_slot_ms)),
             "remote_execute_ms": max(0.0, float(remote_execute_ms)),
             "total_ms": max(0.0, float(total_ms)),
+            "session_prepare_ms": max(0.0, float(session_prepare_ms)),
+            "dispatch_ms": max(0.0, float(dispatch_ms)),
+            "verification_ms": max(0.0, float(verification_ms)),
         }
         with self._lock:
             self._latencies[env].append(sample)
@@ -165,6 +171,18 @@ class ConnectionOrchestrator:
             account_waits = [item["account_wait_ms"] for item in samples]
             slot_waits = [item["connector_slot_ms"] for item in samples]
             remote_times = [item["remote_execute_ms"] for item in samples]
+            session_prepare_times = [item.get("session_prepare_ms", 0.0) for item in samples]
+            dispatch_times = [item.get("dispatch_ms", 0.0) for item in samples]
+            verification_times = [item.get("verification_ms", 0.0) for item in samples]
+            phase_p95 = {
+                "account_wait": self._percentile(account_waits, 95),
+                "connector_slot": self._percentile(slot_waits, 95),
+                "session_prepare": self._percentile(session_prepare_times, 95),
+                "dispatch": self._percentile(dispatch_times, 95),
+                "verification": self._percentile(verification_times, 95),
+            }
+            measurable = {key: int(value or 0) for key, value in phase_p95.items()}
+            primary_bottleneck = max(measurable, key=measurable.get) if any(measurable.values()) else None
             telemetry_cycles = list(self._telemetry_cycles[env])
             telemetry_durations = [float(item.get("duration_ms") or 0.0) for item in telemetry_cycles]
             telemetry_fast = [float(item.get("duration_ms") or 0.0) for item in telemetry_cycles if item.get("profile") in {"fast", "interactive", "confirmation"}]
@@ -190,6 +208,10 @@ class ConnectionOrchestrator:
                     "account_wait_p95_ms": self._percentile(account_waits, 95),
                     "connector_slot_p95_ms": self._percentile(slot_waits, 95),
                     "remote_execute_p95_ms": self._percentile(remote_times, 95),
+                    "session_prepare_p95_ms": phase_p95["session_prepare"],
+                    "dispatch_p95_ms": phase_p95["dispatch"],
+                    "verification_p95_ms": phase_p95["verification"],
+                    "primary_bottleneck": primary_bottleneck,
                 },
                 "telemetry_latency": {
                     "samples": len(telemetry_cycles),

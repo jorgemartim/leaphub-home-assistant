@@ -65,7 +65,7 @@ except ModuleNotFoundError:
         _event_transport_spec.loader.exec_module(_event_transport_module)
         EVENT_TRANSPORT = _event_transport_module.EVENT_TRANSPORT
 
-VERSION = "1.12.35"
+VERSION = "1.12.36"
 API_VERSION = 2
 CAPABILITY_SCHEMA_VERSION = 1
 MIN_SUPPORTED_CLIENT_API_VERSION = 1
@@ -927,11 +927,15 @@ def run_command_job(
         execute_started_at = time.monotonic()
         result = TELEMETRY.execute_command(environment, payload, progress=progress)
         execute_finished_at = time.monotonic()
+        phase_latency = result.get("phase_latency_ms") if isinstance(result.get("phase_latency_ms"), dict) else {}
         latency = {
             "account_wait_ms": int(round((account_acquired_at - queue_started) * 1000)),
             "connector_slot_ms": int(round((slot_acquired_at - account_acquired_at) * 1000)),
             "remote_execute_ms": int(round((execute_finished_at - execute_started_at) * 1000)),
             "total_ms": int(round((execute_finished_at - queue_started) * 1000)),
+            "session_prepare_ms": int(phase_latency.get("session_prepare_ms") or 0),
+            "dispatch_ms": int(phase_latency.get("dispatch_ms") or 0),
+            "verification_ms": int(phase_latency.get("verification_ms") or 0),
         }
         result["latency"] = latency
         ORCHESTRATOR.record_command_latency(environment, **latency)
@@ -953,13 +957,16 @@ def run_command_job(
         )
         remote_summary_text = connector.clean_message(remote_summary_text)[:320]
         LOG.info(
-            "Comando remoto %s finalizado no worker para %s; resultado=%s, espera_fila=%ss, latência_conta=%sms, vaga_connector=%sms, execução_remota=%sms, total=%sms, tentativas=%s, despertar_real=%s, repetição_segura=%s, estratégia=%s, confirmado_direto=%s, confirmação_pendente=%s, motivo=%s, ack=%s, resultado_remoto=%s, evidencia=%s, sinal=%s, resumo=%s.",
+            "Comando remoto %s finalizado no worker para %s; resultado=%s, espera_fila=%ss, latência_conta=%sms, vaga_connector=%sms, preparo_sessao=%sms, dispatch=%sms, verificacao=%sms, execução_remota=%sms, total=%sms, tentativas=%s, despertar_real=%s, repetição_segura=%s, estratégia=%s, confirmado_direto=%s, confirmação_pendente=%s, motivo=%s, ack=%s, resultado_remoto=%s, evidencia=%s, sinal=%s, resumo=%s.",
             str(payload.get("command") or "desconhecido")[:40],
             environment,
             str(result.get("final_outcome") or ("confirmed" if result.get("verified_by_gateway") else "confirmation_pending"))[:40],
             int(result.get("queue_wait_seconds") or 0),
             int(latency.get("account_wait_ms") or 0),
             int(latency.get("connector_slot_ms") or 0),
+            int(latency.get("session_prepare_ms") or 0),
+            int(latency.get("dispatch_ms") or 0),
+            int(latency.get("verification_ms") or 0),
             int(latency.get("remote_execute_ms") or 0),
             int(latency.get("total_ms") or 0),
             int(result.get("attempts") or 1),
