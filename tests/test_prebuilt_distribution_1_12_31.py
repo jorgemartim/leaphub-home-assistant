@@ -16,12 +16,21 @@ assert headings == ["1.12.31"], headings
 assert "imagem GHCR pré-compilada" in changelog
 
 workflow = (ROOT / ".github/workflows/build.yml").read_text(encoding="utf-8")
+for action in (
+    "actions/checkout@v6",
+    "docker/setup-buildx-action@v4",
+    "docker/login-action@v4",
+    "docker/build-push-action@v7",
+):
+    assert action in workflow, action
+assert "actions/checkout@v7" not in workflow
+assert "docker/login-action@v4.4.0" not in workflow
 for marker in (
     "ghcr.io/jorgemartim/leaphub-gateway",
-    "--cache-from type=gha",
-    "--cache-to type=gha,mode=max",
-    "Smoke-test exact runtime image",
-    "Verify anonymous image access",
+    "cache-from: type=gha",
+    "cache-to: type=gha,mode=max",
+    "Verify published image while authenticated",
+    "Check anonymous GHCR access for Home Assistant",
     "docker logout",
 ):
     assert marker in workflow, marker

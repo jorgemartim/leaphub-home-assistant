@@ -32,12 +32,12 @@ for marker in (
 
 workflow = (ROOT / ".github" / "workflows" / "build.yml").read_text(encoding="utf-8")
 for marker in (
-    "docker/setup-buildx-action@v3",
-    "--cache-from type=gha",
-    "--cache-to type=gha",
-    "Smoke-test exact runtime image",
+    "docker/setup-buildx-action@v4",
+    "cache-from: type=gha",
+    "cache-to: type=gha",
+    "Verify published image while authenticated",
     "docker buildx imagetools inspect",
-    "Verify anonymous image access",
+    "Check anonymous GHCR access for Home Assistant",
 ):
     assert marker in workflow, marker
 

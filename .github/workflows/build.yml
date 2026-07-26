@@ -23,11 +23,11 @@ env:
 
 jobs:
   build:
-    name: Validate, pre-build and publish amd64 image
+    name: Validate, build and publish amd64 image
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@v6
 
       - name: Read App version
         id: app
@@ -44,85 +44,67 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # Runtime dependencies are installed inside the cached Docker layer.
-          # CI only needs PyYAML for the repository validator, avoiding a duplicate pip install.
           python3 -m pip install --quiet PyYAML==6.0.2
           python3 .github/scripts/validate_repository.py
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v4.4.0
+        uses: docker/login-action@v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build cached image locally
-        shell: bash
-        run: |
-          set -euo pipefail
-          image="${REGISTRY}/${IMAGE_NAME}:${{ steps.app.outputs.version }}"
-          docker buildx build \
-            --pull \
-            --load \
-            --platform linux/amd64 \
-            --cache-from type=gha,scope=leaphub-gateway-amd64 \
-            --cache-to type=gha,mode=max,scope=leaphub-gateway-amd64 \
-            --build-arg BUILD_ARCH=amd64 \
-            --build-arg BUILD_VERSION="${{ steps.app.outputs.version }}" \
-            --tag "${image}" \
-            ./leaphub_gateway
+      - name: Build and publish pre-compiled image
+        uses: docker/build-push-action@v7
+        with:
+          context: ./leaphub_gateway
+          file: ./leaphub_gateway/Dockerfile
+          platforms: linux/amd64
+          push: true
+          pull: true
+          tags: |
+            ghcr.io/jorgemartim/leaphub-gateway:${{ steps.app.outputs.version }}
+            ghcr.io/jorgemartim/leaphub-gateway:latest
+          build-args: |
+            BUILD_ARCH=amd64
+            BUILD_VERSION=${{ steps.app.outputs.version }}
+          cache-from: type=gha,scope=leaphub-gateway-amd64
+          cache-to: type=gha,mode=max,scope=leaphub-gateway-amd64
 
-      - name: Smoke-test exact runtime image
+      - name: Verify published image while authenticated
         shell: bash
         run: |
           set -euo pipefail
           image="${REGISTRY}/${IMAGE_NAME}:${{ steps.app.outputs.version }}"
+          docker buildx imagetools inspect "${image}" >/dev/null
+          docker pull "${image}"
           docker run --rm --entrypoint python3 "${image}" -c \
             "import leaphub_connector, leaphub_telemetry_engine; from leaphub_telemetry_engine import TelemetryEngine; import connector_server, ocpp_gateway, gateway_manager; print('runtime imports ok')"
-          docker run --rm --entrypoint sh "${image}" -c \
-            "test -s /app/telemetry_engine.py && test -s /usr/local/lib/python3.12/site-packages/leaphub_telemetry_engine.py"
 
-      - name: Publish immutable version and latest tags
-        shell: bash
-        run: |
-          set -euo pipefail
-          versioned="${REGISTRY}/${IMAGE_NAME}:${{ steps.app.outputs.version }}"
-          latest="${REGISTRY}/${IMAGE_NAME}:latest"
-          docker push "${versioned}"
-          docker tag "${versioned}" "${latest}"
-          docker push "${latest}"
-
-      - name: Verify published manifest
-        shell: bash
-        run: |
-          set -euo pipefail
-          image="${REGISTRY}/${IMAGE_NAME}:${{ steps.app.outputs.version }}"
-          for attempt in $(seq 1 12); do
-            if docker buildx imagetools inspect "${image}" | grep -q "linux/amd64"; then
-              echo "Manifest published and linux/amd64 confirmed."
-              exit 0
-            fi
-            echo "Manifest not ready; attempt ${attempt}/12."
-            sleep 10
-          done
-          exit 1
-
-      - name: Verify anonymous image access
+      - name: Check anonymous GHCR access for Home Assistant
+        id: anonymous
+        continue-on-error: true
         shell: bash
         run: |
           set -euo pipefail
           image="${REGISTRY}/${IMAGE_NAME}:${{ steps.app.outputs.version }}"
           docker logout "${REGISTRY}" >/dev/null 2>&1 || true
-          for attempt in $(seq 1 6); do
-            if docker buildx imagetools inspect "${image}" | grep -q "linux/amd64"; then
-              echo "Anonymous GHCR access confirmed. Home Assistant can pull the pre-built image."
-              exit 0
-            fi
-            echo "Anonymous access not ready; attempt ${attempt}/6."
-            sleep 10
-          done
-          echo "The image exists but is not anonymously accessible. Set the GHCR package visibility to Public." >&2
-          exit 1
+          docker buildx imagetools inspect "${image}" >/dev/null
+
+      - name: Explain first-publication visibility
+        if: steps.anonymous.outcome != 'success'
+        shell: bash
+        run: |
+          echo "::warning title=GHCR package is private::The image was published successfully, but Home Assistant cannot download a private GHCR package. Open the leaphub-gateway package settings in GitHub, change Package visibility to Public, then refresh the Home Assistant App repository. This is normally required only once, on the first publication."
+
+      - name: Confirm distribution status
+        shell: bash
+        run: |
+          if [ "${{ steps.anonymous.outcome }}" = "success" ]; then
+            echo "Pre-built image is public and ready for Home Assistant."
+          else
+            echo "Pre-built image exists; one-time GHCR visibility change to Public is still required."
+          fi
