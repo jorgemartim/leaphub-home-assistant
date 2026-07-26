@@ -28,9 +28,15 @@ O Home Assistant usa automaticamente a tag igual ao campo `version` do `config.y
 O pacote GHCR precisa ser público. O Home Assistant não deve depender de token pessoal ou credenciais do GitHub para instalar o Gateway.
 
 
-## 1.12.33 — imagem pré-compilada
+## 1.12.34 — imagem pré-compilada
 
 O App declara `image: ghcr.io/jorgemartim/leaphub-gateway`. Após o push, aguarde o workflow **Build and publish Leap Hub Gateway** ficar verde. O último passo valida acesso anônimo à tag exata; isso evita anunciar uma atualização que o Home Assistant ainda não consegue baixar. Na primeira publicação do pacote GHCR pode ser necessário tornar o pacote público uma única vez e reexecutar o workflow.
 
 
-> Importante: só atualize o App no Home Assistant depois que o workflow de build da versão 1.12.33 estiver verde.
+> Importante: só atualize o App no Home Assistant depois que o workflow de build da versão 1.12.34 estiver verde.
+
+## Regra de publicação desde 1.12.34
+
+O upload de uma nova versão precisa incluir a pasta `.github`. Publicar apenas `leaphub_gateway/` pode deixar um workflow antigo ativo.
+
+A versão só deve ser instalada no Home Assistant depois que o workflow **Build and publish Leap Hub Gateway** concluir o build e o smoke test da tag exata no GHCR. O check anônimo pode levar alguns segundos adicionais de propagação.

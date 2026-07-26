@@ -145,6 +145,7 @@ for test_file in (
     ROOT / "tests" / "test_fast_install_1_12_18.py",
     ROOT / "tests" / "test_background_telemetry_1_12_19.py",
     ROOT / "tests" / "test_prebuilt_distribution_1_12_31.py",
+    ROOT / "tests" / "test_prebuilt_distribution_1_12_34.py",
 ):
     subprocess.run([sys.executable, str(test_file)], cwd=ROOT, check=True)
 

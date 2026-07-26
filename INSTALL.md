@@ -21,9 +21,9 @@ O pacote `leaphub-gateway` precisa estar **Public** no GitHub Packages para o Ho
 O Dockerfile continua no repositório para desenvolvimento ou recuperação controlada. Não remova `image:` da versão normal apenas para contornar uma falha de publicação; primeiro corrija a imagem/tag no GHCR para evitar que instalações diferentes usem builds diferentes.
 
 
-## 1.12.33 — imagem pré-compilada
+## 1.12.34 — imagem pré-compilada
 
 O App declara `image: ghcr.io/jorgemartim/leaphub-gateway`. Após o push, aguarde o workflow **Build and publish Leap Hub Gateway** ficar verde. O último passo valida acesso anônimo à tag exata; isso evita anunciar uma atualização que o Home Assistant ainda não consegue baixar. Na primeira publicação do pacote GHCR pode ser necessário tornar o pacote público uma única vez e reexecutar o workflow.
 
 
-> Importante: só atualize o App no Home Assistant depois que o workflow de build da versão 1.12.33 estiver verde.
+> Importante: só atualize o App no Home Assistant depois que o workflow de build da versão 1.12.34 estiver verde.

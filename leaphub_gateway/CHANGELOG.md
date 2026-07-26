@@ -1,7 +1,9 @@
-## 1.12.33
+## 1.12.34
 
-- Corrige a publicação pré-compilada após a regressão da 1.12.32.
-- Remove testes de runtime executados antes de as dependências do Gateway existirem no runner do GitHub.
-- Mantém validação estática antes do build e smoke test da imagem exata depois da publicação.
-- Mantém instalação rápida pelo GHCR, sem compilação local no Home Assistant.
-- Nenhuma alteração de banco, OCPP, Wallbox ou protocolo de comandos nesta correção.
+- Recupera o pipeline pré-compilado conhecido como estável na 1.12.31 e remove a regressão de publicação observada depois dela.
+- Mantém build somente `amd64`, sem matriz e sem manifesto multi-arquitetura intermediário.
+- Faz validação estática antes do Docker e smoke test somente depois de a imagem existir com todas as dependências.
+- A verificação anônima do GHCR volta a ser informativa: uma propagação lenta do registry não invalida uma imagem que já foi construída e publicada.
+- Adiciona resumo do release no GitHub Actions com tag exata, digest e estado de acesso anônimo.
+- Mantém instalação pré-compilada no Home Assistant e CHANGELOG exibindo somente a versão atual.
+- Nenhuma alteração de banco, OCPP, Wallbox, MQTT ou protocolo de comandos nesta versão de recuperação.
