@@ -42,7 +42,7 @@ except ImportError:
         _privacy_spec.loader.exec_module(_privacy_module)
         sanitize_log = _privacy_module.sanitize_log
 
-CONNECTOR_VERSION = "1.12.27"
+CONNECTOR_VERSION = "1.12.28"
 MAX_INPUT_BYTES = 1024 * 1024
 logging.getLogger("leapmotor_api").setLevel(logging.WARNING)
 LOGGER = logging.getLogger("leaphub.connector")
@@ -1639,7 +1639,13 @@ def _validate_picture_zip(raw: bytes) -> None:
                 raise ValueError("Pacote oficial de imagens descompactado excede o limite.")
 
 
-def _official_picture_package(client: Any, vehicle: Any, remote_id: str, force_refresh: bool = False) -> tuple[Any, str, Path] | None:
+def _official_picture_package(
+    client: Any,
+    vehicle: Any,
+    remote_id: str,
+    force_refresh: bool = False,
+    manual_should_yield: Callable[[], bool] | None = None,
+) -> tuple[Any, str, Path] | None:
     cache_key = hashlib.sha256(remote_id.encode("utf-8", "ignore")).hexdigest()
     cached = _IMAGE_PACKAGE_CACHE.get(cache_key)
     now = time.time()
@@ -1663,11 +1669,24 @@ def _official_picture_package(client: Any, vehicle: Any, remote_id: str, force_r
     picture_key: str | None = None
     raw: bytes | None = None
     should_refresh = force_refresh or not package_file.is_file() or now - package_file.stat().st_mtime > 24 * 3600
+    # 1.12.28 — imagem oficial é trabalho secundário. Se um comando manual
+    # chegou depois de a leitura de status começar, não abra uma nova chamada
+    # de rede para metadados/imagem: use o cache existente e libere a conta.
+    try:
+        manual_pending = bool(manual_should_yield and manual_should_yield())
+    except Exception:
+        manual_pending = False
+    if manual_pending:
+        should_refresh = False
     if should_refresh:
         try:
             metadata = client.get_car_picture(vehicle)
             picture_key = _picture_key(metadata)
-            if picture_key:
+            try:
+                manual_pending = bool(manual_should_yield and manual_should_yield())
+            except Exception:
+                manual_pending = False
+            if picture_key and not manual_pending:
                 raw = client.download_car_picture_package(picture_key=picture_key)
                 _validate_picture_zip(raw)
                 temporary = package_file.with_suffix(f".tmp-{os.getpid()}")
@@ -1742,8 +1761,15 @@ def official_visual_image_payload(
     force_visual_bytes: bool = False,
     force_debug_package: bool = False,
     force_package_refresh: bool = False,
+    manual_should_yield: Callable[[], bool] | None = None,
 ) -> dict[str, Any] | None:
-    resolved = _official_picture_package(client, vehicle, remote_id, force_refresh=force_package_refresh)
+    resolved = _official_picture_package(
+        client,
+        vehicle,
+        remote_id,
+        force_refresh=force_package_refresh,
+        manual_should_yield=manual_should_yield,
+    )
     if resolved is None:
         return None
     package, picture_key_hash, package_file = resolved
@@ -1831,6 +1857,7 @@ def serialize_vehicle(
     force_visual_bytes: bool = False,
     force_debug_package: bool = False,
     force_package_refresh: bool = False,
+    manual_should_yield: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     vin = str(attribute(vehicle, "vin", "") or "").strip()
     remote_id = str(attribute(vehicle, "car_id", "") or vin).strip()
@@ -2354,21 +2381,33 @@ def serialize_vehicle(
         }),
         "mapping_version": "1.11.75",
     }
-    official_image = official_visual_image_payload(
-        client,
-        vehicle,
-        status,
-        remote_id or vin,
-        visual_fingerprint_value,
-        visual_signature,
-        visual_primary_state,
-        visual_components,
-        charging_evidence_data,
-        captured_at,
-        force_visual_bytes=force_visual_bytes,
-        force_debug_package=force_debug_package,
-        force_package_refresh=force_package_refresh,
-    )
+    # 1.12.28 — o status do veículo é a parte essencial da telemetria.
+    # Metadados/pacote de imagem são secundários e não podem manter a conta
+    # ocupada quando um comando manual já está aguardando.
+    try:
+        defer_secondary_network = bool(manual_should_yield and manual_should_yield())
+    except Exception:
+        defer_secondary_network = False
+    if defer_secondary_network:
+        connector_log(logging.DEBUG, "Telemetria adiou imagem oficial para liberar a conta a um comando manual.")
+        official_image = None
+    else:
+        official_image = official_visual_image_payload(
+            client,
+            vehicle,
+            status,
+            remote_id or vin,
+            visual_fingerprint_value,
+            visual_signature,
+            visual_primary_state,
+            visual_components,
+            charging_evidence_data,
+            captured_at,
+            force_visual_bytes=force_visual_bytes,
+            force_debug_package=force_debug_package,
+            force_package_refresh=force_package_refresh,
+            manual_should_yield=manual_should_yield,
+        )
     if official_image is not None:
         # visual_image sem data_base64 funciona como heartbeat de metadados; o
         # site mantém o último arquivo oficial persistido.

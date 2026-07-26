@@ -24,7 +24,7 @@ from cryptography.fernet import Fernet, InvalidToken
 import leaphub_connector as connector
 
 LOG = logging.getLogger("leaphub.telemetry")
-ENGINE_VERSION = "1.12.27"
+ENGINE_VERSION = "1.12.28"
 
 
 def utc_iso() -> str:
@@ -2150,6 +2150,7 @@ class TelemetryEngine:
                         client=client,
                         messages=messages,
                         allow_unscoped_messages=len(selected) == 1,
+                        manual_should_yield=manual_should_yield,
                     )
                 )
             if not serialized:

@@ -1,3 +1,8 @@
+## 1.12.28
+
+- Comandos manuais passam a cortar trabalho secundário de imagem da telemetria assim que a leitura essencial de status termina.
+- Mantém requisições já em voo intactas e não adiciona retry físico.
+
 ## 1.12.27
 
 - adiciona diagnóstico allow-list do retorno da biblioteca para comandos Sentinela, sem serializar tokens, PIN, VIN ou identificadores opacos;
