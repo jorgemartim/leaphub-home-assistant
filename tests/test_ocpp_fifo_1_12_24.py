@@ -36,7 +36,7 @@ def insert_event(gateway, target_name: str, identity: str, message_id: str, acti
 
 def test_strict_fifo_blocks_overtake_but_not_other_wallboxes(tmp_path: Path) -> None:
     gateway = load_gateway(tmp_path)
-    assert gateway.GATEWAY_VERSION == "1.12.25"
+    assert gateway.GATEWAY_VERSION == "1.12.26"
 
     target = gateway.ApiTarget("staging", "https://example.invalid/internal/ocpp", "secret")
     gateway.TARGETS_BY_NAME = {"staging": target}

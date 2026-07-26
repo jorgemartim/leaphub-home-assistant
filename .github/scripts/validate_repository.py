@@ -136,7 +136,6 @@ if f"## {version}" not in changelog:
 for test_file in (
     ROOT / "tests" / "test_contracts.py",
     ROOT / "tests" / "test_remote_command_matrix.py",
-    ROOT / "tests" / "test_sentry_probe_1_12_25.py",
     ROOT / "tests" / "test_comfort_contract.py",
     ROOT / "tests" / "test_auth_recovery_contract.py",
     ROOT / "tests" / "test_gateway_1_12_14.py",

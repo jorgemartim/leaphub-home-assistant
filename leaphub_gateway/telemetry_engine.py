@@ -24,7 +24,7 @@ from cryptography.fernet import Fernet, InvalidToken
 import leaphub_connector as connector
 
 LOG = logging.getLogger("leaphub.telemetry")
-ENGINE_VERSION = "1.12.25"
+ENGINE_VERSION = "1.12.26"
 
 
 def utc_iso() -> str:
@@ -2398,6 +2398,11 @@ class TelemetryEngine:
             if not known:
                 return False, False
             return (any(known) if command == "windows_open" else not any(known), True)
+        if command in {"sentry_on", "sentry_off"}:
+            security = telemetry.get("security") if isinstance(telemetry.get("security"), dict) else {}
+            state = self._command_bool(security.get("sentry_mode", telemetry.get("sentry_mode")))
+            expected = command == "sentry_on"
+            return (state is expected, state is not None)
         if command in {"start_charging", "stop_charging"}:
             charging = str(telemetry.get("charging_status") or "").strip().lower()
             try:

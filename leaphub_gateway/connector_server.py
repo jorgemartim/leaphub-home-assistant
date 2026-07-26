@@ -37,7 +37,7 @@ try:
 except ModuleNotFoundError:
     from privacy import install_logging_privacy_filter
 
-VERSION = "1.12.25"
+VERSION = "1.12.26"
 API_VERSION = 2
 CAPABILITY_SCHEMA_VERSION = 1
 MIN_SUPPORTED_CLIENT_API_VERSION = 1
@@ -901,7 +901,7 @@ def run_command_job(
         # abrir/fechar ou travar/destravar em sequência aguardava até 31s.
         defer_seconds = MANUAL_SETTLE_SECONDS
         LOG.info(
-            "Comando remoto %s finalizado no worker para %s; resultado=%s, espera_fila=%ss, tentativas=%s, despertar_real=%s, repetição_segura=%s, estratégia=%s, confirmado_direto=%s, confirmação_pendente=%s.",
+            "Comando remoto %s finalizado no worker para %s; resultado=%s, espera_fila=%ss, tentativas=%s, despertar_real=%s, repetição_segura=%s, estratégia=%s, confirmado_direto=%s, confirmação_pendente=%s, motivo=%s, ack=%s, resultado_remoto=%s.",
             str(payload.get("command") or "desconhecido")[:40],
             environment,
             str(result.get("final_outcome") or ("confirmed" if result.get("verified_by_gateway") else "confirmation_pending"))[:40],
@@ -912,6 +912,9 @@ def run_command_job(
             str(result.get("safe_retry_strategy") or "none")[:48],
             bool(result.get("verified_by_gateway")),
             bool(result.get("confirmation_pending")),
+            str(result.get("confirmation_reason") or "none")[:48],
+            str(result.get("dispatch_ack") or "unknown")[:48],
+            str(result.get("remote_result_status") or "unknown")[:48],
         )
         if bool(result.get("session_recovered")):
             LOG.info("Comando %s exigiu uma nova sessão após cert/sync recusar o token anterior.", request_id[:12])
