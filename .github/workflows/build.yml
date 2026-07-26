@@ -25,6 +25,7 @@ jobs:
   build:
     name: Validate, build and publish amd64 image
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
@@ -39,6 +40,7 @@ jobs:
           test -n "${version}"
           test "${image}" = "ghcr.io/jorgemartim/leaphub-gateway"
           echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "image=${image}:${version}" >> "${GITHUB_OUTPUT}"
 
       - name: Validate repository
         shell: bash
@@ -46,6 +48,14 @@ jobs:
           set -euo pipefail
           python3 -m pip install --quiet PyYAML==6.0.2
           python3 .github/scripts/validate_repository.py
+
+      - name: Run source contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet pytest==9.0.2 PyYAML==6.0.2
+          pytest -q tests
+          pytest -q leaphub_gateway/tests
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
@@ -64,7 +74,6 @@ jobs:
           file: ./leaphub_gateway/Dockerfile
           platforms: linux/amd64
           push: true
-          pull: true
           tags: |
             ghcr.io/jorgemartim/leaphub-gateway:${{ steps.app.outputs.version }}
             ghcr.io/jorgemartim/leaphub-gateway:latest
@@ -73,38 +82,31 @@ jobs:
             BUILD_VERSION=${{ steps.app.outputs.version }}
           cache-from: type=gha,scope=leaphub-gateway-amd64
           cache-to: type=gha,mode=max,scope=leaphub-gateway-amd64
+          provenance: false
 
-      - name: Verify published image while authenticated
+      - name: Smoke test exact published image
         shell: bash
         run: |
           set -euo pipefail
-          image="${REGISTRY}/${IMAGE_NAME}:${{ steps.app.outputs.version }}"
+          image="${{ steps.app.outputs.image }}"
           docker buildx imagetools inspect "${image}" >/dev/null
           docker pull "${image}"
           docker run --rm --entrypoint python3 "${image}" -c \
-            "import leaphub_connector, leaphub_telemetry_engine; from leaphub_telemetry_engine import TelemetryEngine; import connector_server, ocpp_gateway, gateway_manager; print('runtime imports ok')"
+            "import leaphub_connector, leaphub_telemetry_engine, leaphub_connection_orchestrator, leaphub_event_transport; import connector_server, ocpp_gateway, gateway_manager; print('runtime imports ok')"
 
-      - name: Check anonymous GHCR access for Home Assistant
-        id: anonymous
-        continue-on-error: true
+      - name: Verify anonymous image access for Home Assistant
         shell: bash
         run: |
           set -euo pipefail
-          image="${REGISTRY}/${IMAGE_NAME}:${{ steps.app.outputs.version }}"
+          image="${{ steps.app.outputs.image }}"
           docker logout "${REGISTRY}" >/dev/null 2>&1 || true
-          docker buildx imagetools inspect "${image}" >/dev/null
-
-      - name: Explain first-publication visibility
-        if: steps.anonymous.outcome != 'success'
-        shell: bash
-        run: |
-          echo "::warning title=GHCR package is private::The image was published successfully, but Home Assistant cannot download a private GHCR package. Open the leaphub-gateway package settings in GitHub, change Package visibility to Public, then refresh the Home Assistant App repository. This is normally required only once, on the first publication."
-
-      - name: Confirm distribution status
-        shell: bash
-        run: |
-          if [ "${{ steps.anonymous.outcome }}" = "success" ]; then
-            echo "Pre-built image is public and ready for Home Assistant."
-          else
-            echo "Pre-built image exists; one-time GHCR visibility change to Public is still required."
-          fi
+          for attempt in 1 2 3 4 5 6; do
+            if docker buildx imagetools inspect "${image}" >/dev/null 2>&1; then
+              echo "GHCR image is public and ready for Home Assistant: ${image}"
+              exit 0
+            fi
+            echo "Anonymous manifest check ${attempt}/6 failed; waiting for registry propagation..."
+            sleep 10
+          done
+          echo "::error title=GHCR package is not public::The image was built and pushed, but Home Assistant cannot pull it anonymously. On the first publication, open GitHub Packages > leaphub-gateway > Package settings, set visibility to Public, then rerun this workflow. Do not update the Home Assistant App until this workflow is green."
+          exit 1

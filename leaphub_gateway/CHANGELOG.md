@@ -1,7 +1,7 @@
-## 1.12.31
+## 1.12.32
 
-- Atualização rápida no Home Assistant por imagem GHCR pré-compilada; o Supervisor deixa de compilar Python e dependências localmente nas atualizações normais.
-- `config.yaml` passa a apontar explicitamente para `ghcr.io/jorgemartim/leaphub-gateway`, com a tag controlada pela própria versão do App.
-- Release enxuto: o Home Assistant exibe somente as mudanças da versão que está sendo instalada.
-- Publicação no GitHub usa cache de camadas, smoke test da imagem exata e verificação de acesso anônimo ao manifesto antes de considerar a publicação pronta.
-- Sem mudança funcional em Connector Leapmotor, telemetria, OCPP, Wallbox ou transporte de eventos.
+- Publicação pré-compilada do Home Assistant endurecida: o workflow só fica verde quando a tag exata do GHCR também puder ser consultada sem autenticação pelo Supervisor.
+- Bootstrap do GitHub preparado para repositórios antigos: o pacote de recuperação traz todos os módulos atuais antes de anunciar a nova versão.
+- O release exibido pelo Home Assistant continua contendo somente as informações da versão atual.
+- Buildx mantém cache por arquitetura e faz smoke test da imagem exata antes da liberação.
+- Sem alteração funcional em Connector Leapmotor, telemetria, OCPP, Wallbox, comandos remotos ou transporte de eventos.
