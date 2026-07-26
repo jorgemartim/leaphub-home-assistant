@@ -42,7 +42,7 @@ except ImportError:
         _privacy_spec.loader.exec_module(_privacy_module)
         sanitize_log = _privacy_module.sanitize_log
 
-CONNECTOR_VERSION = "1.12.36"
+CONNECTOR_VERSION = "1.12.37"
 MAX_INPUT_BYTES = 1024 * 1024
 logging.getLogger("leapmotor_api").setLevel(logging.WARNING)
 LOGGER = logging.getLogger("leaphub.connector")
@@ -398,21 +398,27 @@ def is_authentication_error(value: Any) -> bool:
 
 
 def is_command_certificate_session_error(value: Any) -> bool:
-    """True only when certificate preparation failed before command dispatch.
+    """True only for an expired session rejected *before* command dispatch.
 
-    This narrow classifier is intentionally stricter than the generic token
-    markers: retrying is safe here because the cloud rejected cert/sync before
-    the vehicle action was submitted.
+    leapmotor-api may fail either while synchronizing the command certificate or
+    during its protected remote-verification step. Both happen before /remote/ctl
+    is allowed to submit the vehicle action, so one clean-session retry is safe.
+    Result-poll token failures are deliberately excluded because the action may
+    already have been accepted by the cloud.
     """
     message = clean_message(str(value)).lower()
-    certificate_stage = any(marker in message for marker in (
+    pre_dispatch_stage = any(marker in message for marker in (
         'cert sync failed', 'certificate sync failed', 'failed to issue certificate',
         'could not issue certificate', 'certificate issuance failed',
+        'remote verify failed', 'remote verification failed',
     ))
     invalid_session = any(marker in message for marker in (
         'token is invalid', 'invalid token', 'token expired', 'session expired', 'login expired',
     ))
-    return certificate_stage and invalid_session
+    post_dispatch_result = any(marker in message for marker in (
+        'remote control result failed', 'timed out waiting for remote control result',
+    ))
+    return pre_dispatch_stage and invalid_session and not post_dispatch_result
 
 
 def reconnect_message(value: Any) -> str:

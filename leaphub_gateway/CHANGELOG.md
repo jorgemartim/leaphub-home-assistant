@@ -1,7 +1,5 @@
-## 1.12.36
+## 1.12.37
 
-- Comandos passam a medir separadamente espera da conta, vaga do Connector, preparo/reuso de sessão, dispatch/result e verificação, permitindo identificar o gargalo real sem registrar credenciais ou VIN.
-- Connection Orchestrator expõe o gargalo p95 dominante por ambiente para orientar otimizações futuras com dados reais.
-- Event Transport coalesce wake-ups equivalentes por conta/veículo em uma janela de 1,5 s, reduzindo leituras redundantes sem aumentar polling e sem descartar o evento original.
-- Confirmação rápida, prioridade manual, REST autenticado e fallback atuais foram preservados; MQTT Leapmotor segue desativado até homologação legítima.
-- Distribuição pré-compilada via GHCR permanece inalterada em relação à 1.12.35.
+- Corrige recuperação de sessão quando a Leapmotor responde `remote verify failed: Token is invalid` antes de qualquer ação chegar ao veículo.
+- A sessão compartilhada inválida é descartada e o mesmo comando recebe no máximo uma nova autenticação limpa antes do envio; falhas de token após aceite/resultado remoto continuam sem reenvio físico.
+- Mantém prioridade manual, telemetria FAST/SLOW, Event Transport, OCPP e distribuição pré-compilada GHCR inalterados.

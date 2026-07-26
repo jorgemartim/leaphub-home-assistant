@@ -52,7 +52,7 @@ except ModuleNotFoundError:
         EVENT_TRANSPORT = _event_transport_module.EVENT_TRANSPORT
 
 LOG = logging.getLogger("leaphub.telemetry")
-ENGINE_VERSION = "1.12.36"
+ENGINE_VERSION = "1.12.37"
 
 
 def utc_iso() -> str:
@@ -200,14 +200,14 @@ class TelemetryEngine:
         self.session_idle_seconds = self._bounded("telemetry_session_idle_seconds", 21600, 1800, 86400)
         self.vehicle_list_cache_seconds = self._bounded("telemetry_vehicle_list_cache_seconds", 1800, 300, 7200)
         self.message_cache_seconds = self._bounded("telemetry_message_cache_seconds", 1800, 300, 14400)
-        # 1.12.36 — o estado essencial é FAST; mensagens/imagem oficial são SLOW.
+        # 1.12.37 — o estado essencial é FAST; mensagens/imagem oficial são SLOW.
         # Não adicionamos uma opção obrigatória ao schema do add-on para manter
         # atualização compatível com instalações antigas.
         self.slow_interval_seconds = max(600, min(1800, self.message_cache_seconds))
         self.request_timeout_seconds = self._bounded("telemetry_request_timeout_seconds", 15, 10, 30)
         self._init_db()
         self.storage_healthy = True
-        # 1.12.36 — a telemetria já aceita hints de um futuro transporte por
+        # 1.12.37 — a telemetria já aceita hints de um futuro transporte por
         # eventos. O REST continua como fallback e nenhuma conexão MQTT é aberta
         # enquanto autenticação/tópicos/payloads não estiverem homologados.
         EVENT_TRANSPORT.register_wake_callback(self._wake_from_event)
@@ -1053,12 +1053,12 @@ class TelemetryEngine:
             except Exception as exc:
                 session["last_used_at"] = time.time()
                 if connector.is_command_certificate_session_error(exc):
-                    # cert/sync recusou o token antes da ação chegar ao veículo.
-                    # A sessão compartilhada é descartada e o mesmo comando é
-                    # tentado uma única vez em uma autenticação limpa. Outros
-                    # erros de token, especialmente após aceite, nunca entram aqui.
+                    # Cert/sync ou a verificação remota pré-envio recusaram o token
+                    # antes de qualquer ação chegar ao veículo. A sessão compartilhada
+                    # é descartada e o mesmo comando é tentado uma única vez em uma
+                    # autenticação limpa. Erros de token após aceite nunca entram aqui.
                     LOG.warning(
-                        "Sessão de %s expirou durante cert/sync; recriando uma única vez antes do envio.",
+                        "Sessão de %s expirou na verificação pré-envio; recriando uma única vez antes da ação.",
                         subscription_id,
                     )
                     self._close_session_locked(subscription_id)
@@ -1746,7 +1746,7 @@ class TelemetryEngine:
 
         environment = str(subscription["environment"])
         account_id = int(subscription["account_id"] or 0)
-        # 1.12.36 — circuit breaker global: durante uma oscilação confirmada
+        # 1.12.37 — circuit breaker global: durante uma oscilação confirmada
         # da nuvem, telemetria de fundo é reduzida para uma sonda moderada por
         # ambiente. Janelas interativas/comando continuam elegíveis.
         if not fast_mode and ORCHESTRATOR.is_degraded(environment) and not ORCHESTRATOR.claim_background_probe(environment):

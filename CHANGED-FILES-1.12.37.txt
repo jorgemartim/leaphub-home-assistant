@@ -1,12 +1,9 @@
-GITHUB-RECOVERY-1.12.35.md
-GITHUB-RECOVERY-SHA256SUMS.txt
-RELEASE-1.12.35.md
-SOURCE-SHA256SUMS.txt
-UPLOAD-1.12.35.md
+GITHUB-RECOVERY-1.12.37.md
+RELEASE-1.12.37.md
+UPLOAD-1.12.37.md
 leaphub_gateway/CHANGELOG.md
-leaphub_gateway/RELEASE-1.12.35.md
+leaphub_gateway/RELEASE-1.12.37.md
 leaphub_gateway/config.yaml
-leaphub_gateway/connection_orchestrator.py
 leaphub_gateway/connector.py
 leaphub_gateway/connector_server.py
 leaphub_gateway/gateway_manager.py
@@ -24,6 +21,7 @@ tests/test_full_resilience_1_12_16.py
 tests/test_manual_command_priority_1_12_23.py
 tests/test_manual_preemption_1_12_28.py
 tests/test_ocpp_fifo_1_12_24.py
+tests/test_pre_dispatch_token_recovery_1_12_37.py
 tests/test_prebuilt_distribution_1_12_31.py
 tests/test_prebuilt_distribution_1_12_32.py
 tests/test_prebuilt_distribution_1_12_33.py
