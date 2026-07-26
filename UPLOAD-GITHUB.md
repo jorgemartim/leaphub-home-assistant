@@ -21,6 +21,9 @@ ghcr.io/jorgemartim/leaphub-gateway:1.12.18
 ```
 
 
-## 1.12.32 — imagem pré-compilada
+## 1.12.33 — imagem pré-compilada
 
 O App declara `image: ghcr.io/jorgemartim/leaphub-gateway`. Após o push, aguarde o workflow **Build and publish Leap Hub Gateway** ficar verde. O último passo valida acesso anônimo à tag exata; isso evita anunciar uma atualização que o Home Assistant ainda não consegue baixar. Na primeira publicação do pacote GHCR pode ser necessário tornar o pacote público uma única vez e reexecutar o workflow.
+
+
+> Importante: só atualize o App no Home Assistant depois que o workflow de build da versão 1.12.33 estiver verde.

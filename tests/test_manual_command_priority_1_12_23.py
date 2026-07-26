@@ -10,7 +10,7 @@ CONFIG = (ROOT / "leaphub_gateway" / "config.yaml").read_text(encoding="utf-8")
 
 
 def test_manual_settle_window_is_bounded_and_configured() -> None:
-    assert 'VERSION = "1.12.32"' in SERVER
+    assert 'VERSION = "1.12.33"' in SERVER
     assert 'OPTIONS.get("connector_manual_settle_seconds") or 20' in SERVER
     assert "MANUAL_SETTLE_SECONDS = max(8, min(45," in SERVER
     assert "defer_seconds = MANUAL_SETTLE_SECONDS" in SERVER
