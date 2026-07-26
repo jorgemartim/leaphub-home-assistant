@@ -52,7 +52,7 @@ except ModuleNotFoundError:
         EVENT_TRANSPORT = _event_transport_module.EVENT_TRANSPORT
 
 LOG = logging.getLogger("leaphub.telemetry")
-ENGINE_VERSION = "1.12.34"
+ENGINE_VERSION = "1.12.35"
 
 
 def utc_iso() -> str:
@@ -108,6 +108,7 @@ class TelemetryEngine:
         account_lock_provider: Callable[[str, dict[str, Any]], Any] | None = None,
         account_wait_seconds: int = 20,
         manual_pending_provider: Callable[[str, dict[str, Any]], bool] | None = None,
+        manual_active_provider: Callable[[str, dict[str, Any]], bool] | None = None,
     ) -> None:
         self.options = options
         self.secrets = secrets
@@ -115,6 +116,10 @@ class TelemetryEngine:
         self.account_lock_provider = account_lock_provider
         self.account_wait_seconds = max(2, min(60, int(account_wait_seconds)))
         self.manual_pending_provider = manual_pending_provider
+        # A confirmação de um comando pode ignorar apenas a janela de "settle"
+        # deixada para uma possível ação seguinte. Um comando realmente pendente
+        # continua tendo prioridade e faz a coleta ceder no próximo ponto seguro.
+        self.manual_active_provider = manual_active_provider or manual_pending_provider
         self.data_dir = Path(os.getenv("LEAPHUB_TELEMETRY_DIR", "/data/telemetry"))
         self.db_path = self.data_dir / "telemetry.sqlite"
         self.key_path = self.data_dir / "telemetry.key"
@@ -195,25 +200,36 @@ class TelemetryEngine:
         self.session_idle_seconds = self._bounded("telemetry_session_idle_seconds", 21600, 1800, 86400)
         self.vehicle_list_cache_seconds = self._bounded("telemetry_vehicle_list_cache_seconds", 1800, 300, 7200)
         self.message_cache_seconds = self._bounded("telemetry_message_cache_seconds", 1800, 300, 14400)
-        # 1.12.34 — o estado essencial é FAST; mensagens/imagem oficial são SLOW.
+        # 1.12.35 — o estado essencial é FAST; mensagens/imagem oficial são SLOW.
         # Não adicionamos uma opção obrigatória ao schema do add-on para manter
         # atualização compatível com instalações antigas.
         self.slow_interval_seconds = max(600, min(1800, self.message_cache_seconds))
         self.request_timeout_seconds = self._bounded("telemetry_request_timeout_seconds", 15, 10, 30)
         self._init_db()
         self.storage_healthy = True
-        # 1.12.34 — a telemetria já aceita hints de um futuro transporte por
+        # 1.12.35 — a telemetria já aceita hints de um futuro transporte por
         # eventos. O REST continua como fallback e nenhuma conexão MQTT é aberta
         # enquanto autenticação/tópicos/payloads não estiverem homologados.
         EVENT_TRANSPORT.register_wake_callback(self._wake_from_event)
 
     def _wake_from_event(self, environment: str, account_id: int, vehicle_id: str, source: str) -> bool:
         now = time.time()
+        target_vehicle = str(vehicle_id or "").strip()[:190]
         with self.lock, self._db() as db:
-            rows = db.execute(
-                "SELECT subscription_id,active_until,next_run_at FROM subscriptions WHERE environment=? AND account_id=? AND enabled=1 AND auth_required=0",
+            candidates = db.execute(
+                "SELECT subscription_id,active_until,next_run_at,vehicle_ids_json FROM subscriptions WHERE environment=? AND account_id=? AND enabled=1 AND auth_required=0",
                 (str(environment or ""), int(account_id)),
             ).fetchall()
+            rows = []
+            for row in candidates:
+                if target_vehicle:
+                    try:
+                        configured = {str(item).strip() for item in json.loads(str(row["vehicle_ids_json"] or "[]"))}
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        configured = set()
+                    if target_vehicle not in configured:
+                        continue
+                rows.append(row)
             for row in rows:
                 active_until = max(float(row["active_until"] or 0), now + 90)
                 next_run = min(float(row["next_run_at"] or now), now)
@@ -233,6 +249,12 @@ class TelemetryEngine:
         except (TypeError, ValueError):
             value = default
         return max(minimum, min(maximum, value))
+
+    def _manual_operation_blocks(
+        self, environment: str, operation_payload: dict[str, Any], *, command_mode: bool
+    ) -> bool:
+        provider = self.manual_active_provider if command_mode else self.manual_pending_provider
+        return bool(provider and provider(environment, operation_payload))
 
     def _prepare_storage(self, probe: bool = False) -> None:
         """Garante que a fila persistente continue gravável após atualização/reinício."""
@@ -1724,7 +1746,7 @@ class TelemetryEngine:
 
         environment = str(subscription["environment"])
         account_id = int(subscription["account_id"] or 0)
-        # 1.12.34 — circuit breaker global: durante uma oscilação confirmada
+        # 1.12.35 — circuit breaker global: durante uma oscilação confirmada
         # da nuvem, telemetria de fundo é reduzida para uma sonda moderada por
         # ambiente. Janelas interativas/comando continuam elegíveis.
         if not fast_mode and ORCHESTRATOR.is_degraded(environment) and not ORCHESTRATOR.claim_background_probe(environment):
@@ -1790,7 +1812,7 @@ class TelemetryEngine:
                     failed=False,
                 )
                 return
-        if self.manual_pending_provider is not None and self.manual_pending_provider(environment, operation_payload):
+        if self._manual_operation_blocks(environment, operation_payload, command_mode=command_mode):
             credentials.clear()
             self._reschedule(sid, 2, "waiting", "Comando do usuário tem prioridade sobre a telemetria automática.", failed=False)
             return
@@ -1801,7 +1823,7 @@ class TelemetryEngine:
             self._reschedule(sid, 30, "waiting", "Aguardando vaga no Connector.", failed=False)
             return
 
-        if self.manual_pending_provider is not None and self.manual_pending_provider(environment, operation_payload):
+        if self._manual_operation_blocks(environment, operation_payload, command_mode=command_mode):
             self.operation_semaphore.release()
             credentials.clear()
             self._reschedule(sid, 2, "waiting", "Comando do usuário aguardando execução; telemetria cedendo a conexão.", failed=False)
@@ -1823,11 +1845,13 @@ class TelemetryEngine:
                     failed=False,
                 )
                 return
+        manual_provider = self.manual_active_provider if command_mode else self.manual_pending_provider
         manual_should_yield = (
-            (lambda: bool(self.manual_pending_provider and self.manual_pending_provider(environment, operation_payload)))
-            if self.manual_pending_provider is not None
+            (lambda: bool(manual_provider and manual_provider(environment, operation_payload)))
+            if manual_provider is not None
             else None
         )
+        collection_started_at = time.monotonic()
         try:
             result = self._collect_with_session(
                 sid,
@@ -1839,10 +1863,22 @@ class TelemetryEngine:
                 manual_should_yield=manual_should_yield,
             )
         except TelemetryYieldForManual:
+            ORCHESTRATOR.record_telemetry_cycle(
+                environment,
+                profile="confirmation" if command_mode else ("interactive" if interactive else "background"),
+                duration_ms=(time.monotonic() - collection_started_at) * 1000.0,
+                outcome="manual_yield",
+            )
             self._reschedule(sid, 2, "waiting", "Telemetria cedeu a conta para o comando do usuário.", failed=False)
             LOG.info("Telemetria de %s interrompida em ponto seguro para priorizar comando manual.", sid)
             return
         except Exception as exc:  # noqa: BLE001
+            ORCHESTRATOR.record_telemetry_cycle(
+                environment,
+                profile="confirmation" if command_mode else ("interactive" if interactive else "background"),
+                duration_ms=(time.monotonic() - collection_started_at) * 1000.0,
+                outcome="failure",
+            )
             message = connector.clean_message(str(exc))
             failures = int(subscription["consecutive_failures"] or 0) + 1
             transient = connector.is_transient_cloud_error(exc) or isinstance(exc, connector.ConnectorTemporaryError)
@@ -1911,6 +1947,13 @@ class TelemetryEngine:
             self.operation_semaphore.release()
             credentials.clear()
 
+        collection_profile = str(result.get("collection_profile") or ("confirmation" if command_mode else "fast"))
+        ORCHESTRATOR.record_telemetry_cycle(
+            environment,
+            profile="confirmation" if command_mode else collection_profile,
+            duration_ms=(time.monotonic() - collection_started_at) * 1000.0,
+            outcome="success",
+        )
         ORCHESTRATOR.record_cloud_success(environment)
         vehicles = [item for item in (result.get("vehicles") or []) if isinstance(item, dict)]
         if vehicle_ids:

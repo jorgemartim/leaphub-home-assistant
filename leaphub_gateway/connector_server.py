@@ -65,7 +65,7 @@ except ModuleNotFoundError:
         _event_transport_spec.loader.exec_module(_event_transport_module)
         EVENT_TRANSPORT = _event_transport_module.EVENT_TRANSPORT
 
-VERSION = "1.12.34"
+VERSION = "1.12.35"
 API_VERSION = 2
 CAPABILITY_SCHEMA_VERSION = 1
 MIN_SUPPORTED_CLIENT_API_VERSION = 1
@@ -855,6 +855,7 @@ def run_command_job(
     account_acquired_at = queue_started
     slot_acquired_at = queue_started
     execute_started_at = queue_started
+    result: dict[str, Any] | None = None
     try:
         def ensure_not_cancelled() -> None:
             if command_cancel_requested(environment, request_id):
@@ -1008,7 +1009,25 @@ def run_command_job(
         if account_acquired and account_lock is not None:
             account_lock.release()
         manual_operation_leave(pending_key)
-        timer = threading.Timer(float(defer_seconds) + 0.2, TELEMETRY.wake_event.set)
+        def wake_confirmation() -> None:
+            try:
+                if isinstance(result, dict) and bool(result.get("accepted", True)):
+                    EVENT_TRANSPORT.ingest_hint(
+                        environment,
+                        int(payload.get("account_id") or 0),
+                        str(payload.get("vehicle_id") or payload.get("vehicle_remote_id") or ""),
+                        source="command_result",
+                        event_key=f"command:{str(payload.get('command') or 'remote')[:48]}",
+                    )
+                else:
+                    TELEMETRY.wake_event.set()
+            except Exception:
+                TELEMETRY.wake_event.set()
+
+        # A confirmação do próprio comando pode começar cedo. O settle continua
+        # protegendo a conta contra telemetria de fundo; uma nova ação manual
+        # preempta esta confirmação no próximo ponto seguro.
+        timer = threading.Timer(1.2 if isinstance(result, dict) else float(defer_seconds) + 0.2, wake_confirmation)
         timer.daemon = True
         timer.start()
         with COMMAND_WORKERS_GUARD:
@@ -1198,6 +1217,17 @@ def manual_operation_defer(key: str, seconds: int = 12) -> None:
         MANUAL_DEFER_UNTIL[key] = max(MANUAL_DEFER_UNTIL.get(key, 0.0), time.time() + max(2, min(45, int(seconds))))
 
 
+def manual_operation_active(environment: str, payload: dict[str, Any]) -> bool:
+    """Retorna somente operações manuais realmente pendentes/em execução.
+
+    A janela de settle pós-comando não entra aqui: ela continua bloqueando
+    telemetria de fundo, mas não deve atrasar a confirmação do próprio comando.
+    """
+    key = account_operation_key(environment, payload)
+    with MANUAL_PENDING_GUARD:
+        return MANUAL_PENDING.get(key, 0) > 0
+
+
 def manual_operation_pending(environment: str, payload: dict[str, Any]) -> bool:
     key = account_operation_key(environment, payload)
     now = time.time()
@@ -1217,6 +1247,7 @@ TELEMETRY = TelemetryEngine(
     account_lock_provider=account_operation_lock,
     account_wait_seconds=MANUAL_WAIT_SECONDS,
     manual_pending_provider=manual_operation_pending,
+    manual_active_provider=manual_operation_active,
 )
 
 

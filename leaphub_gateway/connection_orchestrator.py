@@ -31,6 +31,7 @@ class ConnectionOrchestrator:
         self._consecutive_successes: dict[str, int] = defaultdict(int)
         self._deduplicated: dict[str, int] = defaultdict(int)
         self._latencies: dict[str, deque[dict[str, float]]] = defaultdict(lambda: deque(maxlen=self.MAX_EVENTS))
+        self._telemetry_cycles: dict[str, deque[dict[str, Any]]] = defaultdict(lambda: deque(maxlen=self.MAX_EVENTS))
 
     @staticmethod
     def _environment(value: str) -> str:
@@ -122,6 +123,23 @@ class ConnectionOrchestrator:
         with self._lock:
             self._latencies[env].append(sample)
 
+    def record_telemetry_cycle(
+        self,
+        environment: str,
+        *,
+        profile: str,
+        duration_ms: float,
+        outcome: str = "success",
+    ) -> None:
+        env = self._environment(environment)
+        item = {
+            "profile": str(profile or "unknown")[:24],
+            "duration_ms": max(0.0, float(duration_ms)),
+            "outcome": str(outcome or "unknown")[:24],
+        }
+        with self._lock:
+            self._telemetry_cycles[env].append(item)
+
     @staticmethod
     def _percentile(values: list[float], percentile: float) -> int | None:
         if not values:
@@ -147,6 +165,12 @@ class ConnectionOrchestrator:
             account_waits = [item["account_wait_ms"] for item in samples]
             slot_waits = [item["connector_slot_ms"] for item in samples]
             remote_times = [item["remote_execute_ms"] for item in samples]
+            telemetry_cycles = list(self._telemetry_cycles[env])
+            telemetry_durations = [float(item.get("duration_ms") or 0.0) for item in telemetry_cycles]
+            telemetry_fast = [float(item.get("duration_ms") or 0.0) for item in telemetry_cycles if item.get("profile") in {"fast", "interactive", "confirmation"}]
+            telemetry_slow = [float(item.get("duration_ms") or 0.0) for item in telemetry_cycles if item.get("profile") == "slow"]
+            manual_yields = sum(1 for item in telemetry_cycles if item.get("outcome") == "manual_yield")
+            failures_total = sum(1 for item in telemetry_cycles if item.get("outcome") == "failure")
             return {
                 "state": "degraded" if degraded_for > 0 else "healthy",
                 "transient_failures_3m": len(failures),
@@ -166,6 +190,15 @@ class ConnectionOrchestrator:
                     "account_wait_p95_ms": self._percentile(account_waits, 95),
                     "connector_slot_p95_ms": self._percentile(slot_waits, 95),
                     "remote_execute_p95_ms": self._percentile(remote_times, 95),
+                },
+                "telemetry_latency": {
+                    "samples": len(telemetry_cycles),
+                    "total_p50_ms": self._percentile(telemetry_durations, 50),
+                    "total_p95_ms": self._percentile(telemetry_durations, 95),
+                    "fast_p95_ms": self._percentile(telemetry_fast, 95),
+                    "slow_p95_ms": self._percentile(telemetry_slow, 95),
+                    "manual_yields": manual_yields,
+                    "failures": failures_total,
                 },
                 "deduplicated": dict(self._deduplicated),
             }
