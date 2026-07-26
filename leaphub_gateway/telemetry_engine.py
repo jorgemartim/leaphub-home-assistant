@@ -52,7 +52,7 @@ except ModuleNotFoundError:
         EVENT_TRANSPORT = _event_transport_module.EVENT_TRANSPORT
 
 LOG = logging.getLogger("leaphub.telemetry")
-ENGINE_VERSION = "1.12.37"
+ENGINE_VERSION = "1.12.38"
 
 
 def utc_iso() -> str:
@@ -200,14 +200,14 @@ class TelemetryEngine:
         self.session_idle_seconds = self._bounded("telemetry_session_idle_seconds", 21600, 1800, 86400)
         self.vehicle_list_cache_seconds = self._bounded("telemetry_vehicle_list_cache_seconds", 1800, 300, 7200)
         self.message_cache_seconds = self._bounded("telemetry_message_cache_seconds", 1800, 300, 14400)
-        # 1.12.37 — o estado essencial é FAST; mensagens/imagem oficial são SLOW.
+        # 1.12.38 — o estado essencial é FAST; mensagens/imagem oficial são SLOW.
         # Não adicionamos uma opção obrigatória ao schema do add-on para manter
         # atualização compatível com instalações antigas.
         self.slow_interval_seconds = max(600, min(1800, self.message_cache_seconds))
         self.request_timeout_seconds = self._bounded("telemetry_request_timeout_seconds", 15, 10, 30)
         self._init_db()
         self.storage_healthy = True
-        # 1.12.37 — a telemetria já aceita hints de um futuro transporte por
+        # 1.12.38 — a telemetria já aceita hints de um futuro transporte por
         # eventos. O REST continua como fallback e nenhuma conexão MQTT é aberta
         # enquanto autenticação/tópicos/payloads não estiverem homologados.
         EVENT_TRANSPORT.register_wake_callback(self._wake_from_event)
@@ -1746,7 +1746,7 @@ class TelemetryEngine:
 
         environment = str(subscription["environment"])
         account_id = int(subscription["account_id"] or 0)
-        # 1.12.37 — circuit breaker global: durante uma oscilação confirmada
+        # 1.12.38 — circuit breaker global: durante uma oscilação confirmada
         # da nuvem, telemetria de fundo é reduzida para uma sonda moderada por
         # ambiente. Janelas interativas/comando continuam elegíveis.
         if not fast_mode and ORCHESTRATOR.is_degraded(environment) and not ORCHESTRATOR.claim_background_probe(environment):
@@ -1954,7 +1954,7 @@ class TelemetryEngine:
             duration_ms=(time.monotonic() - collection_started_at) * 1000.0,
             outcome="success",
         )
-        ORCHESTRATOR.record_cloud_success(environment)
+        ORCHESTRATOR.record_cloud_success(environment, account_id)
         vehicles = [item for item in (result.get("vehicles") or []) if isinstance(item, dict)]
         if vehicle_ids:
             vehicles = [item for item in vehicles if str(item.get("remote_id") or "") in vehicle_ids]

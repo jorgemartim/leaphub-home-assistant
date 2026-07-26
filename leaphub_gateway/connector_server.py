@@ -65,7 +65,7 @@ except ModuleNotFoundError:
         _event_transport_spec.loader.exec_module(_event_transport_module)
         EVENT_TRANSPORT = _event_transport_module.EVENT_TRANSPORT
 
-VERSION = "1.12.37"
+VERSION = "1.12.38"
 API_VERSION = 2
 CAPABILITY_SCHEMA_VERSION = 1
 MIN_SUPPORTED_CLIENT_API_VERSION = 1
@@ -937,13 +937,35 @@ def run_command_job(
             "dispatch_ms": int(phase_latency.get("dispatch_ms") or 0),
             "verification_ms": int(phase_latency.get("verification_ms") or 0),
         }
+        # Nomes aditivos e não ambíguos para o painel novo. Os campos legados
+        # permanecem porque versões anteriores do site ainda os consomem.
+        latency.update({
+            "queue_account_ms": latency["account_wait_ms"],
+            "queue_connector_ms": latency["connector_slot_ms"],
+            "remote_dispatch_ms": latency["dispatch_ms"],
+            "remote_result_ms": None,
+            "remote_result_bundled_with_dispatch": True,
+            "post_state_verify_ms": latency["verification_ms"],
+        })
         result["latency"] = latency
-        ORCHESTRATOR.record_command_latency(environment, **latency)
-        ORCHESTRATOR.record_cloud_success(environment)
+        ORCHESTRATOR.record_command_latency(
+            environment,
+            account_wait_ms=latency["account_wait_ms"],
+            connector_slot_ms=latency["connector_slot_ms"],
+            remote_execute_ms=latency["remote_execute_ms"],
+            total_ms=latency["total_ms"],
+            session_prepare_ms=latency["session_prepare_ms"],
+            dispatch_ms=latency["dispatch_ms"],
+            verification_ms=latency["verification_ms"],
+        )
+        ORCHESTRATOR.record_cloud_success(
+            environment,
+            payload.get("account_id") or payload.get("vehicle_id"),
+        )
         if request_id:
             result["request_id"] = request_id
         result["queued"] = False
-        result["queue_wait_seconds"] = int(time.monotonic() - queue_started)
+        result["queue_wait_seconds"] = int(round(slot_acquired_at - queue_started))
         command_journal_finish(request_hash, request_id, result)
         # Preserve uma janela curta para uma ação manual seguinte. Antes, a
         # telemetria de confirmação assumia a conta após três segundos e

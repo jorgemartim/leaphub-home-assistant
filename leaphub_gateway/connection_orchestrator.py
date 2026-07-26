@@ -19,6 +19,8 @@ class ConnectionOrchestrator:
     FAILURE_WINDOW_SECONDS = 180
     DEGRADED_SECONDS = 120
     DEGRADED_PROBE_SECONDS = 60
+    RECOVERY_QUIET_SECONDS = 30
+    RECOVERY_DISTINCT_ACCOUNTS = 2
     MAX_EVENTS = 256
 
     def __init__(self) -> None:
@@ -29,6 +31,7 @@ class ConnectionOrchestrator:
         self._last_error_at: dict[str, float] = defaultdict(float)
         self._last_success_at: dict[str, float] = defaultdict(float)
         self._consecutive_successes: dict[str, int] = defaultdict(int)
+        self._recovery_accounts: dict[str, set[str]] = defaultdict(set)
         self._deduplicated: dict[str, int] = defaultdict(int)
         self._latencies: dict[str, deque[dict[str, float]]] = defaultdict(lambda: deque(maxlen=self.MAX_EVENTS))
         self._telemetry_cycles: dict[str, deque[dict[str, Any]]] = defaultdict(lambda: deque(maxlen=self.MAX_EVENTS))
@@ -62,18 +65,29 @@ class ConnectionOrchestrator:
                 self._degraded_until[env] = max(self._degraded_until[env], now + self.DEGRADED_SECONDS)
             self._last_error_at[env] = now
             self._consecutive_successes[env] = 0
+            self._recovery_accounts[env].clear()
 
-    def record_cloud_success(self, environment: str) -> None:
+    def record_cloud_success(self, environment: str, account_key: Any = None) -> None:
         env = self._environment(environment)
         now = time.time()
+        fingerprint = self._account_fingerprint(account_key)
         with self._lock:
             self._prune_locked(env, now)
             self._last_success_at[env] = now
             self._consecutive_successes[env] += 1
-            # Duas respostas recentes bem-sucedidas encerram cedo o modo
-            # degradado. Falhas antigas continuam na janela apenas para
-            # observabilidade; não prendem o serviço em degradação.
-            if self._consecutive_successes[env] >= 2:
+            if account_key not in (None, ""):
+                self._recovery_accounts[env].add(fingerprint)
+            # Um sucesso isolado não prova que uma indisponibilidade global
+            # terminou. A recuperação antecipada exige uma janela sem falhas e
+            # respostas de contas distintas. Instalações com uma única conta
+            # continuam funcionando: comandos manuais nunca são bloqueados e o
+            # modo degradado expira naturalmente após DEGRADED_SECONDS.
+            quiet_for = now - self._last_error_at[env]
+            if (
+                self._degraded_until[env] > now
+                and quiet_for >= self.RECOVERY_QUIET_SECONDS
+                and len(self._recovery_accounts[env]) >= self.RECOVERY_DISTINCT_ACCOUNTS
+            ):
                 self._degraded_until[env] = 0.0
 
     def is_degraded(self, environment: str) -> bool:
@@ -201,6 +215,11 @@ class ConnectionOrchestrator:
                 ) if degraded_for > 0 else 0,
                 "last_error_seconds_ago": self._age(self._last_error_at[env], now),
                 "last_success_seconds_ago": self._age(self._last_success_at[env], now),
+                "recovery": {
+                    "quiet_seconds_required": self.RECOVERY_QUIET_SECONDS,
+                    "distinct_accounts_required": self.RECOVERY_DISTINCT_ACCOUNTS,
+                    "distinct_accounts_confirmed": len(self._recovery_accounts[env]),
+                },
                 "command_latency": {
                     "samples": len(samples),
                     "total_p50_ms": self._percentile(totals, 50),
@@ -211,6 +230,12 @@ class ConnectionOrchestrator:
                     "session_prepare_p95_ms": phase_p95["session_prepare"],
                     "dispatch_p95_ms": phase_p95["dispatch"],
                     "verification_p95_ms": phase_p95["verification"],
+                    "queue_account_p95_ms": phase_p95["account_wait"],
+                    "queue_connector_p95_ms": phase_p95["connector_slot"],
+                    "remote_dispatch_p95_ms": phase_p95["dispatch"],
+                    "remote_result_p95_ms": None,
+                    "remote_result_bundled_with_dispatch": True,
+                    "post_state_verify_p95_ms": phase_p95["verification"],
                     "primary_bottleneck": primary_bottleneck,
                 },
                 "telemetry_latency": {

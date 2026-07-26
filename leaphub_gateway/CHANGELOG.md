@@ -1,5 +1,7 @@
-## 1.12.37
+## 1.12.38
 
-- Corrige recuperação de sessão quando a Leapmotor responde `remote verify failed: Token is invalid` antes de qualquer ação chegar ao veículo.
-- A sessão compartilhada inválida é descartada e o mesmo comando recebe no máximo uma nova autenticação limpa antes do envio; falhas de token após aceite/resultado remoto continuam sem reenvio físico.
-- Mantém prioridade manual, telemetria FAST/SLOW, Event Transport, OCPP e distribuição pré-compilada GHCR inalterados.
+- Impede que uma única conta saudável encerre prematuramente o circuit breaker global enquanto outras contas ainda apresentam timeout, desconexão ou 503.
+- A recuperação antecipada exige 30 segundos sem novas falhas e sucesso de duas contas distintas; comandos manuais continuam liberados durante `DEGRADED`.
+- Corrige `queue_wait_seconds`: agora mede somente fila da conta + vaga do Connector, sem incluir envio ou confirmação.
+- Expõe aliases de latência aditivos (`queue_account`, `queue_connector`, `remote_dispatch` e `post_state_verify`) e informa quando o tempo do resultado remoto está agregado ao despacho pela biblioteca.
+- Mantém comandos REST, sessões, retries, telemetria FAST/SLOW, Event Transport passivo, OCPP e distribuição pré-compilada GHCR inalterados.

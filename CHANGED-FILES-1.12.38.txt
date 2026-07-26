@@ -1,0 +1,17 @@
+GITHUB-RECOVERY-1.12.38.md
+RELEASE-1.12.38.md
+UPLOAD-1.12.38.md
+leaphub_gateway/CHANGELOG.md
+leaphub_gateway/RELEASE-1.12.38.md
+leaphub_gateway/config.yaml
+leaphub_gateway/connection_orchestrator.py
+leaphub_gateway/connector.py
+leaphub_gateway/connector_server.py
+leaphub_gateway/gateway_manager.py
+leaphub_gateway/ocpp_gateway.py
+leaphub_gateway/privacy.py
+leaphub_gateway/telemetry_engine.py
+tests/test_orchestrator_stability_1_12_38.py
+
+Os demais testes presentes no ZIP foram atualizados somente para validar a versão
+corrente 1.12.38, seguindo o formato do pacote incremental anterior.

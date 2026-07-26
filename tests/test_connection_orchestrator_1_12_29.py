@@ -16,7 +16,7 @@ SERVER = (ROOT / "leaphub_gateway" / "connector_server.py").read_text(encoding="
 DOCKER = (ROOT / "leaphub_gateway" / "Dockerfile").read_text(encoding="utf-8")
 
 
-def test_multi_account_failures_open_and_successes_close_breaker() -> None:
+def test_multi_account_failures_require_quiet_multi_account_recovery() -> None:
     coordinator = ConnectionOrchestrator()
     coordinator.record_cloud_failure("staging", 11)
     coordinator.record_cloud_failure("staging", 22)
@@ -25,8 +25,11 @@ def test_multi_account_failures_open_and_successes_close_breaker() -> None:
     assert state["state"] == "degraded"
     assert state["affected_accounts_3m"] == 2
     assert state["automatic_reduction_active"] is True
-    coordinator.record_cloud_success("staging")
-    coordinator.record_cloud_success("staging")
+    coordinator.record_cloud_success("staging", 11)
+    coordinator.record_cloud_success("staging", 11)
+    assert coordinator.snapshot("staging")["state"] == "degraded"
+    coordinator._last_error_at["staging"] -= coordinator.RECOVERY_QUIET_SECONDS + 1
+    coordinator.record_cloud_success("staging", 22)
     assert coordinator.snapshot("staging")["state"] == "healthy"
 
 
@@ -53,9 +56,9 @@ def test_command_latency_is_aggregated_without_identifiers() -> None:
 
 
 def test_fast_slow_profiles_and_health_are_wired() -> None:
-    assert 'ENGINE_VERSION = "1.12.37"' in TELEMETRY
-    assert 'CONNECTOR_VERSION = "1.12.37"' in CONNECTOR
-    assert 'VERSION = "1.12.37"' in SERVER
+    assert 'ENGINE_VERSION = "1.12.38"' in TELEMETRY
+    assert 'CONNECTOR_VERSION = "1.12.38"' in CONNECTOR
+    assert 'VERSION = "1.12.38"' in SERVER
     assert '"collection_profile": "slow" if slow_cycle else "fast"' in TELEMETRY
     assert 'include_secondary_network=slow_cycle' in TELEMETRY
     assert 'ORCHESTRATOR.is_degraded(environment)' in TELEMETRY
