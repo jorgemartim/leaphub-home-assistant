@@ -8,7 +8,7 @@ assert spec and spec.loader
 connector = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(connector)
 
-assert connector.CONNECTOR_VERSION == "1.12.28"
+assert connector.CONNECTOR_VERSION == "1.12.29"
 
 positive = connector.safe_remote_result_summary({"result": 0, "message": "ok", "remoteCtlId": "secret-id", "token": "must-not-leak"})
 assert positive["result"] == 0
@@ -35,4 +35,4 @@ server_source = (ROOT / "leaphub_gateway" / "connector_server.py").read_text(enc
 for token in ("evidencia=%s", "sinal=%s", "resumo=%s", "remote_result_summary"):
     assert token in server_source
 
-print({"ok": True, "checks": 16, "version": "1.12.28"})
+print({"ok": True, "checks": 16, "version": "1.12.29"})

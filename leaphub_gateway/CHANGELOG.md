@@ -1,3 +1,7 @@
+## 1.12.29
+- Connection Orchestrator: circuit breaker da nuvem, telemetria FAST/SLOW e métricas de latência de comandos sem PII.
+- Comandos manuais não são bloqueados pelo circuit breaker e nenhum retry físico foi adicionado.
+
 ## 1.12.28
 
 - Comandos manuais passam a cortar trabalho secundário de imagem da telemetria assim que a leitura essencial de status termina.

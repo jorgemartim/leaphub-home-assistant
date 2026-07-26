@@ -36,8 +36,22 @@ try:
     from leaphub_privacy import install_logging_privacy_filter
 except ModuleNotFoundError:
     from privacy import install_logging_privacy_filter
+try:
+    from leaphub_connection_orchestrator import ORCHESTRATOR
+except ModuleNotFoundError:
+    try:
+        from connection_orchestrator import ORCHESTRATOR
+    except ModuleNotFoundError:
+        import importlib.util as _importlib_util
+        _orchestrator_path = Path(__file__).with_name("connection_orchestrator.py")
+        _orchestrator_spec = _importlib_util.spec_from_file_location("leaphub_connection_orchestrator_local", _orchestrator_path)
+        if _orchestrator_spec is None or _orchestrator_spec.loader is None:
+            raise
+        _orchestrator_module = _importlib_util.module_from_spec(_orchestrator_spec)
+        _orchestrator_spec.loader.exec_module(_orchestrator_module)
+        ORCHESTRATOR = _orchestrator_module.ORCHESTRATOR
 
-VERSION = "1.12.28"
+VERSION = "1.12.29"
 API_VERSION = 2
 CAPABILITY_SCHEMA_VERSION = 1
 MIN_SUPPORTED_CLIENT_API_VERSION = 1
@@ -824,6 +838,9 @@ def run_command_job(
     defer_seconds = 4
     retry_after_seconds = 0
     queue_started = time.monotonic()
+    account_acquired_at = queue_started
+    slot_acquired_at = queue_started
+    execute_started_at = queue_started
     try:
         def ensure_not_cancelled() -> None:
             if command_cancel_requested(environment, request_id):
@@ -874,6 +891,7 @@ def run_command_job(
                     "A leitura anterior excedeu a janela segura. O comando não foi enviado e pode ser tentado novamente."
                 )
         account_acquired = True
+        account_acquired_at = time.monotonic()
         ensure_not_cancelled()
 
         progress(
@@ -886,11 +904,23 @@ def run_command_job(
             raise connector.ConnectorTemporaryError(
                 "A conta foi liberada, mas o Connector permaneceu ocupado. O comando não foi enviado."
             )
+        slot_acquired_at = time.monotonic()
 
         ensure_not_cancelled()
         progress("preparing", "Preparando a sessão autenticada para a ação.")
         ensure_not_cancelled()
+        execute_started_at = time.monotonic()
         result = TELEMETRY.execute_command(environment, payload, progress=progress)
+        execute_finished_at = time.monotonic()
+        latency = {
+            "account_wait_ms": int(round((account_acquired_at - queue_started) * 1000)),
+            "connector_slot_ms": int(round((slot_acquired_at - account_acquired_at) * 1000)),
+            "remote_execute_ms": int(round((execute_finished_at - execute_started_at) * 1000)),
+            "total_ms": int(round((execute_finished_at - queue_started) * 1000)),
+        }
+        result["latency"] = latency
+        ORCHESTRATOR.record_command_latency(environment, **latency)
+        ORCHESTRATOR.record_cloud_success(environment)
         if request_id:
             result["request_id"] = request_id
         result["queued"] = False
@@ -908,11 +938,15 @@ def run_command_job(
         )
         remote_summary_text = connector.clean_message(remote_summary_text)[:320]
         LOG.info(
-            "Comando remoto %s finalizado no worker para %s; resultado=%s, espera_fila=%ss, tentativas=%s, despertar_real=%s, repetição_segura=%s, estratégia=%s, confirmado_direto=%s, confirmação_pendente=%s, motivo=%s, ack=%s, resultado_remoto=%s, evidencia=%s, sinal=%s, resumo=%s.",
+            "Comando remoto %s finalizado no worker para %s; resultado=%s, espera_fila=%ss, latência_conta=%sms, vaga_connector=%sms, execução_remota=%sms, total=%sms, tentativas=%s, despertar_real=%s, repetição_segura=%s, estratégia=%s, confirmado_direto=%s, confirmação_pendente=%s, motivo=%s, ack=%s, resultado_remoto=%s, evidencia=%s, sinal=%s, resumo=%s.",
             str(payload.get("command") or "desconhecido")[:40],
             environment,
             str(result.get("final_outcome") or ("confirmed" if result.get("verified_by_gateway") else "confirmation_pending"))[:40],
             int(result.get("queue_wait_seconds") or 0),
+            int(latency.get("account_wait_ms") or 0),
+            int(latency.get("connector_slot_ms") or 0),
+            int(latency.get("remote_execute_ms") or 0),
+            int(latency.get("total_ms") or 0),
             int(result.get("attempts") or 1),
             bool(result.get("wake_attempted")),
             bool(result.get("safe_retry_performed")),
@@ -948,6 +982,8 @@ def run_command_job(
             retry_after_seconds,
         )
     except BaseException as exc:  # noqa: BLE001
+        if connector.is_transient_cloud_error(exc) or isinstance(exc, connector.ConnectorTemporaryError):
+            ORCHESTRATOR.record_cloud_failure(environment, payload.get("account_id") or payload.get("vehicle_id"))
         command_journal_fail(request_hash, request_id, exc)
         defer_seconds = 3
         LOG.warning("Comando remoto em segundo plano falhou (%s): %s", type(exc).__name__, connector.clean_message(str(exc)))
@@ -1258,6 +1294,7 @@ def detailed_health_payload(environment: str) -> dict[str, Any]:
         "connector_version": connector.CONNECTOR_VERSION,
         "library_version": library,
         "operation_limiter": SEMAPHORE.snapshot(),
+        "connection_orchestrator": ORCHESTRATOR.snapshot(environment),
         "python_version": sys.version.split()[0],
         "environment": environment,
         "configured_environments": configured,

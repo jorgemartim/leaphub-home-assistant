@@ -42,7 +42,7 @@ except ImportError:
         _privacy_spec.loader.exec_module(_privacy_module)
         sanitize_log = _privacy_module.sanitize_log
 
-CONNECTOR_VERSION = "1.12.28"
+CONNECTOR_VERSION = "1.12.29"
 MAX_INPUT_BYTES = 1024 * 1024
 logging.getLogger("leapmotor_api").setLevel(logging.WARNING)
 LOGGER = logging.getLogger("leaphub.connector")
@@ -1858,6 +1858,7 @@ def serialize_vehicle(
     force_debug_package: bool = False,
     force_package_refresh: bool = False,
     manual_should_yield: Callable[[], bool] | None = None,
+    include_secondary_network: bool = True,
 ) -> dict[str, Any]:
     vin = str(attribute(vehicle, "vin", "") or "").strip()
     remote_id = str(attribute(vehicle, "car_id", "") or vin).strip()
@@ -2385,11 +2386,11 @@ def serialize_vehicle(
     # Metadados/pacote de imagem são secundários e não podem manter a conta
     # ocupada quando um comando manual já está aguardando.
     try:
-        defer_secondary_network = bool(manual_should_yield and manual_should_yield())
+        defer_secondary_network = (not include_secondary_network) or bool(manual_should_yield and manual_should_yield())
     except Exception:
-        defer_secondary_network = False
+        defer_secondary_network = not include_secondary_network
     if defer_secondary_network:
-        connector_log(logging.DEBUG, "Telemetria adiou imagem oficial para liberar a conta a um comando manual.")
+        connector_log(logging.DEBUG, "Telemetria adiou imagem oficial pelo perfil FAST ou para liberar a conta a um comando manual.")
         official_image = None
     else:
         official_image = official_visual_image_payload(

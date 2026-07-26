@@ -22,9 +22,23 @@ from typing import Any, Callable, Iterator
 from cryptography.fernet import Fernet, InvalidToken
 
 import leaphub_connector as connector
+try:
+    from leaphub_connection_orchestrator import ORCHESTRATOR
+except ModuleNotFoundError:
+    try:
+        from connection_orchestrator import ORCHESTRATOR
+    except ModuleNotFoundError:
+        import importlib.util as _importlib_util
+        _orchestrator_path = Path(__file__).with_name("connection_orchestrator.py")
+        _orchestrator_spec = _importlib_util.spec_from_file_location("leaphub_connection_orchestrator_local", _orchestrator_path)
+        if _orchestrator_spec is None or _orchestrator_spec.loader is None:
+            raise
+        _orchestrator_module = _importlib_util.module_from_spec(_orchestrator_spec)
+        _orchestrator_spec.loader.exec_module(_orchestrator_module)
+        ORCHESTRATOR = _orchestrator_module.ORCHESTRATOR
 
 LOG = logging.getLogger("leaphub.telemetry")
-ENGINE_VERSION = "1.12.28"
+ENGINE_VERSION = "1.12.29"
 
 
 def utc_iso() -> str:
@@ -167,6 +181,10 @@ class TelemetryEngine:
         self.session_idle_seconds = self._bounded("telemetry_session_idle_seconds", 21600, 1800, 86400)
         self.vehicle_list_cache_seconds = self._bounded("telemetry_vehicle_list_cache_seconds", 1800, 300, 7200)
         self.message_cache_seconds = self._bounded("telemetry_message_cache_seconds", 1800, 300, 14400)
+        # 1.12.29 — o estado essencial é FAST; mensagens/imagem oficial são SLOW.
+        # Não adicionamos uma opção obrigatória ao schema do add-on para manter
+        # atualização compatível com instalações antigas.
+        self.slow_interval_seconds = max(600, min(1800, self.message_cache_seconds))
         self.request_timeout_seconds = self._bounded("telemetry_request_timeout_seconds", 15, 10, 30)
         self._init_db()
         self.storage_healthy = True
@@ -1106,6 +1124,7 @@ class TelemetryEngine:
                 "next_run_seconds": max(0, int(float(existing["next_run_at"] or 0) - now_epoch)),
                 "status": status,
             }
+            ORCHESTRATOR.record_deduplicated("telemetry_subscription_upsert")
             if protected_auth:
                 response.update({"auth_required": True, "protected": True, "message": "Credenciais recusadas anteriormente; confirme a conta antes de uma nova tentativa."})
             elif protected_cooldown:
@@ -1524,6 +1543,12 @@ class TelemetryEngine:
                 "command_cadence_seconds": list(self.command_cadence),
                 "command_max_polls": self.command_max_polls,
                 "manual_priority": self.manual_pending_provider is not None,
+                "collection_profiles": {
+                    "fast": "status_and_vehicle_state",
+                    "slow": "messages_and_official_visual",
+                    "slow_interval_seconds": self.slow_interval_seconds,
+                    "degraded_disables_slow": True,
+                },
                 "charging_seconds": self.charging_seconds,
                 "charge_watch_seconds": self.charge_watch_seconds,
                 "parked_seconds": self.parked_seconds,
@@ -1660,6 +1685,18 @@ class TelemetryEngine:
 
         environment = str(subscription["environment"])
         account_id = int(subscription["account_id"] or 0)
+        # 1.12.29 — circuit breaker global: durante uma oscilação confirmada
+        # da nuvem, telemetria de fundo é reduzida para uma sonda moderada por
+        # ambiente. Janelas interativas/comando continuam elegíveis.
+        if not fast_mode and ORCHESTRATOR.is_degraded(environment) and not ORCHESTRATOR.claim_background_probe(environment):
+            self._reschedule(
+                sid,
+                60,
+                "cloud_degraded",
+                "Nuvem Leapmotor degradada; telemetria automática reduzida sem afetar comandos manuais.",
+                failed=False,
+            )
+            return
         global_auth = self.account_auth_status(environment, account_id)
         if global_auth.get("cooldown"):
             self._reschedule(
@@ -1805,6 +1842,7 @@ class TelemetryEngine:
                 self._mark_auth_required(sid, message)
                 LOG.warning("A assinatura %s foi pausada até as credenciais serem confirmadas: %s", sid, message)
             elif transient:
+                ORCHESTRATOR.record_cloud_failure(environment, account_id)
                 verification_challenge = any(marker in message.lower() for marker in (
                     "information verification failed",
                     "please try again later",
@@ -1834,6 +1872,7 @@ class TelemetryEngine:
             self.operation_semaphore.release()
             credentials.clear()
 
+        ORCHESTRATOR.record_cloud_success(environment)
         vehicles = [item for item in (result.get("vehicles") or []) if isinstance(item, dict)]
         if vehicle_ids:
             vehicles = [item for item in vehicles if str(item.get("remote_id") or "") in vehicle_ids]
@@ -2060,6 +2099,9 @@ class TelemetryEngine:
                 "vehicles_cached_at": 0.0,
                 "messages": [],
                 "messages_cached_at": 0.0,
+                # Primeiro ciclo prioriza FAST. O enriquecimento SLOW entra
+                # depois sem atrasar a primeira telemetria da conta.
+                "slow_last_at": now_epoch,
             }
             with self.session_lock:
                 self.sessions[subscription_id] = session
@@ -2108,10 +2150,16 @@ class TelemetryEngine:
                     if str(connector.attribute(item, "car_id", "") or connector.attribute(item, "vin", "")) in vehicle_ids
                 ]
             messages: list[Any] = []
+            slow_last_at = float(session.get("slow_last_at") or 0)
+            slow_cycle = (
+                not command_mode
+                and ORCHESTRATOR.secondary_network_allowed(environment)
+                and now_epoch - slow_last_at >= self.slow_interval_seconds
+            )
             get_messages = getattr(client, "get_message_list", None)
             if manual_should_yield is not None and manual_should_yield():
                 raise TelemetryYieldForManual("Operação manual aguardando a conta.")
-            if not command_mode and callable(get_messages):
+            if slow_cycle and callable(get_messages):
                 cached_messages = session.get("messages") if isinstance(session.get("messages"), list) else []
                 messages_cached_at = float(session.get("messages_cached_at") or 0)
                 if messages_cached_at > 0 and now_epoch - messages_cached_at < self.message_cache_seconds:
@@ -2151,12 +2199,15 @@ class TelemetryEngine:
                         messages=messages,
                         allow_unscoped_messages=len(selected) == 1,
                         manual_should_yield=manual_should_yield,
+                        include_secondary_network=slow_cycle,
                     )
                 )
             if not serialized:
                 raise RuntimeError("Nenhum veículo foi encontrado para esta conta.")
             session["last_used_at"] = time.time()
             session["vehicles"] = vehicles
+            if slow_cycle:
+                session["slow_last_at"] = time.time()
             return {
                 "ok": True,
                 "account_name": "Conta Leapmotor",
@@ -2164,6 +2215,7 @@ class TelemetryEngine:
                 "connector_version": connector.CONNECTOR_VERSION,
                 "library_version": connector.package_version(),
                 "session_reused": True,
+                "collection_profile": "slow" if slow_cycle else "fast",
             }
         except TelemetryYieldForManual:
             session["last_used_at"] = time.time()
