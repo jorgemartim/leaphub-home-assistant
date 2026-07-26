@@ -1,7 +1,7 @@
-## 1.12.38
+## 1.12.39
 
-- Impede que uma única conta saudável encerre prematuramente o circuit breaker global enquanto outras contas ainda apresentam timeout, desconexão ou 503.
-- A recuperação antecipada exige 30 segundos sem novas falhas e sucesso de duas contas distintas; comandos manuais continuam liberados durante `DEGRADED`.
-- Corrige `queue_wait_seconds`: agora mede somente fila da conta + vaga do Connector, sem incluir envio ou confirmação.
-- Expõe aliases de latência aditivos (`queue_account`, `queue_connector`, `remote_dispatch` e `post_state_verify`) e informa quando o tempo do resultado remoto está agregado ao despacho pela biblioteca.
-- Mantém comandos REST, sessões, retries, telemetria FAST/SLOW, Event Transport passivo, OCPP e distribuição pré-compilada GHCR inalterados.
+- Retém a sessão criada por um comando manual para a confirmação FAST, evitando uma segunda autenticação imediatamente após o envio.
+- Mantém a regra de nunca repetir automaticamente uma ação que já possa ter sido aceita pela nuvem.
+- Corrige o reflexo do vidro incorporado à camada oficial da porta dianteira aberta, preservando porta, espelho, sombra e canvas.
+- Valida o transporte de eventos em modo passivo, com deduplicação, wake-up coalescido e fallback REST; MQTT continua sem publicar comandos e desativado até homologação.
+- Preserva a distribuição pré-compilada, OCPP, Cloudflare Tunnel e contratos de segurança existentes.

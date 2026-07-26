@@ -1,0 +1,16 @@
+GITHUB-RECOVERY-1.12.39.md
+RELEASE-1.12.39.md
+UPLOAD-1.12.39.md
+leaphub_gateway/CHANGELOG.md
+leaphub_gateway/RELEASE-1.12.39.md
+leaphub_gateway/config.yaml
+leaphub_gateway/connector.py
+leaphub_gateway/connector_server.py
+leaphub_gateway/gateway_manager.py
+leaphub_gateway/ocpp_gateway.py
+leaphub_gateway/privacy.py
+leaphub_gateway/telemetry_engine.py
+tests/test_command_session_reuse_1_12_39.py
+tests/test_mqtt_passive_contract_1_12_39.py
+tests/test_open_door_visual_1_12_39.py
+tests/test_pre_dispatch_token_recovery_1_12_37.py

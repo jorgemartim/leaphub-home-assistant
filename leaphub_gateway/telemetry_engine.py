@@ -52,7 +52,7 @@ except ModuleNotFoundError:
         EVENT_TRANSPORT = _event_transport_module.EVENT_TRANSPORT
 
 LOG = logging.getLogger("leaphub.telemetry")
-ENGINE_VERSION = "1.12.38"
+ENGINE_VERSION = "1.12.39"
 
 
 def utc_iso() -> str:
@@ -975,6 +975,110 @@ class TelemetryEngine:
             )
             raise
 
+    def _create_persistent_session_locked(
+        self,
+        subscription_id: str,
+        environment: str,
+        account_id: int,
+        credentials: dict[str, Any],
+        origin: str,
+        manual_should_yield: Callable[[], bool] | None = None,
+    ) -> dict[str, Any]:
+        """Authenticate once and retain the client for commands and FAST telemetry.
+
+        The caller must hold the subscription operation lock. Keeping the client
+        created for a manual command prevents the confirmation cycle from opening
+        a second Leapmotor login immediately after the action was accepted.
+        """
+        now_epoch = time.time()
+        credential_hash = hashlib.sha256(canonical_json(credentials)).hexdigest()
+        if manual_should_yield is not None and manual_should_yield():
+            raise TelemetryYieldForManual("Operação manual aguardando antes da autenticação automática.")
+
+        temp_dir = connector.secure_temp_directory()
+        client = None
+        try:
+            client = connector.create_client(
+                credentials,
+                temp_dir,
+                None,
+                request_timeout_seconds=self.request_timeout_seconds,
+            )
+            if manual_should_yield is not None and manual_should_yield():
+                raise TelemetryYieldForManual("Operação manual recebeu prioridade antes do login automático.")
+
+            self.begin_account_auth(environment, account_id, origin)
+            with self.lock, self._db() as db:
+                db.execute(
+                    "UPDATE subscriptions SET last_auth_attempt_at=?,updated_at=? WHERE subscription_id=?",
+                    (time.time(), utc_iso(), subscription_id),
+                )
+            client.login()
+            self.record_account_auth_success(environment, account_id, origin)
+            with self.lock, self._db() as db:
+                db.execute(
+                    "UPDATE subscriptions SET last_auth_success_at=?,cooldown_reason=NULL,updated_at=? WHERE subscription_id=?",
+                    (time.time(), utc_iso(), subscription_id),
+                )
+        except Exception as exc:
+            if client is not None:
+                try:
+                    client.close()
+                except Exception:
+                    pass
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            if isinstance(exc, TelemetryYieldForManual):
+                raise
+            delay = connector.login_cooldown_seconds(exc)
+            if delay > 0:
+                protected_delay = self.record_account_auth_failure(
+                    environment,
+                    account_id,
+                    origin,
+                    str(exc),
+                    delay,
+                    blocked=True,
+                )
+                raise connector.ConnectorLoginCooldownError(
+                    "A Leapmotor limitou temporariamente novas autenticações. A próxima tentativa respeitará o cooldown global.",
+                    protected_delay,
+                ) from exc
+            if connector.is_transient_cloud_error(exc) or isinstance(exc, connector.ConnectorTemporaryError):
+                self.record_account_auth_failure(environment, account_id, origin, str(exc), 60, blocked=False)
+            else:
+                self.record_account_auth_failure(
+                    environment,
+                    account_id,
+                    origin,
+                    "Falha de autenticação.",
+                    60,
+                    blocked=False,
+                )
+            raise
+
+        session = {
+            "client": client,
+            "temp_dir": temp_dir,
+            "credential_hash": credential_hash,
+            "created_at": now_epoch,
+            "last_used_at": now_epoch,
+            "vehicles": [],
+            "vehicles_cached_at": 0.0,
+            "messages": [],
+            "messages_cached_at": 0.0,
+            # O primeiro ciclo após comando continua FAST. SLOW não disputa
+            # a confirmação do estado físico.
+            "slow_last_at": now_epoch,
+        }
+        with self.session_lock:
+            self.sessions[subscription_id] = session
+        LOG.info(
+            "Sessão Leapmotor criada para %s por %s; será reutilizada pela próxima leitura FAST.",
+            subscription_id,
+            origin,
+        )
+        return session
+
     def execute_command(
         self,
         environment: str,
@@ -984,8 +1088,9 @@ class TelemetryEngine:
         """Executa a ação sob a mesma sessão e trava usadas pela telemetria.
 
         Uma sessão válida nunca é destruída apenas porque o usuário acionou um
-        comando. Se não houver sessão ativa, o conector mantém o fluxo isolado
-        anterior como fallback. Falhas transitórias preservam a sessão.
+        comando. Se não houver sessão ativa, o cliente autenticado pelo comando
+        fica retido para a confirmação FAST. Falhas transitórias preservam a
+        sessão e nenhuma ação aceita pela nuvem é repetida automaticamente.
         """
         try:
             account_id = int(payload.get("account_id") or 0)
@@ -1015,29 +1120,34 @@ class TelemetryEngine:
                 max(30, int(cooldown_until - time.time())),
             )
 
-        def isolated_command() -> dict[str, Any]:
-            return self._execute_isolated_command(environment, payload, account_id, progress)
-
         with self._session_operation_lock(subscription_id):
-            with self.session_lock:
-                session = self.sessions.get(subscription_id)
-            if not isinstance(session, dict) or session.get("client") is None:
-                return isolated_command()
-
-            now_epoch = time.time()
             command_credentials = payload.get("credentials") if isinstance(payload.get("credentials"), dict) else {}
             session_credentials = dict(command_credentials)
             session_credentials.pop("operation_password", None)
             expected_hash = hashlib.sha256(canonical_json(session_credentials)).hexdigest() if session_credentials else ""
+            if not expected_hash:
+                return self._execute_isolated_command(environment, payload, account_id, progress)
+
+            with self.session_lock:
+                session = self.sessions.get(subscription_id)
+
+            now_epoch = time.time()
             session_stale = (
-                expected_hash == ""
+                not isinstance(session, dict)
+                or session.get("client") is None
                 or session.get("credential_hash") != expected_hash
                 or (self.session_max_age_seconds > 0 and now_epoch - float(session.get("created_at") or 0) >= self.session_max_age_seconds)
                 or (self.session_idle_seconds > 0 and now_epoch - float(session.get("last_used_at") or 0) >= self.session_idle_seconds)
             )
             if session_stale:
                 self._close_session_locked(subscription_id)
-                return isolated_command()
+                session = self._create_persistent_session_locked(
+                    subscription_id,
+                    environment,
+                    account_id,
+                    session_credentials,
+                    "command",
+                )
 
             session["last_used_at"] = now_epoch
             try:
@@ -1049,6 +1159,7 @@ class TelemetryEngine:
                 )
                 session["last_used_at"] = time.time()
                 self.record_account_auth_success(environment, account_id, "command_session")
+                result["session_retained_for_fast_confirmation"] = True
                 return result
             except Exception as exc:
                 session["last_used_at"] = time.time()
@@ -1071,9 +1182,30 @@ class TelemetryEngine:
                             )
                         except Exception:
                             pass
-                    recovered = isolated_command()
+                    recovered_session = self._create_persistent_session_locked(
+                        subscription_id,
+                        environment,
+                        account_id,
+                        session_credentials,
+                        "command_recovery",
+                    )
+                    try:
+                        recovered = connector.handle_command(
+                            payload,
+                            progress=progress,
+                            borrowed_client=recovered_session["client"],
+                            borrowed_vehicles=None,
+                        )
+                    except Exception as recovered_exc:
+                        recovered_session["last_used_at"] = time.time()
+                        if connector.is_authentication_error(recovered_exc):
+                            self._close_session_locked(subscription_id)
+                        raise
+                    recovered_session["last_used_at"] = time.time()
+                    self.record_account_auth_success(environment, account_id, "command_recovery_session")
                     recovered["session_recovered"] = True
-                    recovered["session_reused"] = False
+                    recovered["session_reused"] = True
+                    recovered["session_retained_for_fast_confirmation"] = True
                     return recovered
                 if isinstance(exc, connector.ConnectorLoginCooldownError):
                     self._set_account_login_cooldown(environment, account_id, exc.retry_after_seconds, str(exc))
@@ -2127,67 +2259,14 @@ class TelemetryEngine:
             # o usuário enviava um comando.
             if manual_should_yield is not None and manual_should_yield():
                 raise TelemetryYieldForManual("Operação manual aguardando antes da autenticação automática.")
-            temp_dir = connector.secure_temp_directory()
-            client = None
-            try:
-                client = connector.create_client(credentials, temp_dir, None, request_timeout_seconds=self.request_timeout_seconds)
-                if manual_should_yield is not None and manual_should_yield():
-                    raise TelemetryYieldForManual("Operação manual recebeu prioridade antes do login automático.")
-                # Uma única tentativa de login. O horário é persistido antes
-                # da chamada para impedir repetição após reinício ou queda.
-                self.begin_account_auth(environment, account_id, "telemetry")
-                with self.lock, self._db() as db:
-                    db.execute(
-                        "UPDATE subscriptions SET last_auth_attempt_at=?,updated_at=? WHERE subscription_id=?",
-                        (time.time(), utc_iso(), subscription_id),
-                    )
-                client.login()
-                self.record_account_auth_success(environment, account_id, "telemetry")
-                with self.lock, self._db() as db:
-                    db.execute(
-                        "UPDATE subscriptions SET last_auth_success_at=?,cooldown_reason=NULL,updated_at=? WHERE subscription_id=?",
-                        (time.time(), utc_iso(), subscription_id),
-                    )
-            except Exception as exc:
-                if client is not None:
-                    try:
-                        client.close()
-                    except Exception:
-                        pass
-                shutil.rmtree(temp_dir, ignore_errors=True)
-                if isinstance(exc, TelemetryYieldForManual):
-                    raise
-                delay = connector.login_cooldown_seconds(exc)
-                if delay > 0:
-                    protected_delay = self.record_account_auth_failure(
-                        environment, account_id, "telemetry", str(exc), delay, blocked=True
-                    )
-                    raise connector.ConnectorLoginCooldownError(
-                        "A Leapmotor limitou temporariamente novas autenticações. A próxima tentativa respeitará o cooldown global.",
-                        protected_delay,
-                    ) from exc
-                if connector.is_transient_cloud_error(exc) or isinstance(exc, connector.ConnectorTemporaryError):
-                    self.record_account_auth_failure(environment, account_id, "telemetry", str(exc), 60, blocked=False)
-                else:
-                    self.record_account_auth_failure(environment, account_id, "telemetry", "Falha de autenticação.", 60, blocked=False)
-                raise
-            session = {
-                "client": client,
-                "temp_dir": temp_dir,
-                "credential_hash": credential_hash,
-                "created_at": now_epoch,
-                "last_used_at": now_epoch,
-                "vehicles": [],
-                "vehicles_cached_at": 0.0,
-                "messages": [],
-                "messages_cached_at": 0.0,
-                # Primeiro ciclo prioriza FAST. O enriquecimento SLOW entra
-                # depois sem atrasar a primeira telemetria da conta.
-                "slow_last_at": now_epoch,
-            }
-            with self.session_lock:
-                self.sessions[subscription_id] = session
-            LOG.info("Sessão Leapmotor criada para %s; será reutilizada enquanto permanecer válida e ativa.", subscription_id)
+            session = self._create_persistent_session_locked(
+                subscription_id,
+                environment,
+                account_id,
+                credentials,
+                "telemetry",
+                manual_should_yield=manual_should_yield,
+            )
 
         client = session["client"]
         try:

@@ -8,6 +8,7 @@ Credentials never appear in command-line arguments or environment variables.
 from __future__ import annotations
 
 import base64
+import copy
 import hashlib
 import io
 import inspect
@@ -42,7 +43,7 @@ except ImportError:
         _privacy_spec.loader.exec_module(_privacy_module)
         sanitize_log = _privacy_module.sanitize_log
 
-CONNECTOR_VERSION = "1.12.38"
+CONNECTOR_VERSION = "1.12.39"
 MAX_INPUT_BYTES = 1024 * 1024
 logging.getLogger("leapmotor_api").setLevel(logging.WARNING)
 LOGGER = logging.getLogger("leaphub.connector")
@@ -1290,6 +1291,83 @@ def _edge_alpha_ratio(image: Any) -> float:
     return sum(1 for value in samples if value > 12) / len(samples)
 
 
+def _compose_official_frame(
+    package: Any,
+    visual_status: Any,
+    charge_frame: int | None = None,
+) -> tuple[bytes, int]:
+    """Compose one frame and remove the reflection embedded in an open door.
+
+    The official package already contains the front-left glass inside the
+    `carpic_leftfront_open` layer. Omitting the separate closed-window layer is
+    therefore insufficient. We rebuild only the adaptive glass polygon from an
+    otherwise identical composition with that door closed; the door panel,
+    mirror, shadows and complete official canvas remain untouched.
+    """
+    compose_options: dict[str, Any] = {"format": "PNG"}
+    if charge_frame is not None:
+        compose_options["charge_frame"] = charge_frame
+    raw = package.compose(visual_status, **compose_options)
+    doors = getattr(visual_status, "doors", None)
+    if not bool(getattr(doors, "lbcm_driver_door_status", False)):
+        return raw, 0
+
+    try:
+        from PIL import Image, ImageChops, ImageDraw
+
+        base_status = copy.deepcopy(visual_status)
+        setattr(base_status.doors, "lbcm_driver_door_status", False)
+        base_raw = package.compose(base_status, **compose_options)
+        opened = Image.open(io.BytesIO(raw)).convert("RGBA")
+        base = Image.open(io.BytesIO(base_raw)).convert("RGBA")
+        if opened.size != base.size:
+            return raw, 0
+
+        delta = ImageChops.difference(opened, base)
+        bbox = delta.getbbox()
+        if bbox is None:
+            return raw, 0
+        left, top, right, bottom = bbox
+        width = right - left
+        height = bottom - top
+        if width < 24 or height < 24:
+            return raw, 0
+
+        # The package uses the same aligned canvas for all model layers. Derive
+        # the glass polygon from the actual open-door delta instead of absolute
+        # vehicle/image coordinates so the correction follows different sizes.
+        polygon = [
+            (left + round(width * 0.05), top + round(height * 0.48)),
+            (left + round(width * 0.35), top + round(height * 0.03)),
+            (right - max(1, round(width * 0.02)), top),
+            (right - max(1, round(width * 0.01)), top + round(height * 0.48)),
+        ]
+        region_mask = Image.new("L", opened.size, 0)
+        ImageDraw.Draw(region_mask).polygon(polygon, fill=255)
+
+        channels = delta.split()
+        changed = channels[0]
+        for channel in channels[1:]:
+            changed = ImageChops.lighter(changed, channel)
+        changed = changed.point(lambda value: 255 if value > 6 else 0)
+        restore_mask = ImageChops.multiply(region_mask, changed)
+        restored_pixels = sum(restore_mask.histogram()[1:])
+        if restored_pixels < 8:
+            return raw, 0
+
+        cleaned = Image.composite(base, opened, restore_mask)
+        buffer = io.BytesIO()
+        cleaned.save(buffer, format="PNG", optimize=True)
+        return buffer.getvalue(), restored_pixels
+    except Exception as exc:
+        connector_log(
+            logging.WARNING,
+            "Correção visual da porta aberta não pôde ser aplicada (%s); composição oficial preservada.",
+            type(exc).__name__,
+        )
+        return raw, 0
+
+
 def _encode_official_composite(raw_image: bytes, media_type: str = "image/png") -> tuple[bytes, dict[str, Any]]:
     """Preserve the exact official canvas, alpha, shadow and wheel area.
 
@@ -1340,9 +1418,11 @@ def _compose_official_output(package: Any, visual_status: Any, render_state: str
     """Return the official static or animated composition without local cropping."""
     raw: bytes
     media_type = "image/png"
+    glass_restored_pixels = 0
     if render_state == "charging":
         animated = getattr(package, "compose_animated", None)
-        if callable(animated):
+        front_left_open = bool(getattr(getattr(visual_status, "doors", None), "lbcm_driver_door_status", False))
+        if callable(animated) and not front_left_open:
             result = animated(visual_status, frame_duration=180)
             if isinstance(result, tuple) and len(result) == 2 and isinstance(result[0], bytes):
                 raw = result[0]
@@ -1355,7 +1435,12 @@ def _compose_official_output(package: Any, visual_status: Any, render_state: str
             from PIL import Image
             frames = []
             for frame_number in range(2, 16):
-                frame_raw = package.compose(visual_status, charge_frame=frame_number, format="PNG")
+                frame_raw, frame_restored = _compose_official_frame(
+                    package,
+                    visual_status,
+                    charge_frame=frame_number,
+                )
+                glass_restored_pixels += frame_restored
                 frames.append(Image.open(io.BytesIO(frame_raw)).convert("RGBA"))
             buffer = io.BytesIO()
             frames[0].save(
@@ -1371,10 +1456,12 @@ def _compose_official_output(package: Any, visual_status: Any, render_state: str
             raw = buffer.getvalue()
             media_type = "image/webp"
     else:
-        raw = package.compose(visual_status, format="PNG")
+        raw, glass_restored_pixels = _compose_official_frame(package, visual_status)
     if not isinstance(raw, bytes):
         raise ValueError("A biblioteca não retornou a composição oficial.")
     output, metadata = _encode_official_composite(raw, media_type)
+    metadata["open_door_glass_restored"] = glass_restored_pixels > 0
+    metadata["open_door_glass_restored_pixels"] = glass_restored_pixels
     return output, "image/webp", metadata
 
 def _debug_safe_name(value: str, index: int) -> str:
@@ -1729,7 +1816,7 @@ def _official_render_cache_key(remote_id: str, picture_key_hash: str, render_lay
         str(remote_id or "").strip(),
         str(picture_key_hash or "").strip().lower(),
         str(render_layer_signature or "parked").strip().lower(),
-        "contract-13",
+        "contract-15",
     ])
     return hashlib.sha256(source.encode("utf-8")).hexdigest()
 
@@ -1826,7 +1913,7 @@ def official_visual_image_payload(
             "rendered_layer_signature": render_layer_signature,
             "rendered_layer_components": render_components,
             "image_cleanup": cleanup,
-            "render_contract_version": 14,
+            "render_contract_version": 15,
             "visual_image_state_key": cache_key,
             "state_cache_hit": state_cache_hit,
             "consistency_hash": hashlib.sha256(consistency_source.encode("utf-8")).hexdigest(),
@@ -2429,7 +2516,7 @@ def serialize_vehicle(
             "visual_fingerprint": visual_fingerprint_value,
             "rendered_primary_state": visual_primary_state,
             "rendered_signature": visual_signature,
-            "render_contract_version": 14,
+            "render_contract_version": 15,
         })
     result["telemetry"] = telemetry
     return result
