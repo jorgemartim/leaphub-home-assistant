@@ -1,3 +1,10 @@
+## 1.12.27
+
+- adiciona diagnóstico allow-list do retorno da biblioteca para comandos Sentinela, sem serializar tokens, PIN, VIN ou identificadores opacos;
+- diferencia `library_method_completed_without_exception` de confirmação física do veículo;
+- expõe `remote_result_signal`, `remote_result_evidence` e `remote_result_summary` para o Beta;
+- mantém `sentry_on`/`sentry_off` sem repetição automática e preserva os 25 comandos estáveis.
+
 ## 1.12.26
 
 - Diagnóstico seguro do Sentinela e motivo de confirmação pendente sem duplicar comandos.

@@ -42,7 +42,7 @@ except ImportError:
         _privacy_spec.loader.exec_module(_privacy_module)
         sanitize_log = _privacy_module.sanitize_log
 
-CONNECTOR_VERSION = "1.12.26"
+CONNECTOR_VERSION = "1.12.27"
 MAX_INPUT_BYTES = 1024 * 1024
 logging.getLogger("leapmotor_api").setLevel(logging.WARNING)
 LOGGER = logging.getLogger("leaphub.connector")
@@ -116,6 +116,133 @@ def json_default(value: Any) -> Any:
 
 def clean_message(message: str) -> str:
     return sanitize_log(message, 900)
+
+
+def safe_remote_result_summary(value: Any) -> dict[str, Any]:
+    """Return a tiny allow-listed diagnostic view of a library command result.
+
+    Remote-control responses can contain opaque identifiers and future fields.
+    Never serialize the whole object: only status-like values are retained.
+    """
+    summary: dict[str, Any] = {
+        "type": type(value).__name__,
+        "returned": value is not None,
+        "payload": "none" if value is None else "opaque",
+    }
+    if value is None:
+        return summary
+
+    if isinstance(value, bool):
+        summary.update({"payload": "scalar", "value": value})
+        return summary
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        summary.update({"payload": "scalar", "value": value})
+        return summary
+    if isinstance(value, str):
+        summary.update({"payload": "scalar", "value": clean_message(value)[:160]})
+        return summary
+
+    mapping: dict[str, Any] = {}
+    if isinstance(value, dict):
+        mapping = value
+    elif is_dataclass(value):
+        try:
+            raw = asdict(value)
+            mapping = raw if isinstance(raw, dict) else {}
+        except Exception:
+            mapping = {}
+    else:
+        for exporter in ("model_dump", "dict"):
+            fn = getattr(value, exporter, None)
+            if callable(fn):
+                try:
+                    raw = fn()
+                    if isinstance(raw, dict):
+                        mapping = raw
+                        break
+                except Exception:
+                    pass
+        if not mapping:
+            for name in (
+                "result", "code", "status", "success", "accepted", "completed",
+                "message", "reason", "description", "data", "remote_ctl_id",
+                "remoteCtlId", "remote_control_id",
+            ):
+                try:
+                    if hasattr(value, name):
+                        mapping[name] = getattr(value, name)
+                except Exception:
+                    pass
+
+    if not mapping:
+        return summary
+
+    summary["payload"] = "mapping"
+    allowed = {
+        "result", "code", "status", "success", "accepted", "completed",
+        "message", "reason", "description",
+    }
+    identifier_aliases = {"remotectlid", "remote_ctl_id", "remotecontrolid", "remote_control_id"}
+
+    def add_fields(source: dict[str, Any], prefix: str = "") -> None:
+        for raw_key, raw_value in source.items():
+            key = str(raw_key or "").strip()
+            normalized = re.sub(r"[^a-z0-9_]", "", key.lower())
+            if normalized in identifier_aliases:
+                summary[prefix + "remote_control_id_present"] = bool(raw_value)
+                continue
+            canonical = normalized.replace("_", "")
+            matched = None
+            for candidate in allowed:
+                if canonical == candidate.replace("_", ""):
+                    matched = candidate
+                    break
+            if matched is None:
+                continue
+            out_key = prefix + matched
+            if isinstance(raw_value, bool) or raw_value is None:
+                summary[out_key] = raw_value
+            elif isinstance(raw_value, (int, float)):
+                summary[out_key] = raw_value
+            elif isinstance(raw_value, str):
+                summary[out_key] = clean_message(raw_value)[:160]
+            else:
+                summary[out_key] = type(raw_value).__name__
+
+    add_fields(mapping)
+    nested = mapping.get("data")
+    if isinstance(nested, dict):
+        add_fields(nested, "data_")
+    response = mapping.get("response")
+    if isinstance(response, dict):
+        add_fields(response, "response_")
+    return summary
+
+
+def remote_result_signal(summary: dict[str, Any]) -> str:
+    """Classify only explicit result evidence; absence remains unknown."""
+    boolean_keys = (
+        "success", "accepted", "completed",
+        "data_success", "data_accepted", "data_completed",
+        "response_success", "response_accepted", "response_completed",
+    )
+    booleans = [summary.get(key) for key in boolean_keys if isinstance(summary.get(key), bool)]
+    if any(value is False for value in booleans):
+        return "negative"
+    if any(value is True for value in booleans):
+        return "positive"
+
+    for key in ("result", "code", "data_result", "data_code", "response_result", "response_code"):
+        value = summary.get(key)
+        if isinstance(value, (int, float)):
+            return "positive" if value == 0 else "negative"
+        if isinstance(value, str) and value.strip():
+            token = value.strip().lower()
+            if token in {"0", "ok", "success", "successful", "completed", "complete"}:
+                return "positive"
+            if token in {"1", "false", "failed", "failure", "error", "rejected", "denied"}:
+                return "negative"
+    return "unknown"
 
 
 class ConnectorTemporaryError(RuntimeError):
@@ -2917,6 +3044,9 @@ def handle_command(
     cloud_accepted = False
     dispatch_ack = "not_dispatched"
     remote_result_status = "not_started"
+    remote_result_summary: dict[str, Any] = {"type": "NoneType", "returned": False, "payload": "none"}
+    remote_result_signal_value = "unknown"
+    remote_result_evidence = "not_dispatched"
     command_started_at = time.time()
 
     def close_client(force: bool = False) -> None:
@@ -2963,7 +3093,7 @@ def handle_command(
         return client, resolved_id, vehicles, selected_method, source
 
     def classify_accepted_ambiguity(exc: Exception) -> bool:
-        nonlocal result, confirmation_pending, confirmation_reason, command_dispatched, cloud_accepted, dispatch_ack, remote_result_status
+        nonlocal result, confirmation_pending, confirmation_reason, command_dispatched, cloud_accepted, dispatch_ack, remote_result_status, remote_result_summary, remote_result_signal_value, remote_result_evidence
         if not (is_remote_command_confirmation_timeout(exc) or is_remote_command_result_session_error(exc)):
             return False
         confirmation_pending = True
@@ -2981,6 +3111,9 @@ def handle_command(
         cloud_accepted = True
         dispatch_ack = "cloud_accepted_result_pending"
         remote_result_status = confirmation_reason
+        remote_result_summary = safe_remote_result_summary(result)
+        remote_result_signal_value = "unknown"
+        remote_result_evidence = "cloud_acknowledged_but_result_query_inconclusive"
         return True
 
     def raise_classified(exc: Exception) -> None:
@@ -2997,7 +3130,7 @@ def handle_command(
         raise RuntimeError(clean_message(str(exc))) from exc
 
     def dispatch_once(stage: str, message: str, attempt: int) -> Exception | None:
-        nonlocal result, command_attempts, command_dispatched, cloud_accepted, dispatch_ack, remote_result_status
+        nonlocal result, command_attempts, command_dispatched, cloud_accepted, dispatch_ack, remote_result_status, remote_result_summary, remote_result_signal_value, remote_result_evidence
         report(stage, message, {
             "attempt": attempt,
             "climate_profile": active_climate_profile if command == "climate_off" else None,
@@ -3016,6 +3149,9 @@ def handle_command(
             cloud_accepted = True
             dispatch_ack = "library_returned"
             remote_result_status = "completed"
+            remote_result_summary = safe_remote_result_summary(result)
+            remote_result_signal_value = remote_result_signal(remote_result_summary)
+            remote_result_evidence = "library_method_completed_without_exception"
             return None
         except Exception as exc:  # noqa: BLE001
             if classify_accepted_ambiguity(exc):
@@ -3256,11 +3392,11 @@ def handle_command(
             elif confirmation_reason == "result_session_refresh":
                 message = "O Sentinela foi aceito pela nuvem, mas a sessão expirou durante a consulta do resultado. A telemetria verificará o estado sem reenviar o comando."
             else:
-                message = "O Sentinela foi enviado. A telemetria verificará o estado sem repetir o comando experimental."
+                message = "A biblioteca concluiu o comando Sentinela sem exceção. A telemetria verificará o estado sem repetir o comando experimental."
         elif confirmation_pending:
             message = "A ação foi aceita pela nuvem. O estado será confirmado pela telemetria sem repetir comandos não idempotentes."
         elif command in SENTRY_COMMANDS:
-            message = "A consulta de resultado do Sentinela terminou sem erro. A telemetria continuará validando o estado sentry_mode."
+            message = "O fluxo remoto do Sentinela terminou sem exceção. Isso confirma o processamento da chamada, mas não prova o estado físico enquanto sentry_mode não for publicado."
         else:
             message = "A ação foi enviada ao veículo. Atualizando o estado automaticamente."
 
@@ -3302,6 +3438,9 @@ def handle_command(
             "cloud_accepted": cloud_accepted,
             "dispatch_ack": dispatch_ack,
             "remote_result_status": remote_result_status,
+            "remote_result_evidence": remote_result_evidence,
+            "remote_result_signal": remote_result_signal_value,
+            "remote_result_summary": remote_result_summary if command in SENTRY_COMMANDS else {},
             "sentry_probe": command in SENTRY_COMMANDS,
             "session_reused": borrowed_client is not None,
             "verified_by_gateway": verified_by_gateway,

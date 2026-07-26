@@ -37,7 +37,7 @@ try:
 except ModuleNotFoundError:
     from privacy import install_logging_privacy_filter
 
-VERSION = "1.12.26"
+VERSION = "1.12.27"
 API_VERSION = 2
 CAPABILITY_SCHEMA_VERSION = 1
 MIN_SUPPORTED_CLIENT_API_VERSION = 1
@@ -900,8 +900,15 @@ def run_command_job(
         # telemetria de confirmação assumia a conta após três segundos e
         # abrir/fechar ou travar/destravar em sequência aguardava até 31s.
         defer_seconds = MANUAL_SETTLE_SECONDS
+        remote_summary = result.get("remote_result_summary")
+        remote_summary_text = (
+            json.dumps(remote_summary, ensure_ascii=False, separators=(",", ":"))
+            if isinstance(remote_summary, dict) and remote_summary
+            else "{}"
+        )
+        remote_summary_text = connector.clean_message(remote_summary_text)[:320]
         LOG.info(
-            "Comando remoto %s finalizado no worker para %s; resultado=%s, espera_fila=%ss, tentativas=%s, despertar_real=%s, repetição_segura=%s, estratégia=%s, confirmado_direto=%s, confirmação_pendente=%s, motivo=%s, ack=%s, resultado_remoto=%s.",
+            "Comando remoto %s finalizado no worker para %s; resultado=%s, espera_fila=%ss, tentativas=%s, despertar_real=%s, repetição_segura=%s, estratégia=%s, confirmado_direto=%s, confirmação_pendente=%s, motivo=%s, ack=%s, resultado_remoto=%s, evidencia=%s, sinal=%s, resumo=%s.",
             str(payload.get("command") or "desconhecido")[:40],
             environment,
             str(result.get("final_outcome") or ("confirmed" if result.get("verified_by_gateway") else "confirmation_pending"))[:40],
@@ -915,6 +922,9 @@ def run_command_job(
             str(result.get("confirmation_reason") or "none")[:48],
             str(result.get("dispatch_ack") or "unknown")[:48],
             str(result.get("remote_result_status") or "unknown")[:48],
+            str(result.get("remote_result_evidence") or "unknown")[:80],
+            str(result.get("remote_result_signal") or "unknown")[:32],
+            remote_summary_text,
         )
         if bool(result.get("session_recovered")):
             LOG.info("Comando %s exigiu uma nova sessão após cert/sync recusar o token anterior.", request_id[:12])
