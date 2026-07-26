@@ -1,3 +1,7 @@
+## 1.12.30
+- Fundação de transporte por eventos com hints deduplicados e wake-up da telemetria.
+- REST permanece fallback; MQTT fica explicitamente aguardando homologação e não cria caminho de comando paralelo.
+
 ## 1.12.29
 - Connection Orchestrator: circuit breaker da nuvem, telemetria FAST/SLOW e métricas de latência de comandos sem PII.
 - Comandos manuais não são bloqueados pelo circuit breaker e nenhum retry físico foi adicionado.

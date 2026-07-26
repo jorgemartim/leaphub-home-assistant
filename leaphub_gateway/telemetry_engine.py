@@ -36,9 +36,23 @@ except ModuleNotFoundError:
         _orchestrator_module = _importlib_util.module_from_spec(_orchestrator_spec)
         _orchestrator_spec.loader.exec_module(_orchestrator_module)
         ORCHESTRATOR = _orchestrator_module.ORCHESTRATOR
+try:
+    from leaphub_event_transport import EVENT_TRANSPORT
+except ModuleNotFoundError:
+    try:
+        from event_transport import EVENT_TRANSPORT
+    except ModuleNotFoundError:
+        import importlib.util as _event_importlib_util
+        _event_transport_path = Path(__file__).with_name("event_transport.py")
+        _event_transport_spec = _event_importlib_util.spec_from_file_location("leaphub_event_transport_local", _event_transport_path)
+        if _event_transport_spec is None or _event_transport_spec.loader is None:
+            raise
+        _event_transport_module = _event_importlib_util.module_from_spec(_event_transport_spec)
+        _event_transport_spec.loader.exec_module(_event_transport_module)
+        EVENT_TRANSPORT = _event_transport_module.EVENT_TRANSPORT
 
 LOG = logging.getLogger("leaphub.telemetry")
-ENGINE_VERSION = "1.12.29"
+ENGINE_VERSION = "1.12.30"
 
 
 def utc_iso() -> str:
@@ -181,13 +195,37 @@ class TelemetryEngine:
         self.session_idle_seconds = self._bounded("telemetry_session_idle_seconds", 21600, 1800, 86400)
         self.vehicle_list_cache_seconds = self._bounded("telemetry_vehicle_list_cache_seconds", 1800, 300, 7200)
         self.message_cache_seconds = self._bounded("telemetry_message_cache_seconds", 1800, 300, 14400)
-        # 1.12.29 — o estado essencial é FAST; mensagens/imagem oficial são SLOW.
+        # 1.12.30 — o estado essencial é FAST; mensagens/imagem oficial são SLOW.
         # Não adicionamos uma opção obrigatória ao schema do add-on para manter
         # atualização compatível com instalações antigas.
         self.slow_interval_seconds = max(600, min(1800, self.message_cache_seconds))
         self.request_timeout_seconds = self._bounded("telemetry_request_timeout_seconds", 15, 10, 30)
         self._init_db()
         self.storage_healthy = True
+        # 1.12.30 — a telemetria já aceita hints de um futuro transporte por
+        # eventos. O REST continua como fallback e nenhuma conexão MQTT é aberta
+        # enquanto autenticação/tópicos/payloads não estiverem homologados.
+        EVENT_TRANSPORT.register_wake_callback(self._wake_from_event)
+
+    def _wake_from_event(self, environment: str, account_id: int, vehicle_id: str, source: str) -> bool:
+        now = time.time()
+        with self.lock, self._db() as db:
+            rows = db.execute(
+                "SELECT subscription_id,active_until,next_run_at FROM subscriptions WHERE environment=? AND account_id=? AND enabled=1 AND auth_required=0",
+                (str(environment or ""), int(account_id)),
+            ).fetchall()
+            for row in rows:
+                active_until = max(float(row["active_until"] or 0), now + 90)
+                next_run = min(float(row["next_run_at"] or now), now)
+                db.execute(
+                    "UPDATE subscriptions SET active_until=?, next_run_at=?, status='event_hint', updated_at=? WHERE subscription_id=?",
+                    (active_until, next_run, utc_iso(), str(row["subscription_id"])),
+                )
+        if rows:
+            LOG.debug("Hint de evento %s acordou %s assinatura(s) sem abrir chamada extra por conta própria.", str(source or "event")[:40], len(rows))
+            self.wake_event.set()
+            return True
+        return False
 
     def _bounded(self, key: str, default: int, minimum: int, maximum: int) -> int:
         try:
@@ -1562,6 +1600,7 @@ class TelemetryEngine:
                 "presence_role": "fast_mode",
                 "session_reuse": True,
             },
+            "event_transport": EVENT_TRANSPORT.snapshot(),
             "recent_vehicle_states": recent_states,
             "recent": recent,
         }
@@ -1685,7 +1724,7 @@ class TelemetryEngine:
 
         environment = str(subscription["environment"])
         account_id = int(subscription["account_id"] or 0)
-        # 1.12.29 — circuit breaker global: durante uma oscilação confirmada
+        # 1.12.30 — circuit breaker global: durante uma oscilação confirmada
         # da nuvem, telemetria de fundo é reduzida para uma sonda moderada por
         # ambiente. Janelas interativas/comando continuam elegíveis.
         if not fast_mode and ORCHESTRATOR.is_degraded(environment) and not ORCHESTRATOR.claim_background_probe(environment):

@@ -50,8 +50,22 @@ except ModuleNotFoundError:
         _orchestrator_module = _importlib_util.module_from_spec(_orchestrator_spec)
         _orchestrator_spec.loader.exec_module(_orchestrator_module)
         ORCHESTRATOR = _orchestrator_module.ORCHESTRATOR
+try:
+    from leaphub_event_transport import EVENT_TRANSPORT
+except ModuleNotFoundError:
+    try:
+        from event_transport import EVENT_TRANSPORT
+    except ModuleNotFoundError:
+        import importlib.util as _event_importlib_util
+        _event_transport_path = Path(__file__).with_name("event_transport.py")
+        _event_transport_spec = _event_importlib_util.spec_from_file_location("leaphub_event_transport_local", _event_transport_path)
+        if _event_transport_spec is None or _event_transport_spec.loader is None:
+            raise
+        _event_transport_module = _event_importlib_util.module_from_spec(_event_transport_spec)
+        _event_transport_spec.loader.exec_module(_event_transport_module)
+        EVENT_TRANSPORT = _event_transport_module.EVENT_TRANSPORT
 
-VERSION = "1.12.29"
+VERSION = "1.12.30"
 API_VERSION = 2
 CAPABILITY_SCHEMA_VERSION = 1
 MIN_SUPPORTED_CLIENT_API_VERSION = 1
@@ -1295,6 +1309,7 @@ def detailed_health_payload(environment: str) -> dict[str, Any]:
         "library_version": library,
         "operation_limiter": SEMAPHORE.snapshot(),
         "connection_orchestrator": ORCHESTRATOR.snapshot(environment),
+        "event_transport": EVENT_TRANSPORT.snapshot(),
         "python_version": sys.version.split()[0],
         "environment": environment,
         "configured_environments": configured,
