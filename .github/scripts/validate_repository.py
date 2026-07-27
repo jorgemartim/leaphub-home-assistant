@@ -132,21 +132,9 @@ headings = re.findall(r"^##\s+(.+)$", changelog, flags=re.MULTILINE)
 if headings != [version]:
     fail(f"CHANGELOG.md deve conter somente o release atual {version}; encontrado: {headings}.")
 
-for test_file in (
-    ROOT / "tests" / "test_contracts.py",
-    ROOT / "tests" / "test_remote_command_matrix.py",
-    ROOT / "tests" / "test_comfort_contract.py",
-    ROOT / "tests" / "test_auth_recovery_contract.py",
-    ROOT / "tests" / "test_gateway_1_12_14.py",
-    ROOT / "tests" / "test_resilience_1_12_14.py",
-    ROOT / "tests" / "test_connection_resilience_1_12_15.py",
-    ROOT / "tests" / "test_full_resilience_1_12_16.py",
-    ROOT / "tests" / "test_single_ocpp_1_12_17.py",
-    ROOT / "tests" / "test_fast_install_1_12_18.py",
-    ROOT / "tests" / "test_background_telemetry_1_12_19.py",
-    ROOT / "tests" / "test_prebuilt_distribution_1_12_31.py",
-    ROOT / "tests" / "test_prebuilt_distribution_1_12_34.py",
-):
-    subprocess.run([sys.executable, str(test_file)], cwd=ROOT, check=True)
+# Executa a suíte inteira. O pytest em import-mode evita colisões entre
+# arquivos históricos com o mesmo basename em árvores diferentes.
+subprocess.run([sys.executable, "-m", "pytest", "-q", "tests"], cwd=ROOT, check=True)
+subprocess.run([sys.executable, "-m", "pytest", "-q", "leaphub_gateway/tests"], cwd=ROOT, check=True)
 
 print(f"Repositório válido. Leap Hub Gateway {version}.")
