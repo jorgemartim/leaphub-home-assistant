@@ -1,9 +1,7 @@
-## 1.12.41
+## 1.12.42
 
-- Classifica rejeições permanentes da API OCPP separadamente de falhas temporárias.
-- Mantém retry com backoff para timeout, 408, 425, 429 e 5xx.
-- Eventos permanentemente rejeitados deixam a fila ativa e entram em quarentena sanitizada, sem payload bruto, segredo ou Charge ID em texto claro.
-- Preserva FIFO por Charge ID e libera a sequência somente após entrega ou quarentena segura do evento bloqueador.
-- Expõe contadores de quarentena nos diagnósticos do Gateway.
-- Mantém Connector, telemetria, MQTT passivo, sessão, comandos e configurações existentes sem reset.
-- A distribuição continua usando a imagem GHCR oficial pré-compilada, sem alterar a instalação existente.
+- Mantém distribuição pré-compilada via GHCR.
+- Smoke test da imagem pré-compilada não executa mais o processo de longa duração `gateway_manager.py`.
+- Timeouts defensivos no teste da imagem publicada.
+- Publicação em duas fases preservada: imagem primeiro, versão do Home Assistant depois.
+- Sem alteração funcional de OCPP, Connector, opções ou dados persistentes em relação à 1.12.41.

@@ -36,7 +36,7 @@ def insert_event(gateway, identity: str, message_id: str, action: str = "StatusN
 
 def test_http_error_classification_is_fail_safe(tmp_path: Path) -> None:
     gateway = load_gateway(tmp_path)
-    assert gateway.GATEWAY_VERSION == "1.12.41"
+    assert gateway.GATEWAY_VERSION == "1.12.42"
 
     permanent = gateway.classify_api_error(
         403,

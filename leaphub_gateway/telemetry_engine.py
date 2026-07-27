@@ -52,7 +52,7 @@ except ModuleNotFoundError:
         EVENT_TRANSPORT = _event_transport_module.EVENT_TRANSPORT
 
 LOG = logging.getLogger("leaphub.telemetry")
-ENGINE_VERSION = "1.12.41"  # confirmação idêntica entregue ao site
+ENGINE_VERSION = "1.12.42"  # confirmação idêntica entregue ao site
 
 
 def utc_iso() -> str:
