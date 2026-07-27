@@ -1,8 +1,9 @@
-## 1.12.45
+## 1.12.46
 
-- Distribuição pré-compilada via GHCR preservada.
-- OCPP SQLite single-writer coordination to eliminate cross-wallbox write contention.
-- Reconnect route/owner write coalescing and aggregate reconnect-storm diagnostics.
-- Async vehicle sync with short-lived HTTP polling instead of a long Cloudflare request.
-- Health diagnostics now include latency and consecutive failures.
-- No destructive migration; existing queues and state are preserved.
+- Mantém distribuição pré-compilada via GHCR.
+- Corrige a inversão de lock da telemetria: a conta é adquirida antes da vaga global do Connector.
+- Uma conta ocupada não consome slot compartilhado enquanto aguarda.
+- Espera de slot é interrompível por comando manual da mesma conta.
+- Métricas agregadas de account wait, connector wait, yields e timeouts.
+- Exportação de diagnóstico sanitizado no painel Ingress, sem logs, tokens, segredos ou identificadores.
+- Nenhuma migration destrutiva; estado e filas existentes são preservados.

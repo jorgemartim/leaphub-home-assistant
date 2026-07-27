@@ -24,7 +24,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-VERSION = "1.12.45"
+VERSION = "1.12.46"
 OPTIONS_PATH = Path(os.getenv("LEAPHUB_OPTIONS_PATH", "/data/options.json"))
 RUNTIME = Path(os.getenv("LEAPHUB_RUNTIME_DIR", "/data/runtime"))
 LOG_DIR = Path(os.getenv("LEAPHUB_LOG_DIR", "/data/logs"))
@@ -647,6 +647,59 @@ def status_payload(include_logs: bool = True) -> dict[str, Any]:
     return result
 
 
+def diagnostic_export_payload() -> dict[str, Any]:
+    """Snapshot sanitizado: sem logs, tokens, segredos, URLs ou identificadores."""
+    base = status_payload(False)
+    services: dict[str, Any] = {}
+    for name, raw in (base.get("services") or {}).items():
+        if not isinstance(raw, dict):
+            continue
+        health = raw.get("health") if isinstance(raw.get("health"), dict) else {}
+        services[str(name)] = {
+            "enabled": bool(raw.get("enabled")),
+            "configured": bool(raw.get("configured")),
+            "state": str(raw.get("state") or "unknown")[:32],
+            "restarts": max(0, int(raw.get("restarts") or 0)),
+            "last_exit_code": raw.get("last_exit_code"),
+            "health": {
+                "ok": bool(health.get("ok")),
+                "latency_ms": max(0, int(health.get("latency_ms") or 0)),
+                "failures_consecutive": max(0, int(health.get("failures_consecutive") or 0)),
+                "last_ok_at": health.get("last_ok_at"),
+                "last_error_at": health.get("last_error_at"),
+            },
+        }
+    limiter = {}
+    connector = SERVICES.get("connector")
+    connector_health = connector.health() if connector is not None else {}
+    if isinstance(connector_health, dict):
+        details = connector_health.get("details") if isinstance(connector_health.get("details"), dict) else {}
+        limiter_raw = details.get("operation_limiter") if isinstance(details.get("operation_limiter"), dict) else {}
+        isolation_raw = details.get("operation_isolation") if isinstance(details.get("operation_isolation"), dict) else {}
+        limiter = {
+            "capacity": max(0, int(limiter_raw.get("capacity") or 0)),
+            "active": max(0, int(limiter_raw.get("active") or 0)),
+            "manual_waiters": max(0, int(limiter_raw.get("manual_waiters") or 0)),
+            "background_waiters": max(0, int(limiter_raw.get("background_waiters") or 0)),
+            "isolation": {
+                "per_account_locking": bool(isolation_raw.get("per_account_locking")),
+                "lock_order": str(isolation_raw.get("lock_order") or "")[:40],
+                "global_slot_held_while_waiting_account": bool(isolation_raw.get("global_slot_held_while_waiting_account")),
+                "manual_preemption": bool(isolation_raw.get("manual_preemption")),
+            },
+        }
+    return {
+        "product": "Leap Hub Gateway",
+        "version": VERSION,
+        "generated_at": utc_now(),
+        "privacy": "sanitized_no_logs_no_secrets_no_identifiers",
+        "services": services,
+        "telemetry": base.get("telemetry") if isinstance(base.get("telemetry"), dict) else {},
+        "ocpp_queue": base.get("ocpp_queue") if isinstance(base.get("ocpp_queue"), dict) else {},
+        "operation_limiter": limiter,
+    }
+
+
 def persist_status() -> None:
     temporary = STATUS_PATH.with_suffix(".tmp")
     temporary.write_text(json.dumps(status_payload(False), ensure_ascii=False), encoding="utf-8")
@@ -664,9 +717,9 @@ main{max-width:1180px;margin:auto;padding:24px}.hero{display:flex;gap:18px;align
 details{margin-top:12px}summary{cursor:pointer;color:var(--muted)}pre{white-space:pre-wrap;word-break:break-word;background:#050c15;border:1px solid var(--line);border-radius:12px;padding:12px;max-height:260px;overflow:auto;color:#bcd0e8;font-size:12px}.wide{grid-column:1/-1}.routes{display:grid;grid-template-columns:1fr auto;gap:8px}.routes code{background:#050c15;border:1px solid var(--line);border-radius:10px;padding:9px;overflow:auto}.notice{border-left:3px solid var(--blue);padding:10px 12px;background:rgba(85,167,255,.08);border-radius:10px;color:#cfe4ff}.foot{color:var(--muted);text-align:center;padding:20px}
 @media(max-width:760px){main{padding:14px}.grid{grid-template-columns:1fr}.hero{align-items:flex-start}.badge{display:none}.meta{grid-template-columns:1fr 1fr}.routes{grid-template-columns:1fr}}
 </style></head><body><main>
-<div class="hero"><div class="mark">LH</div><div><h1>Leap Hub Gateway</h1><p class="sub">Telemetria resiliente, Connector, OCPP e Cloudflare em um único App</p></div><span class="badge">v1.12.44</span></div>
+<div class="hero"><div class="mark">LH</div><div><h1>Leap Hub Gateway</h1><p class="sub">Telemetria resiliente, Connector, OCPP e Cloudflare em um único App</p></div><span class="badge">v1.12.46</span></div>
 <div class="grid" id="cards"></div>
-<section class="card wide" style="margin-top:16px"><div class="head"><div><h2>Rotas do Cloudflare Tunnel</h2><p>Como o Tunnel roda dentro do mesmo App, use 127.0.0.1 nas origens.</p></div></div><div class="routes"><code>connector.leaphub.com.br → http://127.0.0.1:8094</code><span>Connector</span><code>ocpp-wallbox.leaphub.com.br → http://127.0.0.1:8092</code><span>OCPP Wallbox · ambiente ativo</span></div><p class="notice">A fila de telemetria sobrevive a reinícios do App. Uma queda do Home Assistant inteiro ainda cria uma lacuna real, que nunca será preenchida com dados inventados.</p></section>
+<section class="card wide" style="margin-top:16px"><div class="head"><div><h2>Rotas do Cloudflare Tunnel</h2><p>Como o Tunnel roda dentro do mesmo App, use 127.0.0.1 nas origens.</p></div><a class="btn secondary" href="api/diagnostics/export">Exportar diagnóstico</a></div><div class="routes"><code>connector.leaphub.com.br → http://127.0.0.1:8094</code><span>Connector</span><code>ocpp-wallbox.leaphub.com.br → http://127.0.0.1:8092</code><span>OCPP Wallbox · ambiente ativo</span></div><p class="notice">A fila de telemetria sobrevive a reinícios do App. Uma queda do Home Assistant inteiro ainda cria uma lacuna real, que nunca será preenchida com dados inventados.</p></section>
 <div class="foot">Tokens e chaves nunca são exibidos neste painel.</div></main><script>
 const token='__TOKEN__';const labels={connector:'Connector Leapmotor',ocpp_wallbox:'OCPP Wallbox',tunnel:'Cloudflare Tunnel'};
 function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
@@ -708,6 +761,14 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/status":
             self.send_json(200, status_payload(True))
+            return
+        if path == "/api/diagnostics/export":
+            raw = json.dumps(diagnostic_export_payload(), ensure_ascii=False, indent=2).encode("utf-8")
+            self.send_response(200)
+            self.common_headers("application/json; charset=utf-8", len(raw))
+            self.send_header("Content-Disposition", f'attachment; filename="leaphub-gateway-diagnostic-{VERSION}.json"')
+            self.end_headers()
+            self.wfile.write(raw)
             return
         if path == "/":
             raw = DASHBOARD_HTML.replace("__TOKEN__", UI_TOKEN).encode()

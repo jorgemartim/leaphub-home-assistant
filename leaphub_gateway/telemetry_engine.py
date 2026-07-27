@@ -52,7 +52,7 @@ except ModuleNotFoundError:
         EVENT_TRANSPORT = _event_transport_module.EVENT_TRANSPORT
 
 LOG = logging.getLogger("leaphub.telemetry")
-ENGINE_VERSION = "1.12.45"  # confirmação idêntica entregue ao site
+ENGINE_VERSION = "1.12.46"  # confirmação idêntica entregue ao site
 
 
 def utc_iso() -> str:
@@ -1949,34 +1949,108 @@ class TelemetryEngine:
             self._reschedule(sid, 2, "waiting", "Comando do usuário tem prioridade sobre a telemetria automática.", failed=False)
             return
 
-        acquired = self.operation_semaphore.acquire(timeout=5)
-        if not acquired:
-            credentials.clear()
-            self._reschedule(sid, 30, "waiting", "Aguardando vaga no Connector.", failed=False)
-            return
-
-        if self._manual_operation_blocks(environment, operation_payload, command_mode=command_mode):
-            self.operation_semaphore.release()
-            credentials.clear()
-            self._reschedule(sid, 2, "waiting", "Comando do usuário aguardando execução; telemetria cedendo a conexão.", failed=False)
-            return
-
+        # 1.12.46 — ordem única de aquisição: conta -> vaga global.
+        # Antes a telemetria podia segurar uma vaga global enquanto aguardava
+        # a trava de uma conta ocupada, invertendo a ordem usada pelos comandos
+        # manuais. Isso permitia uma conta lenta consumir capacidade de outras.
+        queue_started_at = time.monotonic()
+        account_wait_ms = 0.0
+        connector_slot_ms = 0.0
         account_lock = None
         account_acquired = False
+        acquired = False
         if self.account_lock_provider is not None:
             account_lock = self.account_lock_provider(environment, operation_payload)
+            account_wait_started_at = time.monotonic()
             account_acquired = account_lock.acquire(timeout=self.account_wait_seconds)
+            account_wait_ms = (time.monotonic() - account_wait_started_at) * 1000.0
             if not account_acquired:
-                self.operation_semaphore.release()
                 credentials.clear()
+                ORCHESTRATOR.record_telemetry_cycle(
+                    environment,
+                    profile="confirmation" if command_mode else ("interactive" if interactive else "background"),
+                    duration_ms=0.0,
+                    outcome="account_busy_yield",
+                    account_wait_ms=account_wait_ms,
+                    connector_slot_ms=0.0,
+                )
                 self._reschedule(
                     sid,
                     15,
                     "waiting",
-                    "A conta já está sendo consultada por outra operação; a telemetria aguardará sem criar outro login.",
+                    "A conta já está sendo consultada por outra operação; nenhuma vaga global foi ocupada enquanto aguardava.",
                     failed=False,
                 )
                 return
+
+        if self._manual_operation_blocks(environment, operation_payload, command_mode=command_mode):
+            if account_acquired and account_lock is not None:
+                account_lock.release()
+            credentials.clear()
+            ORCHESTRATOR.record_telemetry_cycle(
+                environment,
+                profile="confirmation" if command_mode else ("interactive" if interactive else "background"),
+                duration_ms=0.0,
+                outcome="manual_yield",
+                account_wait_ms=account_wait_ms,
+                connector_slot_ms=0.0,
+            )
+            self._reschedule(sid, 2, "waiting", "Comando do usuário aguardando execução; telemetria liberou a conta antes de usar uma vaga global.", failed=False)
+            return
+
+        slot_wait_started_at = time.monotonic()
+        slot_deadline = slot_wait_started_at + 5.0
+        while True:
+            acquired = self.operation_semaphore.acquire(timeout=0.25)
+            if acquired:
+                break
+            if self._manual_operation_blocks(environment, operation_payload, command_mode=command_mode):
+                if account_acquired and account_lock is not None:
+                    account_lock.release()
+                credentials.clear()
+                connector_slot_ms = (time.monotonic() - slot_wait_started_at) * 1000.0
+                ORCHESTRATOR.record_telemetry_cycle(
+                    environment,
+                    profile="confirmation" if command_mode else ("interactive" if interactive else "background"),
+                    duration_ms=0.0,
+                    outcome="manual_yield",
+                    account_wait_ms=account_wait_ms,
+                    connector_slot_ms=connector_slot_ms,
+                )
+                self._reschedule(sid, 2, "waiting", "Telemetria liberou a conta para um comando manual antes de ocupar o Connector.", failed=False)
+                return
+            if time.monotonic() >= slot_deadline:
+                if account_acquired and account_lock is not None:
+                    account_lock.release()
+                credentials.clear()
+                connector_slot_ms = (time.monotonic() - slot_wait_started_at) * 1000.0
+                ORCHESTRATOR.record_telemetry_cycle(
+                    environment,
+                    profile="confirmation" if command_mode else ("interactive" if interactive else "background"),
+                    duration_ms=0.0,
+                    outcome="slot_timeout",
+                    account_wait_ms=account_wait_ms,
+                    connector_slot_ms=connector_slot_ms,
+                )
+                self._reschedule(sid, 30, "waiting", "Aguardando vaga no Connector; a conta foi liberada para não bloquear comandos.", failed=False)
+                return
+
+        connector_slot_ms = (time.monotonic() - slot_wait_started_at) * 1000.0
+        if self._manual_operation_blocks(environment, operation_payload, command_mode=command_mode):
+            self.operation_semaphore.release()
+            if account_acquired and account_lock is not None:
+                account_lock.release()
+            credentials.clear()
+            ORCHESTRATOR.record_telemetry_cycle(
+                environment,
+                profile="confirmation" if command_mode else ("interactive" if interactive else "background"),
+                duration_ms=0.0,
+                outcome="manual_yield",
+                account_wait_ms=account_wait_ms,
+                connector_slot_ms=connector_slot_ms,
+            )
+            self._reschedule(sid, 2, "waiting", "Comando do usuário aguardando execução; telemetria cedeu a vaga imediatamente.", failed=False)
+            return
         manual_provider = self.manual_active_provider if command_mode else self.manual_pending_provider
         manual_should_yield = (
             (lambda: bool(manual_provider and manual_provider(environment, operation_payload)))
@@ -2000,6 +2074,8 @@ class TelemetryEngine:
                 profile="confirmation" if command_mode else ("interactive" if interactive else "background"),
                 duration_ms=(time.monotonic() - collection_started_at) * 1000.0,
                 outcome="manual_yield",
+                account_wait_ms=account_wait_ms,
+                connector_slot_ms=connector_slot_ms,
             )
             self._reschedule(sid, 2, "waiting", "Telemetria cedeu a conta para o comando do usuário.", failed=False)
             LOG.info("Telemetria de %s interrompida em ponto seguro para priorizar comando manual.", sid)
@@ -2010,6 +2086,8 @@ class TelemetryEngine:
                 profile="confirmation" if command_mode else ("interactive" if interactive else "background"),
                 duration_ms=(time.monotonic() - collection_started_at) * 1000.0,
                 outcome="failure",
+                account_wait_ms=account_wait_ms,
+                connector_slot_ms=connector_slot_ms,
             )
             message = connector.clean_message(str(exc))
             failures = int(subscription["consecutive_failures"] or 0) + 1
@@ -2074,9 +2152,11 @@ class TelemetryEngine:
                 self._reschedule(sid, delay, "error", message, failed=True)
             return
         finally:
+            # Libera primeiro o recurso global; a trava da conta sai logo depois.
+            # A ordem inversa de aquisição nunca é usada em nenhum caminho.
+            self.operation_semaphore.release()
             if account_acquired and account_lock is not None:
                 account_lock.release()
-            self.operation_semaphore.release()
             credentials.clear()
 
         collection_profile = str(result.get("collection_profile") or ("confirmation" if command_mode else "fast"))
@@ -2085,6 +2165,8 @@ class TelemetryEngine:
             profile="confirmation" if command_mode else collection_profile,
             duration_ms=(time.monotonic() - collection_started_at) * 1000.0,
             outcome="success",
+            account_wait_ms=account_wait_ms,
+            connector_slot_ms=connector_slot_ms,
         )
         ORCHESTRATOR.record_cloud_success(environment, account_id)
         vehicles = [item for item in (result.get("vehicles") or []) if isinstance(item, dict)]

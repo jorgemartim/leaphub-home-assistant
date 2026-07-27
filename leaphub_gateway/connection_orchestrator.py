@@ -150,12 +150,16 @@ class ConnectionOrchestrator:
         profile: str,
         duration_ms: float,
         outcome: str = "success",
+        account_wait_ms: float = 0.0,
+        connector_slot_ms: float = 0.0,
     ) -> None:
         env = self._environment(environment)
         item = {
             "profile": str(profile or "unknown")[:24],
             "duration_ms": max(0.0, float(duration_ms)),
             "outcome": str(outcome or "unknown")[:24],
+            "account_wait_ms": max(0.0, float(account_wait_ms)),
+            "connector_slot_ms": max(0.0, float(connector_slot_ms)),
         }
         with self._lock:
             self._telemetry_cycles[env].append(item)
@@ -201,7 +205,11 @@ class ConnectionOrchestrator:
             telemetry_durations = [float(item.get("duration_ms") or 0.0) for item in telemetry_cycles]
             telemetry_fast = [float(item.get("duration_ms") or 0.0) for item in telemetry_cycles if item.get("profile") in {"fast", "interactive", "confirmation"}]
             telemetry_slow = [float(item.get("duration_ms") or 0.0) for item in telemetry_cycles if item.get("profile") == "slow"]
+            telemetry_account_waits = [float(item.get("account_wait_ms") or 0.0) for item in telemetry_cycles]
+            telemetry_slot_waits = [float(item.get("connector_slot_ms") or 0.0) for item in telemetry_cycles]
             manual_yields = sum(1 for item in telemetry_cycles if item.get("outcome") == "manual_yield")
+            account_busy_yields = sum(1 for item in telemetry_cycles if item.get("outcome") == "account_busy_yield")
+            slot_timeouts = sum(1 for item in telemetry_cycles if item.get("outcome") == "slot_timeout")
             failures_total = sum(1 for item in telemetry_cycles if item.get("outcome") == "failure")
             return {
                 "state": "degraded" if degraded_for > 0 else "healthy",
@@ -244,7 +252,13 @@ class ConnectionOrchestrator:
                     "total_p95_ms": self._percentile(telemetry_durations, 95),
                     "fast_p95_ms": self._percentile(telemetry_fast, 95),
                     "slow_p95_ms": self._percentile(telemetry_slow, 95),
+                    "account_wait_p95_ms": self._percentile(telemetry_account_waits, 95),
+                    "connector_slot_p95_ms": self._percentile(telemetry_slot_waits, 95),
                     "manual_yields": manual_yields,
+                    "account_busy_yields": account_busy_yields,
+                    "slot_timeouts": slot_timeouts,
+                    "lock_order": "account_then_connector",
+                    "global_slot_held_while_waiting_account": False,
                     "failures": failures_total,
                 },
                 "deduplicated": dict(self._deduplicated),

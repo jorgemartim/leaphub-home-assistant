@@ -65,7 +65,7 @@ except ModuleNotFoundError:
         _event_transport_spec.loader.exec_module(_event_transport_module)
         EVENT_TRANSPORT = _event_transport_module.EVENT_TRANSPORT
 
-VERSION = "1.12.45"
+VERSION = "1.12.46"
 API_VERSION = 2
 CAPABILITY_SCHEMA_VERSION = 1
 MIN_SUPPORTED_CLIENT_API_VERSION = 1
@@ -105,6 +105,7 @@ class PriorityOperationLimiter:
         self.capacity = max(1, int(capacity))
         self._active = 0
         self._manual_waiters = 0
+        self._background_waiters = 0
         self._condition = threading.Condition()
 
     def acquire(self, blocking: bool = True, timeout: float = -1, priority: bool = False) -> bool:
@@ -112,6 +113,8 @@ class PriorityOperationLimiter:
         with self._condition:
             if priority:
                 self._manual_waiters += 1
+            else:
+                self._background_waiters += 1
             try:
                 while self._active >= self.capacity or (not priority and self._manual_waiters > 0):
                     if not blocking:
@@ -125,7 +128,9 @@ class PriorityOperationLimiter:
             finally:
                 if priority:
                     self._manual_waiters = max(0, self._manual_waiters - 1)
-                    self._condition.notify_all()
+                else:
+                    self._background_waiters = max(0, self._background_waiters - 1)
+                self._condition.notify_all()
 
     def release(self) -> None:
         with self._condition:
@@ -140,6 +145,7 @@ class PriorityOperationLimiter:
                 "capacity": self.capacity,
                 "active": self._active,
                 "manual_waiters": self._manual_waiters,
+                "background_waiters": self._background_waiters,
             }
 
 
@@ -1607,6 +1613,12 @@ def detailed_health_payload(environment: str) -> dict[str, Any]:
         "connector_version": connector.CONNECTOR_VERSION,
         "library_version": library,
         "operation_limiter": SEMAPHORE.snapshot(),
+        "operation_isolation": {
+            "per_account_locking": True,
+            "lock_order": "account_then_connector",
+            "global_slot_held_while_waiting_account": False,
+            "manual_preemption": True,
+        },
         "connection_orchestrator": ORCHESTRATOR.snapshot(environment),
         "event_transport": EVENT_TRANSPORT.snapshot(),
         "python_version": sys.version.split()[0],
