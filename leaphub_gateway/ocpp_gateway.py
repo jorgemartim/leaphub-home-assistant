@@ -38,7 +38,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-GATEWAY_VERSION = "1.12.41"
+GATEWAY_VERSION = "1.12.40"
 IS_RAILWAY = bool(os.getenv("RAILWAY_ENVIRONMENT_NAME") or os.getenv("RAILWAY_SERVICE_ID"))
 RUNTIME_DIR = Path(os.getenv("LEAPHUB_RUNTIME_DIR", "/tmp/leaphub-ocpp" if IS_RAILWAY else "."))
 BIND = os.getenv("LEAPHUB_OCPP_BIND", "0.0.0.0")
@@ -71,8 +71,6 @@ LIVENESS_TIMEOUT_SECONDS = max(60.0, float(os.getenv("LEAPHUB_OCPP_LIVENESS_TIME
 DISCONNECT_GRACE_SECONDS = max(0.0, min(30.0, float(os.getenv("LEAPHUB_OCPP_DISCONNECT_GRACE", "8"))))
 EVENT_QUEUE_MAX = max(100, int(os.getenv("LEAPHUB_OCPP_QUEUE_MAX", "10000")))
 EVENT_QUEUE_RETENTION_SECONDS = max(86400, int(os.getenv("LEAPHUB_OCPP_QUEUE_RETENTION_SECONDS", str(7 * 86400))))
-DEAD_LETTER_MAX = max(100, int(os.getenv("LEAPHUB_OCPP_DEAD_LETTER_MAX", "1000")))
-DEAD_LETTER_RETENTION_SECONDS = max(86400, int(os.getenv("LEAPHUB_OCPP_DEAD_LETTER_RETENTION_SECONDS", str(14 * 86400))))
 STARTED_AT = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 DIAGNOSTIC_WINDOW_SECONDS = 180
 DIAGNOSTIC_NONCES: dict[str, float] = {}
@@ -114,31 +112,6 @@ class ApiTarget:
     name: str
     url: str
     secret: str
-
-
-class ApiRequestError(RuntimeError):
-    """Erro HTTP conhecido da API interna do Leap Hub."""
-
-    def __init__(
-        self,
-        message: str,
-        *,
-        status_code: int = 0,
-        error_code: str = "",
-        retry_after_seconds: int = 0,
-    ) -> None:
-        super().__init__(message)
-        self.status_code = max(0, int(status_code))
-        self.error_code = re.sub(r"[^a-z0-9._-]", "_", str(error_code or "").lower())[:80]
-        self.retry_after_seconds = max(0, min(86400, int(retry_after_seconds or 0)))
-
-
-class PermanentApiError(ApiRequestError):
-    """A mesma requisição não ficará válida apenas por ser repetida."""
-
-
-class TransientApiError(ApiRequestError):
-    """Falha recuperável por retry com backoff."""
 
 
 def configured_targets() -> list[ApiTarget]:
@@ -228,25 +201,9 @@ def state_db() -> sqlite3.Connection:
                     last_error TEXT NULL,
                     UNIQUE(target_name, identity, command_id)
                 )""")
-                db.execute("""CREATE TABLE IF NOT EXISTS dead_letter_queue (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    fingerprint TEXT NOT NULL UNIQUE,
-                    kind TEXT NOT NULL,
-                    target_name TEXT NOT NULL,
-                    identity_hash TEXT NOT NULL,
-                    message_hash TEXT NOT NULL,
-                    ocpp_action TEXT NOT NULL,
-                    status_code INTEGER NOT NULL DEFAULT 0,
-                    error_code TEXT NOT NULL DEFAULT '',
-                    error_text TEXT NOT NULL DEFAULT '',
-                    occurrences INTEGER NOT NULL DEFAULT 1,
-                    first_seen_at REAL NOT NULL,
-                    last_seen_at REAL NOT NULL
-                )""")
                 db.execute("CREATE INDEX IF NOT EXISTS idx_ocpp_event_due ON event_queue(available_at,id)")
                 db.execute("CREATE INDEX IF NOT EXISTS idx_ocpp_event_identity ON event_queue(target_name,identity,id)")
                 db.execute("CREATE INDEX IF NOT EXISTS idx_ocpp_result_due ON command_result_queue(available_at,id)")
-                db.execute("CREATE INDEX IF NOT EXISTS idx_ocpp_dead_letter_seen ON dead_letter_queue(last_seen_at,id)")
                 db.commit()
                 STATE_DB_INITIALIZED = True
     return db
@@ -273,60 +230,6 @@ def prune_queues(db: sqlite3.Connection) -> None:
             "(SELECT id FROM command_result_queue ORDER BY id ASC LIMIT ?)",
             (result_total - EVENT_QUEUE_MAX,),
         )
-    dead_cutoff = time.time() - DEAD_LETTER_RETENTION_SECONDS
-    db.execute("DELETE FROM dead_letter_queue WHERE last_seen_at < ?", (dead_cutoff,))
-    dead_total = int(db.execute("SELECT COUNT(*) FROM dead_letter_queue").fetchone()[0])
-    if dead_total > DEAD_LETTER_MAX:
-        db.execute(
-            "DELETE FROM dead_letter_queue WHERE id IN "
-            "(SELECT id FROM dead_letter_queue ORDER BY last_seen_at ASC,id ASC LIMIT ?)",
-            (dead_total - DEAD_LETTER_MAX,),
-        )
-
-
-def _dead_letter_fingerprint(kind: str, target_name: str, identity: str, action: str, error_code: str) -> str:
-    raw = f"{kind}|{target_name}|{identity}|{action}|{error_code}".encode("utf-8", "replace")
-    return hashlib.sha256(raw).hexdigest()
-
-
-def quarantine_delivery(
-    *,
-    kind: str,
-    target_name: str,
-    identity: str,
-    message_id: str,
-    action: str,
-    error: ApiRequestError | Exception,
-) -> None:
-    """Registra uma rejeição permanente sem guardar payload, senha ou Charge ID bruto."""
-    now = time.time()
-    error_code = str(getattr(error, "error_code", "permanent_api_error") or "permanent_api_error")[:80]
-    status_code = max(0, int(getattr(error, "status_code", 0) or 0))
-    fingerprint = _dead_letter_fingerprint(kind, target_name, identity, action, error_code)
-    identity_hash = hashlib.sha256(identity.encode("utf-8", "replace")).hexdigest()
-    message_hash = hashlib.sha256(str(message_id).encode("utf-8", "replace")).hexdigest() if message_id else ""
-    error_text = re.sub(r"\s+", " ", str(error)).strip()[:300]
-    try:
-        with state_db() as db:
-            db.execute(
-                "INSERT INTO dead_letter_queue(fingerprint,kind,target_name,identity_hash,message_hash,ocpp_action,status_code,error_code,error_text,occurrences,first_seen_at,last_seen_at) "
-                "VALUES(?,?,?,?,?,?,?,?,?,1,?,?) ON CONFLICT(fingerprint) DO UPDATE SET "
-                "message_hash=excluded.message_hash,status_code=excluded.status_code,error_text=excluded.error_text,"
-                "occurrences=dead_letter_queue.occurrences+1,last_seen_at=excluded.last_seen_at",
-                (fingerprint, kind[:40], target_name[:40], identity_hash, message_hash, action[:80], status_code, error_code, error_text, now, now),
-            )
-            prune_queues(db)
-            db.commit()
-    except sqlite3.Error as exc:
-        LOG.error("Could not quarantine permanent OCPP delivery for %s: %s", action, exc)
-
-
-def dead_letter_count() -> int:
-    try:
-        with state_db() as db:
-            return int(db.execute("SELECT COUNT(*) FROM dead_letter_queue").fetchone()[0])
-    except sqlite3.Error:
-        return 0
 
 
 def has_pending_event(target: ApiTarget, identity: str) -> bool:
@@ -435,15 +338,11 @@ def queue_diagnostics() -> dict[str, Any]:
             now = time.time()
             event = db.execute("SELECT COUNT(*),MIN(created_at),MAX(attempts) FROM event_queue").fetchone()
             result = db.execute("SELECT COUNT(*),MIN(created_at),MAX(attempts) FROM command_result_queue").fetchone()
-            dead = db.execute("SELECT COUNT(*),MAX(last_seen_at),SUM(occurrences) FROM dead_letter_queue").fetchone()
         return {
             "oldest_event_age_seconds": max(0, int(now - float(event[1]))) if event and event[1] is not None else 0,
             "oldest_result_age_seconds": max(0, int(now - float(result[1]))) if result and result[1] is not None else 0,
             "max_event_attempts": int(event[2] or 0) if event else 0,
             "max_result_attempts": int(result[2] or 0) if result else 0,
-            "dead_letter_count": int(dead[0] or 0) if dead else 0,
-            "dead_letter_occurrences": int(dead[2] or 0) if dead else 0,
-            "last_dead_letter_age_seconds": max(0, int(now - float(dead[1]))) if dead and dead[1] is not None else 0,
             "last_replay_at": QUEUE_LAST_REPLAY_AT,
             "last_replay_error": QUEUE_LAST_REPLAY_ERROR[:200],
         }
@@ -470,32 +369,6 @@ def safe_http_error_detail(code: int, raw: bytes) -> str:
             return f"HTTP {code}: {message[:180]}" if message else f"HTTP {code}"
     except json.JSONDecodeError: pass
     return f"HTTP {code}: {re.sub(r'\s+', ' ', text)[:180]}"
-
-
-def classify_api_error(status: int, raw: bytes, retry_after_header: str = "") -> ApiRequestError:
-    decoded: dict[str, Any] = {}
-    try:
-        candidate = json.loads(raw.decode("utf-8"))
-        if isinstance(candidate, dict):
-            decoded = candidate
-    except (UnicodeDecodeError, json.JSONDecodeError):
-        decoded = {}
-    retry_after = 0
-    try:
-        retry_after = int(decoded.get("retry_after_seconds") or retry_after_header or 0)
-    except (TypeError, ValueError):
-        retry_after = 0
-    error_code = str(decoded.get("error_code") or "")[:80]
-    detail = safe_http_error_detail(status, raw[:4096])
-    explicit_temporary = decoded.get("temporary") is True or decoded.get("retryable") is True
-    transient = explicit_temporary or status in {408, 425, 429} or 500 <= status <= 599
-    error_type = TransientApiError if transient else PermanentApiError
-    return error_type(
-        detail,
-        status_code=status,
-        error_code=error_code or ("http_transient" if transient else "http_permanent"),
-        retry_after_seconds=retry_after,
-    )
 
 
 def _api_connection_state(target: ApiTarget) -> dict[str, Any]:
@@ -577,12 +450,8 @@ def api_call(target: ApiTarget, payload: dict[str, Any], timeout: float = 8.0) -
                     state["connection"] = None
                     connection.close()
                 if response.status < 200 or response.status >= 300:
-                    error = classify_api_error(response.status, raw[:4096], response.getheader("Retry-After", ""))
-                    raise type(error)(
-                        f"Internal API {target.name} rejected request: {error}",
-                        status_code=error.status_code,
-                        error_code=error.error_code,
-                        retry_after_seconds=error.retry_after_seconds,
+                    raise RuntimeError(
+                        f"Internal API {target.name} rejected request: {safe_http_error_detail(response.status, raw[:4096])}"
                     )
                 try:
                     decoded = json.loads(raw.decode("utf-8"))
@@ -590,14 +459,7 @@ def api_call(target: ApiTarget, payload: dict[str, Any], timeout: float = 8.0) -
                     raise RuntimeError(f"Internal API {target.name} returned a non-JSON response") from exc
                 if not isinstance(decoded, dict) or not decoded.get("ok"):
                     message = str(decoded.get("message", "Internal API returned an invalid response.")) if isinstance(decoded, dict) else "Invalid response"
-                    temporary = isinstance(decoded, dict) and (decoded.get("temporary") is True or decoded.get("retryable") is True)
-                    error_type = TransientApiError if temporary else PermanentApiError
-                    raise error_type(
-                        f"Internal API {target.name}: {message[:200]}",
-                        status_code=200,
-                        error_code=str(decoded.get("error_code") or ("invalid_api_response" if not temporary else "temporary_api_response")) if isinstance(decoded, dict) else "invalid_api_response",
-                        retry_after_seconds=int(decoded.get("retry_after_seconds") or 0) if isinstance(decoded, dict) else 0,
-                    )
+                    raise RuntimeError(f"Internal API {target.name}: {message[:200]}")
                 return decoded
             except (TimeoutError, OSError, http.client.HTTPException) as exc:
                 last_error = exc
@@ -756,7 +618,6 @@ def detailed_health_payload() -> dict[str, Any]:
         "queued_events": queue_counts()[0],
         "queued_command_results": queue_counts()[1],
         "cached_routes": queue_counts()[2],
-        "quarantined_deliveries": dead_letter_count(),
     }
 
 
@@ -900,18 +761,6 @@ class ChargePointConnection:
             return
         try:
             result = await asyncio.to_thread(api_call, self.target, request_payload, 5.0)
-        except PermanentApiError as exc:
-            if action in RESILIENT_ACTIONS:
-                quarantine_delivery(
-                    kind="event", target_name=self.target.name, identity=self.identity,
-                    message_id=message_id, action=action, error=exc,
-                )
-                await self.send_json([3, message_id, local_response(action, self.authorization)])
-                LOG.error("Permanent OCPP rejection quarantined action=%s status=%s code=%s", action, exc.status_code, exc.error_code)
-                return
-            LOG.warning("Permanent synchronous OCPP rejection action=%s status=%s code=%s", action, exc.status_code, exc.error_code)
-            await self.send_json([4, message_id, "InternalError", "Request was rejected by the server.", {}])
-            return
         except Exception as exc:  # noqa: BLE001
             if action in RESILIENT_ACTIONS:
                 queue_event(self.target, self.identity, message_id, action, payload, str(exc))
@@ -1352,18 +1201,9 @@ def replay_command_results_once(limit: int = 25) -> int:
             with state_db() as db:
                 db.execute("DELETE FROM command_result_queue WHERE id=?", (result_id,)); db.commit()
             delivered += 1
-        except PermanentApiError as exc:
-            quarantine_delivery(
-                kind="command_result", target_name=str(target_name), identity=str(identity),
-                message_id=str(command_id), action="command_result", error=exc,
-            )
-            with state_db() as db:
-                db.execute("DELETE FROM command_result_queue WHERE id=?", (result_id,)); prune_queues(db); db.commit()
-            LOG.error("Permanent OCPP command-result rejection quarantined status=%s code=%s", exc.status_code, exc.error_code)
         except Exception as exc:  # noqa: BLE001
             attempt_count = int(attempts) + 1
-            retry_after = float(getattr(exc, "retry_after_seconds", 0) or 0)
-            delay = max(retry_after, min(900.0, 5.0 * (2 ** min(attempt_count, 7))))
+            delay = min(900.0, 5.0 * (2 ** min(attempt_count, 7)))
             with state_db() as db:
                 db.execute("UPDATE command_result_queue SET attempts=?,available_at=?,last_error=? WHERE id=?", (attempt_count, time.time()+delay, str(exc)[:300], result_id)); db.commit()
     return delivered
@@ -1418,19 +1258,9 @@ def replay_queue_once(limit: int = 25) -> int:
             QUEUE_LAST_REPLAY_AT = time.time()
             QUEUE_LAST_REPLAY_ERROR = ""
             delivered += 1
-        except PermanentApiError as exc:
-            quarantine_delivery(
-                kind="event", target_name=str(target_name), identity=str(identity),
-                message_id=str(message_id), action=str(action), error=exc,
-            )
-            with state_db() as db:
-                db.execute("DELETE FROM event_queue WHERE id=?", (event_id,)); prune_queues(db); db.commit()
-            QUEUE_LAST_REPLAY_AT = time.time()
-            QUEUE_LAST_REPLAY_ERROR = f"permanent:{exc.status_code}:{exc.error_code}"[:300]
-            LOG.error("Permanent queued OCPP rejection quarantined action=%s status=%s code=%s", action, exc.status_code, exc.error_code)
         except Exception as exc:  # noqa: BLE001
             attempt_count = int(attempts) + 1
-            delay = max(float(getattr(exc, "retry_after_seconds", 0) or 0), min(900.0, 5.0 * (2 ** min(attempt_count, 7))))
+            delay = min(900.0, 5.0 * (2 ** min(attempt_count, 7)))
             with state_db() as db:
                 db.execute("UPDATE event_queue SET attempts=?,available_at=?,last_error=? WHERE id=?", (attempt_count, time.time()+delay, str(exc)[:300], event_id))
                 prune_queues(db)
@@ -1490,7 +1320,6 @@ async def status_loop() -> None:
             "railway_environment": RAILWAY_ENVIRONMENT, "public_domain": PUBLIC_DOMAIN, "version": GATEWAY_VERSION,
             "unified_endpoint": True, "active_environment": ENVIRONMENT_LABEL, "target_count": len(API_TARGETS),
             "queued_events": pending_events, "queued_command_results": pending_command_results, "cached_routes": cached_routes,
-            "quarantined_deliveries": dead_letter_count(),
             "connection_liveness": {
                 "oldest_rx_age_seconds": max([int(now_mono - c.last_rx_at) for c in CONNECTIONS.values()] or [0]),
                 "pending_calls": sum(len(c.pending_calls) for c in CONNECTIONS.values()),

@@ -105,4 +105,4 @@ def test_command_poll_forces_delivery_to_site() -> None:
     source = (APP / "telemetry_engine.py").read_text(encoding="utf-8")
     assert "force_delivery=command_mode" in source
     assert 'event_kind = "confirmation" if force_delivery' in source
-    assert 'ENGINE_VERSION = "1.12.41"' in source
+    assert 'ENGINE_VERSION = "1.12.40"' in source

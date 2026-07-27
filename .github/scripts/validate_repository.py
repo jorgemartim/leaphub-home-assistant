@@ -2,10 +2,8 @@ from __future__ import annotations
 
 import py_compile
 import re
-import shutil
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
 
 import yaml
@@ -29,12 +27,6 @@ def load_yaml(path: Path) -> dict:
     return data
 
 
-def version_tuple(value: str) -> tuple[int, ...]:
-    if not re.fullmatch(r"\d+\.\d+\.\d+(?:\.\d+)?", value):
-        fail(f"Versão inválida: {value}")
-    return tuple(int(part) for part in value.split("."))
-
-
 repository = load_yaml(ROOT / "repository.yaml")
 for key in ("name", "url", "maintainer"):
     if not repository.get(key):
@@ -46,14 +38,9 @@ for key in required:
     if not config.get(key):
         fail(f"config.yaml não contém {key}.")
 
-published_version = str(config["version"])
-target_file = APP / "RELEASE_TARGET"
-target_version = target_file.read_text(encoding="utf-8").strip() if target_file.is_file() else published_version
-version_tuple(published_version)
-version_tuple(target_version)
-if version_tuple(published_version) > version_tuple(target_version):
-    fail(f"Versão publicada {published_version} não pode ser maior que o alvo {target_version}.")
-staged = published_version != target_version
+version = str(config["version"])
+if not re.fullmatch(r"\d+\.\d+\.\d+(?:\.\d+)?", version):
+    fail(f"Versão inválida: {version}")
 
 image = str(config.get("image") or "").strip()
 if image != "ghcr.io/jorgemartim/leaphub-gateway":
@@ -85,8 +72,9 @@ for filename in (
     path = APP / filename
     py_compile.compile(str(path), doraise=True)
     content = path.read_text(encoding="utf-8")
-    if filename != "connector.py" and target_version not in content:
-        fail(f"{filename} não contém a versão-alvo {target_version}.")
+    if filename != "connector.py" and version not in content:
+        fail(f"{filename} não contém a versão {version}.")
+
 
 # Garante que o Connector será incluído e importado com o mesmo nome usado em runtime.
 dockerfile = (APP / "Dockerfile").read_text(encoding="utf-8")
@@ -141,55 +129,24 @@ for translation in (APP / "translations").glob("*.yaml"):
 
 changelog = (APP / "CHANGELOG.md").read_text(encoding="utf-8")
 headings = re.findall(r"^##\s+(.+)$", changelog, flags=re.MULTILINE)
-if headings != [target_version]:
-    fail(f"CHANGELOG.md deve conter somente o release-alvo {target_version}; encontrado: {headings}.")
+if headings != [version]:
+    fail(f"CHANGELOG.md deve conter somente o release atual {version}; encontrado: {headings}.")
 
-build_workflow = (ROOT / ".github" / "workflows" / "build.yml").read_text(encoding="utf-8")
-for marker in (
-    "RELEASE_TARGET",
-    "Verify anonymous GHCR access before exposing update to Home Assistant",
-    "Promote App metadata only after image is public",
-    "contents: write",
-    "[gateway-published]",
+for test_file in (
+    ROOT / "tests" / "test_contracts.py",
+    ROOT / "tests" / "test_remote_command_matrix.py",
+    ROOT / "tests" / "test_comfort_contract.py",
+    ROOT / "tests" / "test_auth_recovery_contract.py",
+    ROOT / "tests" / "test_gateway_1_12_14.py",
+    ROOT / "tests" / "test_resilience_1_12_14.py",
+    ROOT / "tests" / "test_connection_resilience_1_12_15.py",
+    ROOT / "tests" / "test_full_resilience_1_12_16.py",
+    ROOT / "tests" / "test_single_ocpp_1_12_17.py",
+    ROOT / "tests" / "test_fast_install_1_12_18.py",
+    ROOT / "tests" / "test_background_telemetry_1_12_19.py",
+    ROOT / "tests" / "test_prebuilt_distribution_1_12_31.py",
+    ROOT / "tests" / "test_prebuilt_distribution_1_12_34.py",
 ):
-    if marker not in build_workflow:
-        fail(f"build.yml não contém a trava de publicação obrigatória: {marker}")
-if "continue-on-error: true" in build_workflow:
-    fail("A verificação anônima do GHCR não pode continuar em caso de erro.")
+    subprocess.run([sys.executable, str(test_file)], cwd=ROOT, check=True)
 
-# Os contratos históricos esperam que config.yaml já anuncie a versão de runtime.
-# Durante uma publicação em duas fases, validamos os mesmos contratos em uma cópia
-# efêmera com apenas esse campo promovido. O repositório real continua anunciando
-# a versão anterior até a imagem GHCR ser pública.
-test_root = ROOT
-cleanup: tempfile.TemporaryDirectory[str] | None = None
-if staged:
-    cleanup = tempfile.TemporaryDirectory(prefix="leaphub-staged-")
-    test_root = Path(cleanup.name) / "repo"
-    shutil.copytree(
-        ROOT,
-        test_root,
-        ignore=shutil.ignore_patterns(".git", "__pycache__", ".pytest_cache", "*.pyc"),
-    )
-    staged_config = test_root / "leaphub_gateway" / "config.yaml"
-    source = staged_config.read_text(encoding="utf-8")
-    source, count = re.subn(
-        r'^version:\s*"[^"]+"\s*$',
-        f'version: "{target_version}"',
-        source,
-        count=1,
-        flags=re.MULTILINE,
-    )
-    if count != 1:
-        fail("Não foi possível promover config.yaml na cópia de validação.")
-    staged_config.write_text(source, encoding="utf-8")
-
-try:
-    subprocess.run([sys.executable, "-m", "pytest", "-q", "tests"], cwd=test_root, check=True)
-    subprocess.run([sys.executable, "-m", "pytest", "-q", "leaphub_gateway/tests"], cwd=test_root, check=True)
-finally:
-    if cleanup is not None:
-        cleanup.cleanup()
-
-mode = "staged; imagem ainda não anunciada" if staged else "publicado"
-print(f"Repositório válido. Gateway alvo {target_version}; App {published_version} ({mode}).")
+print(f"Repositório válido. Leap Hub Gateway {version}.")
