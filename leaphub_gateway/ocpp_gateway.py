@@ -38,7 +38,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-GATEWAY_VERSION = "1.12.42"
+GATEWAY_VERSION = "1.12.43"
 IS_RAILWAY = bool(os.getenv("RAILWAY_ENVIRONMENT_NAME") or os.getenv("RAILWAY_SERVICE_ID"))
 RUNTIME_DIR = Path(os.getenv("LEAPHUB_RUNTIME_DIR", "/tmp/leaphub-ocpp" if IS_RAILWAY else "."))
 BIND = os.getenv("LEAPHUB_OCPP_BIND", "0.0.0.0")
@@ -243,6 +243,15 @@ def state_db() -> sqlite3.Connection:
                     first_seen_at REAL NOT NULL,
                     last_seen_at REAL NOT NULL
                 )""")
+                # Mapeamento mínimo usado somente para justiça de fila. Não altera
+                # as filas existentes e é preenchido no próximo handshake OCPP.
+                db.execute("""CREATE TABLE IF NOT EXISTS queue_owners (
+                    target_name TEXT NOT NULL,
+                    identity TEXT NOT NULL,
+                    owner_user_id INTEGER NOT NULL DEFAULT 0,
+                    updated_at REAL NOT NULL,
+                    PRIMARY KEY(target_name, identity)
+                )""")
                 db.execute("CREATE INDEX IF NOT EXISTS idx_ocpp_event_due ON event_queue(available_at,id)")
                 db.execute("CREATE INDEX IF NOT EXISTS idx_ocpp_event_identity ON event_queue(target_name,identity,id)")
                 db.execute("CREATE INDEX IF NOT EXISTS idx_ocpp_result_due ON command_result_queue(available_at,id)")
@@ -327,6 +336,31 @@ def dead_letter_count() -> int:
             return int(db.execute("SELECT COUNT(*) FROM dead_letter_queue").fetchone()[0])
     except sqlite3.Error:
         return 0
+
+
+def remember_queue_owner(target_name: str, identity: str, owner_user_id: Any) -> None:
+    """Persist a minimal owner scope so replay can be fair between users.
+
+    Existing queues remain valid. If ownership is unavailable (for example an
+    event queued before 1.12.43), replay falls back to the wallbox identity,
+    which is even more isolated and never merges unrelated users.
+    """
+    try:
+        owner_id = max(0, int(owner_user_id or 0))
+    except (TypeError, ValueError):
+        owner_id = 0
+    if not target_name or not identity or owner_id <= 0:
+        return
+    try:
+        with state_db() as db:
+            db.execute(
+                "INSERT INTO queue_owners(target_name,identity,owner_user_id,updated_at) VALUES(?,?,?,?) "
+                "ON CONFLICT(target_name,identity) DO UPDATE SET owner_user_id=excluded.owner_user_id,updated_at=excluded.updated_at",
+                (target_name, identity, owner_id, time.time()),
+            )
+            db.commit()
+    except sqlite3.Error as exc:
+        LOG.warning("Could not persist OCPP owner scope for %s: %s", identity, exc)
 
 
 def has_pending_event(target: ApiTarget, identity: str) -> bool:
@@ -436,6 +470,22 @@ def queue_diagnostics() -> dict[str, Any]:
             event = db.execute("SELECT COUNT(*),MIN(created_at),MAX(attempts) FROM event_queue").fetchone()
             result = db.execute("SELECT COUNT(*),MIN(created_at),MAX(attempts) FROM command_result_queue").fetchone()
             dead = db.execute("SELECT COUNT(*),MAX(last_seen_at),SUM(occurrences) FROM dead_letter_queue").fetchone()
+            owner_event_rows = db.execute(
+                "SELECT COUNT(*) AS backlog FROM event_queue q LEFT JOIN queue_owners o "
+                "ON o.target_name=q.target_name AND o.identity=q.identity "
+                "GROUP BY q.target_name, CASE WHEN COALESCE(o.owner_user_id,0)>0 THEN 'u:'||o.owner_user_id ELSE 'i:'||q.identity END"
+            ).fetchall()
+            identity_event_rows = db.execute(
+                "SELECT COUNT(*) AS backlog FROM event_queue GROUP BY target_name,identity"
+            ).fetchall()
+            owner_result_rows = db.execute(
+                "SELECT COUNT(*) AS backlog FROM command_result_queue q LEFT JOIN queue_owners o "
+                "ON o.target_name=q.target_name AND o.identity=q.identity "
+                "GROUP BY q.target_name, CASE WHEN COALESCE(o.owner_user_id,0)>0 THEN 'u:'||o.owner_user_id ELSE 'i:'||q.identity END"
+            ).fetchall()
+        owner_backlogs = [int(row[0] or 0) for row in owner_event_rows]
+        identity_backlogs = [int(row[0] or 0) for row in identity_event_rows]
+        owner_result_backlogs = [int(row[0] or 0) for row in owner_result_rows]
         return {
             "oldest_event_age_seconds": max(0, int(now - float(event[1]))) if event and event[1] is not None else 0,
             "oldest_result_age_seconds": max(0, int(now - float(result[1]))) if result and result[1] is not None else 0,
@@ -446,9 +496,16 @@ def queue_diagnostics() -> dict[str, Any]:
             "last_dead_letter_age_seconds": max(0, int(now - float(dead[1]))) if dead and dead[1] is not None else 0,
             "last_replay_at": QUEUE_LAST_REPLAY_AT,
             "last_replay_error": QUEUE_LAST_REPLAY_ERROR[:200],
+            "fair_replay_enabled": True,
+            "fairness_scope": "owner_user",
+            "owner_scopes": len(owner_backlogs),
+            "largest_owner_event_backlog": max(owner_backlogs or [0]),
+            "largest_identity_event_backlog": max(identity_backlogs or [0]),
+            "largest_owner_result_backlog": max(owner_result_backlogs or [0]),
         }
     except sqlite3.Error:
         return {}
+
 
 
 def local_response(action: str, authorization: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -1256,6 +1313,12 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
             return
         try:
             route_target, authorization = await asyncio.to_thread(resolve_route, identity, password, remote_ip)
+            await asyncio.to_thread(
+                remember_queue_owner,
+                route_target.name,
+                identity,
+                authorization.get("owner_user_id", 0) if isinstance(authorization, dict) else 0,
+            )
         except PermissionError:
             record_auth_failure(remote_ip); await http_error(writer, 401, "Unauthorized"); return
         except RuntimeError as exc:
@@ -1327,45 +1390,104 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 LOG.info("Charge point disconnected: %s", identity)
 
 
-def replay_command_results_once(limit: int = 25) -> int:
-    now = time.time()
+def _fair_owner_key(target_name: str, identity: str, owner_user_id: Any) -> str:
     try:
-        with state_db() as db:
-            prune_queues(db)
-            db.commit()
-            rows = db.execute(
-                "SELECT id,target_name,identity,command_id,status,payload_json,error_text,attempts FROM command_result_queue WHERE available_at<=? ORDER BY id LIMIT ?",
-                (now, limit),
-            ).fetchall()
-    except sqlite3.Error as exc:
-        LOG.warning("OCPP command-result queue read failed: %s", exc)
-        return 0
-    delivered = 0
+        owner_id = max(0, int(owner_user_id or 0))
+    except (TypeError, ValueError):
+        owner_id = 0
+    if owner_id > 0:
+        return f"{target_name}:user:{owner_id}"
+    # Old queued rows may predate the owner map. Falling back to identity keeps
+    # them isolated rather than putting unrelated users in a global bucket.
+    return f"{target_name}:identity:{identity}"
+
+
+def _fair_pick(rows: list[tuple[Any, ...]], limit: int, owner_index: int, target_index: int, identity_index: int) -> list[tuple[Any, ...]]:
+    selected: list[tuple[Any, ...]] = []
+    seen_owners: set[str] = set()
     for row in rows:
-        result_id, target_name, identity, command_id, status, payload_json, error_text, attempts = row
-        target = TARGETS_BY_NAME.get(str(target_name))
-        if target is None:
+        owner_key = _fair_owner_key(str(row[target_index]), str(row[identity_index]), row[owner_index])
+        if owner_key in seen_owners:
             continue
+        seen_owners.add(owner_key)
+        selected.append(row)
+        if len(selected) >= max(1, limit):
+            break
+    return selected
+
+
+def _due_command_result_owner_heads(now: float, limit: int) -> list[tuple[Any, ...]]:
+    """Return at most one due result per user scope for this scheduling round."""
+    with state_db() as db:
+        return db.execute(
+            "WITH due AS ("
+            " SELECT q.id,q.target_name,q.identity,q.command_id,q.status,q.payload_json,q.error_text,q.attempts,COALESCE(o.owner_user_id,0) AS owner_user_id"
+            " FROM command_result_queue q LEFT JOIN queue_owners o ON o.target_name=q.target_name AND o.identity=q.identity"
+            " WHERE q.available_at<=?"
+            "), owner_heads AS ("
+            " SELECT d.* FROM due d WHERE NOT EXISTS (SELECT 1 FROM due older WHERE older.id<d.id AND older.target_name=d.target_name AND ("
+            "   (d.owner_user_id>0 AND older.owner_user_id=d.owner_user_id) OR"
+            "   (d.owner_user_id<=0 AND older.owner_user_id<=0 AND older.identity=d.identity)"
+            " ))"
+            ") SELECT id,target_name,identity,command_id,status,payload_json,error_text,attempts,owner_user_id FROM owner_heads ORDER BY id LIMIT ?",
+            (now, max(1, limit)),
+        ).fetchall()
+
+
+def replay_command_results_once(limit: int = 25) -> int:
+    delivered = 0
+    processed = 0
+    while processed < max(1, limit):
+        now = time.time()
         try:
-            payload = json.loads(str(payload_json))
-            api_call(target, {"action": "command_result", "identity": identity, "command_id": int(command_id), "status": status, "payload": payload, "error": str(error_text)}, 6.0)
             with state_db() as db:
-                db.execute("DELETE FROM command_result_queue WHERE id=?", (result_id,)); db.commit()
-            delivered += 1
-        except PermanentApiError as exc:
-            quarantine_delivery(
-                kind="command_result", target_name=str(target_name), identity=str(identity),
-                message_id=str(command_id), action="command_result", error=exc,
-            )
-            with state_db() as db:
-                db.execute("DELETE FROM command_result_queue WHERE id=?", (result_id,)); prune_queues(db); db.commit()
-            LOG.error("Permanent OCPP command-result rejection quarantined status=%s code=%s", exc.status_code, exc.error_code)
-        except Exception as exc:  # noqa: BLE001
-            attempt_count = int(attempts) + 1
-            retry_after = float(getattr(exc, "retry_after_seconds", 0) or 0)
-            delay = max(retry_after, min(900.0, 5.0 * (2 ** min(attempt_count, 7))))
-            with state_db() as db:
-                db.execute("UPDATE command_result_queue SET attempts=?,available_at=?,last_error=? WHERE id=?", (attempt_count, time.time()+delay, str(exc)[:300], result_id)); db.commit()
+                prune_queues(db)
+                db.commit()
+            rows = _due_command_result_owner_heads(now, max(1, limit - processed))
+        except sqlite3.Error as exc:
+            LOG.warning("OCPP command-result queue read failed: %s", exc)
+            return delivered
+        if not rows:
+            break
+        # Query already returns one row per owner. _fair_pick is a defensive
+        # second guard in case an older SQLite engine/query plan behaves oddly.
+        selected = _fair_pick(rows, max(1, limit - processed), 8, 1, 2)
+        if not selected:
+            break
+        for row in selected:
+            processed += 1
+            result_id, target_name, identity, command_id, status, payload_json, error_text, attempts, _owner_user_id = row
+            target = TARGETS_BY_NAME.get(str(target_name))
+            if target is None:
+                with state_db() as db:
+                    db.execute(
+                        "UPDATE command_result_queue SET available_at=?,last_error=? WHERE id=?",
+                        (time.time() + 60.0, "OCPP target unavailable for fair replay", result_id),
+                    )
+                    db.commit()
+                continue
+            try:
+                payload = json.loads(str(payload_json))
+                api_call(target, {"action": "command_result", "identity": identity, "command_id": int(command_id), "status": status, "payload": payload, "error": str(error_text)}, 6.0)
+                with state_db() as db:
+                    db.execute("DELETE FROM command_result_queue WHERE id=?", (result_id,)); db.commit()
+                delivered += 1
+            except PermanentApiError as exc:
+                quarantine_delivery(
+                    kind="command_result", target_name=str(target_name), identity=str(identity),
+                    message_id=str(command_id), action="command_result", error=exc,
+                )
+                with state_db() as db:
+                    db.execute("DELETE FROM command_result_queue WHERE id=?", (result_id,)); prune_queues(db); db.commit()
+                LOG.error("Permanent OCPP command-result rejection quarantined status=%s code=%s", exc.status_code, exc.error_code)
+            except Exception as exc:  # noqa: BLE001
+                attempt_count = int(attempts) + 1
+                retry_after = float(getattr(exc, "retry_after_seconds", 0) or 0)
+                delay = max(retry_after, min(900.0, 5.0 * (2 ** min(attempt_count, 7))))
+                with state_db() as db:
+                    db.execute("UPDATE command_result_queue SET attempts=?,available_at=?,last_error=? WHERE id=?", (attempt_count, time.time()+delay, str(exc)[:300], result_id)); db.commit()
+            if processed >= limit:
+                break
     return delivered
 
 
@@ -1388,54 +1510,85 @@ def has_older_queued_event(target_name: str, identity: str, event_id: int) -> bo
         return True
 
 
+def _due_event_owner_heads(now: float, limit: int) -> list[tuple[Any, ...]]:
+    """Oldest due wallbox event per user scope, preserving absolute FIFO per identity."""
+    with state_db() as db:
+        return db.execute(
+            "WITH identity_heads AS ("
+            " SELECT q.id,q.target_name,q.identity,q.message_id,q.ocpp_action,q.payload_json,q.attempts,COALESCE(o.owner_user_id,0) AS owner_user_id"
+            " FROM event_queue q LEFT JOIN queue_owners o ON o.target_name=q.target_name AND o.identity=q.identity"
+            " WHERE q.available_at<=? AND NOT EXISTS ("
+            "   SELECT 1 FROM event_queue older WHERE older.target_name=q.target_name AND older.identity=q.identity AND older.id<q.id"
+            " )"
+            "), owner_heads AS ("
+            " SELECT h.* FROM identity_heads h WHERE NOT EXISTS (SELECT 1 FROM identity_heads older WHERE older.id<h.id AND older.target_name=h.target_name AND ("
+            "   (h.owner_user_id>0 AND older.owner_user_id=h.owner_user_id) OR"
+            "   (h.owner_user_id<=0 AND older.owner_user_id<=0 AND older.identity=h.identity)"
+            " ))"
+            ") SELECT id,target_name,identity,message_id,ocpp_action,payload_json,attempts,owner_user_id FROM owner_heads ORDER BY id LIMIT ?",
+            (now, max(1, limit)),
+        ).fetchall()
+
+
 def replay_queue_once(limit: int = 25) -> int:
     global QUEUE_LAST_REPLAY_AT, QUEUE_LAST_REPLAY_ERROR
-    now = time.time()
-    try:
-        with state_db() as db:
-            rows = db.execute(
-                "SELECT id,target_name,identity,message_id,ocpp_action,payload_json,attempts FROM event_queue WHERE available_at<=? ORDER BY id LIMIT ?",
-                (now, limit),
-            ).fetchall()
-    except sqlite3.Error as exc:
-        LOG.warning("OCPP queue read failed: %s", exc)
-        return 0
     delivered = 0
-    for row in rows:
-        event_id, target_name, identity, message_id, action, payload_json, attempts = row
-        if has_older_queued_event(str(target_name), str(identity), int(event_id)):
-            continue
-        target = TARGETS_BY_NAME.get(str(target_name))
-        if target is None:
-            continue
+    processed = 0
+    while processed < max(1, limit):
         try:
-            payload = json.loads(str(payload_json))
-            api_call(target, {"action": "ocpp_call", "identity": identity, "message_id": message_id, "ocpp_action": action, "payload": payload, "gateway_replay": True}, 6.0)
-            with state_db() as db:
-                db.execute("DELETE FROM event_queue WHERE id=?", (event_id,))
-                prune_queues(db)
-                db.commit()
-            QUEUE_LAST_REPLAY_AT = time.time()
-            QUEUE_LAST_REPLAY_ERROR = ""
-            delivered += 1
-        except PermanentApiError as exc:
-            quarantine_delivery(
-                kind="event", target_name=str(target_name), identity=str(identity),
-                message_id=str(message_id), action=str(action), error=exc,
-            )
-            with state_db() as db:
-                db.execute("DELETE FROM event_queue WHERE id=?", (event_id,)); prune_queues(db); db.commit()
-            QUEUE_LAST_REPLAY_AT = time.time()
-            QUEUE_LAST_REPLAY_ERROR = f"permanent:{exc.status_code}:{exc.error_code}"[:300]
-            LOG.error("Permanent queued OCPP rejection quarantined action=%s status=%s code=%s", action, exc.status_code, exc.error_code)
-        except Exception as exc:  # noqa: BLE001
-            attempt_count = int(attempts) + 1
-            delay = max(float(getattr(exc, "retry_after_seconds", 0) or 0), min(900.0, 5.0 * (2 ** min(attempt_count, 7))))
-            with state_db() as db:
-                db.execute("UPDATE event_queue SET attempts=?,available_at=?,last_error=? WHERE id=?", (attempt_count, time.time()+delay, str(exc)[:300], event_id))
-                prune_queues(db)
-                db.commit()
-            QUEUE_LAST_REPLAY_ERROR = str(exc)[:300]
+            rows = _due_event_owner_heads(time.time(), max(1, limit - processed))
+        except sqlite3.Error as exc:
+            LOG.warning("OCPP queue read failed: %s", exc)
+            return delivered
+        if not rows:
+            break
+        selected = _fair_pick(rows, max(1, limit - processed), 7, 1, 2)
+        if not selected:
+            break
+        for row in selected:
+            processed += 1
+            event_id, target_name, identity, message_id, action, payload_json, attempts, _owner_user_id = row
+            if has_older_queued_event(str(target_name), str(identity), int(event_id)):
+                continue
+            target = TARGETS_BY_NAME.get(str(target_name))
+            if target is None:
+                with state_db() as db:
+                    db.execute(
+                        "UPDATE event_queue SET available_at=?,last_error=? WHERE id=?",
+                        (time.time() + 60.0, "OCPP target unavailable for fair replay", event_id),
+                    )
+                    db.commit()
+                continue
+            try:
+                payload = json.loads(str(payload_json))
+                api_call(target, {"action": "ocpp_call", "identity": identity, "message_id": message_id, "ocpp_action": action, "payload": payload, "gateway_replay": True}, 6.0)
+                with state_db() as db:
+                    db.execute("DELETE FROM event_queue WHERE id=?", (event_id,))
+                    prune_queues(db)
+                    db.commit()
+                QUEUE_LAST_REPLAY_AT = time.time()
+                QUEUE_LAST_REPLAY_ERROR = ""
+                delivered += 1
+            except PermanentApiError as exc:
+                quarantine_delivery(
+                    kind="event", target_name=str(target_name), identity=str(identity),
+                    message_id=str(message_id), action=str(action), error=exc,
+                )
+                with state_db() as db:
+                    db.execute("DELETE FROM event_queue WHERE id=?", (event_id,)); prune_queues(db); db.commit()
+                QUEUE_LAST_REPLAY_AT = time.time()
+                QUEUE_LAST_REPLAY_ERROR = f"permanent:{exc.status_code}:{exc.error_code}"[:300]
+                LOG.error("Permanent queued OCPP rejection quarantined action=%s status=%s code=%s", action, exc.status_code, exc.error_code)
+            except Exception as exc:  # noqa: BLE001
+                attempt_count = int(attempts) + 1
+                delay = max(float(getattr(exc, "retry_after_seconds", 0) or 0), min(900.0, 5.0 * (2 ** min(attempt_count, 7))))
+                with state_db() as db:
+                    db.execute("UPDATE event_queue SET attempts=?,available_at=?,last_error=? WHERE id=?", (attempt_count, time.time()+delay, str(exc)[:300], event_id))
+                    prune_queues(db)
+                    db.commit()
+                QUEUE_LAST_REPLAY_ERROR = str(exc)[:300]
+            if processed >= limit:
+                break
     return delivered
 
 
@@ -1452,6 +1605,7 @@ async def queue_loop() -> None:
             await asyncio.wait_for(STOP_EVENT.wait(), timeout=wait)
         except asyncio.TimeoutError:
             pass
+
 
 
 def apply_route_overrides(source: ApiTarget, result: dict[str, Any]) -> None:
