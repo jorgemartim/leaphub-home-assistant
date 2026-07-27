@@ -24,7 +24,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-VERSION = "1.12.47"
+VERSION = "1.12.48"
 OPTIONS_PATH = Path(os.getenv("LEAPHUB_OPTIONS_PATH", "/data/options.json"))
 RUNTIME = Path(os.getenv("LEAPHUB_RUNTIME_DIR", "/data/runtime"))
 LOG_DIR = Path(os.getenv("LEAPHUB_LOG_DIR", "/data/logs"))
@@ -717,7 +717,7 @@ main{max-width:1180px;margin:auto;padding:24px}.hero{display:flex;gap:18px;align
 details{margin-top:12px}summary{cursor:pointer;color:var(--muted)}pre{white-space:pre-wrap;word-break:break-word;background:#050c15;border:1px solid var(--line);border-radius:12px;padding:12px;max-height:260px;overflow:auto;color:#bcd0e8;font-size:12px}.wide{grid-column:1/-1}.routes{display:grid;grid-template-columns:1fr auto;gap:8px}.routes code{background:#050c15;border:1px solid var(--line);border-radius:10px;padding:9px;overflow:auto}.notice{border-left:3px solid var(--blue);padding:10px 12px;background:rgba(85,167,255,.08);border-radius:10px;color:#cfe4ff}.foot{color:var(--muted);text-align:center;padding:20px}
 @media(max-width:760px){main{padding:14px}.grid{grid-template-columns:1fr}.hero{align-items:flex-start}.badge{display:none}.meta{grid-template-columns:1fr 1fr}.routes{grid-template-columns:1fr}}
 </style></head><body><main>
-<div class="hero"><div class="mark">LH</div><div><h1>Leap Hub Gateway</h1><p class="sub">Telemetria resiliente, Connector, OCPP e Cloudflare em um único App</p></div><span class="badge">v1.12.47</span></div>
+<div class="hero"><div class="mark">LH</div><div><h1>Leap Hub Gateway</h1><p class="sub">Telemetria resiliente, Connector, OCPP e Cloudflare em um único App</p></div><span class="badge">v1.12.48</span></div>
 <div class="grid" id="cards"></div>
 <section class="card wide" style="margin-top:16px"><div class="head"><div><h2>Rotas do Cloudflare Tunnel</h2><p>Como o Tunnel roda dentro do mesmo App, use 127.0.0.1 nas origens.</p></div><a class="btn secondary" href="api/diagnostics/export">Exportar diagnóstico</a></div><div class="routes"><code>connector.leaphub.com.br → http://127.0.0.1:8094</code><span>Connector</span><code>ocpp-wallbox.leaphub.com.br → http://127.0.0.1:8092</code><span>OCPP Wallbox · ambiente ativo</span></div><p class="notice">A fila de telemetria sobrevive a reinícios do App. Uma queda do Home Assistant inteiro ainda cria uma lacuna real, que nunca será preenchida com dados inventados.</p></section>
 <div class="foot">Tokens e chaves nunca são exibidos neste painel.</div></main><script>
@@ -814,8 +814,18 @@ def shutdown(*_: Any) -> None:
     if STOP.is_set():
         return
     STOP.set()
-    for service in SERVICES.values():
-        service.stop(False)
+    # 1.12.48 — feche o túnel antes dos origins. Assim um update planejado
+    # não deixa o cloudflared tentando encaminhar tráfego para portas que o
+    # próprio Gateway acabou de desligar.
+    stopped: set[str] = set()
+    for name in ("tunnel", "ocpp_wallbox", "connector"):
+        service = SERVICES.get(name)
+        if service is not None:
+            service.stop(False)
+            stopped.add(name)
+    for name, service in SERVICES.items():
+        if name not in stopped:
+            service.stop(False)
 
 
 for signal_name in ("SIGTERM", "SIGINT"):
@@ -823,11 +833,56 @@ for signal_name in ("SIGTERM", "SIGINT"):
     if sig is not None:
         signal.signal(sig, shutdown)
 
+def wait_for_local_origins(timeout_seconds: float = 10.0) -> dict[str, bool]:
+    """Aguarda apenas os origins locais configurados antes de expor o túnel.
+
+    É uma barreira curta de startup, não um bloqueio permanente. Se um origin
+    não ficar pronto no prazo, o túnel ainda inicia e o supervisor segue
+    cuidando do serviço normalmente.
+    """
+    tracked = {
+        name: service for name, service in SERVICES.items()
+        if name != "tunnel" and service.enabled and service.configured and service.health_url
+    }
+    ready = {name: False for name in tracked}
+    deadline = time.monotonic() + max(1.0, float(timeout_seconds))
+    while tracked and time.monotonic() < deadline and not STOP.is_set():
+        for name, service in tracked.items():
+            if ready[name] or service.state() != "running":
+                continue
+            try:
+                with urllib.request.urlopen(str(service.health_url), timeout=0.6) as response:
+                    payload = json.loads(response.read(4096).decode("utf-8"))
+                if bool(payload.get("ok")):
+                    ready[name] = True
+            except Exception:
+                continue
+        if all(ready.values()):
+            break
+        STOP.wait(0.15)
+    return ready
+
+
 threading.Thread(target=serve_dashboard, daemon=True).start()
 for service in SERVICES.values():
     if service.enabled and not service.configured:
         LOG.warning("%s está ativado, mas precisa de chave/token válido.", service.label)
-    service.start()
+
+# 1.12.48 — Connector/OCPP primeiro; Tunnel depois que os origins responderem.
+for name, service in SERVICES.items():
+    if name != "tunnel":
+        service.start()
+
+origin_readiness = wait_for_local_origins(10.0)
+if origin_readiness:
+    not_ready = [name for name, ready in origin_readiness.items() if not ready]
+    if not_ready:
+        LOG.warning("Origins locais ainda inicializando após a janela de startup: %s.", ", ".join(not_ready))
+    else:
+        LOG.info("Origins locais prontos; liberando Cloudflare Tunnel.")
+
+if "tunnel" in SERVICES:
+    SERVICES["tunnel"].start()
 
 while not STOP.wait(1.0):
     for service in SERVICES.values():
