@@ -38,7 +38,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-GATEWAY_VERSION = "1.12.43"
+GATEWAY_VERSION = "1.12.44"
 IS_RAILWAY = bool(os.getenv("RAILWAY_ENVIRONMENT_NAME") or os.getenv("RAILWAY_SERVICE_ID"))
 RUNTIME_DIR = Path(os.getenv("LEAPHUB_RUNTIME_DIR", "/tmp/leaphub-ocpp" if IS_RAILWAY else "."))
 BIND = os.getenv("LEAPHUB_OCPP_BIND", "0.0.0.0")
@@ -252,6 +252,14 @@ def state_db() -> sqlite3.Connection:
                     updated_at REAL NOT NULL,
                     PRIMARY KEY(target_name, identity)
                 )""")
+                # Cursor persistente de round-robin. É apenas metadado de scheduler:
+                # não contém e-mail, VIN, Charge ID ou payload OCPP.
+                db.execute("""CREATE TABLE IF NOT EXISTS queue_scheduler_state (
+                    queue_kind TEXT PRIMARY KEY,
+                    last_owner_key TEXT NOT NULL DEFAULT '',
+                    owner_turns INTEGER NOT NULL DEFAULT 0,
+                    updated_at REAL NOT NULL
+                )""")
                 db.execute("CREATE INDEX IF NOT EXISTS idx_ocpp_event_due ON event_queue(available_at,id)")
                 db.execute("CREATE INDEX IF NOT EXISTS idx_ocpp_event_identity ON event_queue(target_name,identity,id)")
                 db.execute("CREATE INDEX IF NOT EXISTS idx_ocpp_result_due ON command_result_queue(available_at,id)")
@@ -342,7 +350,7 @@ def remember_queue_owner(target_name: str, identity: str, owner_user_id: Any) ->
     """Persist a minimal owner scope so replay can be fair between users.
 
     Existing queues remain valid. If ownership is unavailable (for example an
-    event queued before 1.12.43), replay falls back to the wallbox identity,
+    event queued before 1.12.44), replay falls back to the wallbox identity,
     which is even more isolated and never merges unrelated users.
     """
     try:
@@ -486,6 +494,24 @@ def queue_diagnostics() -> dict[str, Any]:
         owner_backlogs = [int(row[0] or 0) for row in owner_event_rows]
         identity_backlogs = [int(row[0] or 0) for row in identity_event_rows]
         owner_result_backlogs = [int(row[0] or 0) for row in owner_result_rows]
+        event_cursor, event_turns = _scheduler_state("event")
+        result_cursor, result_turns = _scheduler_state("command_result")
+        due_owner_event_scopes = 0
+        due_owner_result_scopes = 0
+        try:
+            with state_db() as db:
+                due_owner_event_scopes = int(db.execute(
+                    "SELECT COUNT(DISTINCT q.target_name || CASE WHEN COALESCE(o.owner_user_id,0)>0 THEN ':u:'||o.owner_user_id ELSE ':i:'||q.identity END) "
+                    "FROM event_queue q LEFT JOIN queue_owners o ON o.target_name=q.target_name AND o.identity=q.identity WHERE q.available_at<=?",
+                    (now,),
+                ).fetchone()[0] or 0)
+                due_owner_result_scopes = int(db.execute(
+                    "SELECT COUNT(DISTINCT q.target_name || CASE WHEN COALESCE(o.owner_user_id,0)>0 THEN ':u:'||o.owner_user_id ELSE ':i:'||q.identity END) "
+                    "FROM command_result_queue q LEFT JOIN queue_owners o ON o.target_name=q.target_name AND o.identity=q.identity WHERE q.available_at<=?",
+                    (now,),
+                ).fetchone()[0] or 0)
+        except sqlite3.Error:
+            pass
         return {
             "oldest_event_age_seconds": max(0, int(now - float(event[1]))) if event and event[1] is not None else 0,
             "oldest_result_age_seconds": max(0, int(now - float(result[1]))) if result and result[1] is not None else 0,
@@ -498,6 +524,12 @@ def queue_diagnostics() -> dict[str, Any]:
             "last_replay_error": QUEUE_LAST_REPLAY_ERROR[:200],
             "fair_replay_enabled": True,
             "fairness_scope": "owner_user",
+            "fairness_cursor_persistent": True,
+            "fairness_strategy": "persistent_round_robin",
+            "event_owner_turns": event_turns,
+            "result_owner_turns": result_turns,
+            "due_owner_event_scopes": due_owner_event_scopes,
+            "due_owner_result_scopes": due_owner_result_scopes,
             "owner_scopes": len(owner_backlogs),
             "largest_owner_event_backlog": max(owner_backlogs or [0]),
             "largest_identity_event_backlog": max(identity_backlogs or [0]),
@@ -1396,41 +1428,56 @@ def _fair_owner_key(target_name: str, identity: str, owner_user_id: Any) -> str:
     except (TypeError, ValueError):
         owner_id = 0
     if owner_id > 0:
-        return f"{target_name}:user:{owner_id}"
-    # Old queued rows may predate the owner map. Falling back to identity keeps
-    # them isolated rather than putting unrelated users in a global bucket.
+        # Padding mantém ordenação estável entre IDs numéricos no cursor persistente.
+        return f"{target_name}:user:{owner_id:020d}"
+    # Filas antigas sem owner conhecido continuam isoladas pela wallbox.
     return f"{target_name}:identity:{identity}"
 
 
-def _fair_pick(rows: list[tuple[Any, ...]], limit: int, owner_index: int, target_index: int, identity_index: int) -> list[tuple[Any, ...]]:
-    selected: list[tuple[Any, ...]] = []
-    seen_owners: set[str] = set()
-    for row in rows:
-        owner_key = _fair_owner_key(str(row[target_index]), str(row[identity_index]), row[owner_index])
-        if owner_key in seen_owners:
-            continue
-        seen_owners.add(owner_key)
-        selected.append(row)
-        if len(selected) >= max(1, limit):
-            break
-    return selected
+def _scheduler_state(queue_kind: str) -> tuple[str, int]:
+    try:
+        with state_db() as db:
+            row = db.execute(
+                "SELECT last_owner_key,owner_turns FROM queue_scheduler_state WHERE queue_kind=?",
+                (queue_kind,),
+            ).fetchone()
+        if row:
+            return str(row[0] or ""), max(0, int(row[1] or 0))
+    except sqlite3.Error as exc:
+        LOG.warning("OCPP fair scheduler state unavailable for %s: %s", queue_kind, exc)
+    return "", 0
 
 
-def _due_command_result_owner_heads(now: float, limit: int) -> list[tuple[Any, ...]]:
-    """Return at most one due result per user scope for this scheduling round."""
+def _advance_scheduler(queue_kind: str, owner_key: str) -> None:
+    if not owner_key:
+        return
+    try:
+        with state_db() as db:
+            db.execute(
+                "INSERT INTO queue_scheduler_state(queue_kind,last_owner_key,owner_turns,updated_at) VALUES(?,?,1,?) "
+                "ON CONFLICT(queue_kind) DO UPDATE SET last_owner_key=excluded.last_owner_key,"
+                "owner_turns=queue_scheduler_state.owner_turns+1,updated_at=excluded.updated_at",
+                (queue_kind, owner_key[:220], time.time()),
+            )
+            db.commit()
+    except sqlite3.Error as exc:
+        LOG.warning("Could not advance OCPP fair scheduler %s: %s", queue_kind, exc)
+
+
+def _due_command_result_owner_heads(now: float, limit: int, cursor: str) -> list[tuple[Any, ...]]:
+    """One due command result per owner, rotated after the previous owner turn."""
     with state_db() as db:
         return db.execute(
             "WITH due AS ("
-            " SELECT q.id,q.target_name,q.identity,q.command_id,q.status,q.payload_json,q.error_text,q.attempts,COALESCE(o.owner_user_id,0) AS owner_user_id"
+            " SELECT q.id,q.target_name,q.identity,q.command_id,q.status,q.payload_json,q.error_text,q.attempts,COALESCE(o.owner_user_id,0) AS owner_user_id,"
+            " q.target_name || CASE WHEN COALESCE(o.owner_user_id,0)>0 THEN ':user:'||printf('%020d',o.owner_user_id) ELSE ':identity:'||q.identity END AS owner_key"
             " FROM command_result_queue q LEFT JOIN queue_owners o ON o.target_name=q.target_name AND o.identity=q.identity"
             " WHERE q.available_at<=?"
             "), owner_heads AS ("
-            " SELECT d.* FROM due d WHERE NOT EXISTS (SELECT 1 FROM due older WHERE older.id<d.id AND older.target_name=d.target_name AND ("
-            "   (d.owner_user_id>0 AND older.owner_user_id=d.owner_user_id) OR"
-            "   (d.owner_user_id<=0 AND older.owner_user_id<=0 AND older.identity=d.identity)"
-            " ))"
-            ") SELECT id,target_name,identity,command_id,status,payload_json,error_text,attempts,owner_user_id FROM owner_heads ORDER BY id LIMIT ?",
-            (now, max(1, limit)),
+            " SELECT d.* FROM due d WHERE NOT EXISTS (SELECT 1 FROM due older WHERE older.owner_key=d.owner_key AND older.id<d.id)"
+            ") SELECT id,target_name,identity,command_id,status,payload_json,error_text,attempts,owner_user_id,owner_key FROM owner_heads "
+            "ORDER BY CASE WHEN owner_key>? THEN 0 ELSE 1 END,owner_key,id LIMIT ?",
+            (now, cursor, max(1, limit)),
         ).fetchall()
 
 
@@ -1443,20 +1490,16 @@ def replay_command_results_once(limit: int = 25) -> int:
             with state_db() as db:
                 prune_queues(db)
                 db.commit()
-            rows = _due_command_result_owner_heads(now, max(1, limit - processed))
+            cursor, _turns = _scheduler_state("command_result")
+            rows = _due_command_result_owner_heads(now, max(1, limit - processed), cursor)
         except sqlite3.Error as exc:
             LOG.warning("OCPP command-result queue read failed: %s", exc)
             return delivered
         if not rows:
             break
-        # Query already returns one row per owner. _fair_pick is a defensive
-        # second guard in case an older SQLite engine/query plan behaves oddly.
-        selected = _fair_pick(rows, max(1, limit - processed), 8, 1, 2)
-        if not selected:
-            break
-        for row in selected:
+        for row in rows:
             processed += 1
-            result_id, target_name, identity, command_id, status, payload_json, error_text, attempts, _owner_user_id = row
+            result_id, target_name, identity, command_id, status, payload_json, error_text, attempts, _owner_user_id, owner_key = row
             target = TARGETS_BY_NAME.get(str(target_name))
             if target is None:
                 with state_db() as db:
@@ -1465,6 +1508,7 @@ def replay_command_results_once(limit: int = 25) -> int:
                         (time.time() + 60.0, "OCPP target unavailable for fair replay", result_id),
                     )
                     db.commit()
+                _advance_scheduler("command_result", str(owner_key))
                 continue
             try:
                 payload = json.loads(str(payload_json))
@@ -1486,18 +1530,15 @@ def replay_command_results_once(limit: int = 25) -> int:
                 delay = max(retry_after, min(900.0, 5.0 * (2 ** min(attempt_count, 7))))
                 with state_db() as db:
                     db.execute("UPDATE command_result_queue SET attempts=?,available_at=?,last_error=? WHERE id=?", (attempt_count, time.time()+delay, str(exc)[:300], result_id)); db.commit()
+            finally:
+                _advance_scheduler("command_result", str(owner_key))
             if processed >= limit:
                 break
     return delivered
 
 
 def has_older_queued_event(target_name: str, identity: str, event_id: int) -> bool:
-    """Return True while an older event for the same wallbox is still queued.
-
-    Strict per-identity FIFO prevents an event that is already due from
-    overtaking an older event that is temporarily in backoff. Other wallboxes
-    remain independent and can continue replaying normally.
-    """
+    """True while an older event for the same wallbox is still queued."""
     try:
         with state_db() as db:
             return db.execute(
@@ -1506,27 +1547,25 @@ def has_older_queued_event(target_name: str, identity: str, event_id: int) -> bo
             ).fetchone() is not None
     except sqlite3.Error as exc:
         LOG.warning("OCPP FIFO guard unavailable for %s: %s", identity, exc)
-        # Fail closed: if ordering cannot be proven, do not overtake.
         return True
 
 
-def _due_event_owner_heads(now: float, limit: int) -> list[tuple[Any, ...]]:
-    """Oldest due wallbox event per user scope, preserving absolute FIFO per identity."""
+def _due_event_owner_heads(now: float, limit: int, cursor: str) -> list[tuple[Any, ...]]:
+    """Oldest due wallbox head per owner, round-robin after persistent cursor."""
     with state_db() as db:
         return db.execute(
             "WITH identity_heads AS ("
-            " SELECT q.id,q.target_name,q.identity,q.message_id,q.ocpp_action,q.payload_json,q.attempts,COALESCE(o.owner_user_id,0) AS owner_user_id"
+            " SELECT q.id,q.target_name,q.identity,q.message_id,q.ocpp_action,q.payload_json,q.attempts,COALESCE(o.owner_user_id,0) AS owner_user_id,"
+            " q.target_name || CASE WHEN COALESCE(o.owner_user_id,0)>0 THEN ':user:'||printf('%020d',o.owner_user_id) ELSE ':identity:'||q.identity END AS owner_key"
             " FROM event_queue q LEFT JOIN queue_owners o ON o.target_name=q.target_name AND o.identity=q.identity"
             " WHERE q.available_at<=? AND NOT EXISTS ("
             "   SELECT 1 FROM event_queue older WHERE older.target_name=q.target_name AND older.identity=q.identity AND older.id<q.id"
             " )"
             "), owner_heads AS ("
-            " SELECT h.* FROM identity_heads h WHERE NOT EXISTS (SELECT 1 FROM identity_heads older WHERE older.id<h.id AND older.target_name=h.target_name AND ("
-            "   (h.owner_user_id>0 AND older.owner_user_id=h.owner_user_id) OR"
-            "   (h.owner_user_id<=0 AND older.owner_user_id<=0 AND older.identity=h.identity)"
-            " ))"
-            ") SELECT id,target_name,identity,message_id,ocpp_action,payload_json,attempts,owner_user_id FROM owner_heads ORDER BY id LIMIT ?",
-            (now, max(1, limit)),
+            " SELECT h.* FROM identity_heads h WHERE NOT EXISTS (SELECT 1 FROM identity_heads older WHERE older.owner_key=h.owner_key AND older.id<h.id)"
+            ") SELECT id,target_name,identity,message_id,ocpp_action,payload_json,attempts,owner_user_id,owner_key FROM owner_heads "
+            "ORDER BY CASE WHEN owner_key>? THEN 0 ELSE 1 END,owner_key,id LIMIT ?",
+            (now, cursor, max(1, limit)),
         ).fetchall()
 
 
@@ -1536,19 +1575,18 @@ def replay_queue_once(limit: int = 25) -> int:
     processed = 0
     while processed < max(1, limit):
         try:
-            rows = _due_event_owner_heads(time.time(), max(1, limit - processed))
+            cursor, _turns = _scheduler_state("event")
+            rows = _due_event_owner_heads(time.time(), max(1, limit - processed), cursor)
         except sqlite3.Error as exc:
             LOG.warning("OCPP queue read failed: %s", exc)
             return delivered
         if not rows:
             break
-        selected = _fair_pick(rows, max(1, limit - processed), 7, 1, 2)
-        if not selected:
-            break
-        for row in selected:
+        for row in rows:
             processed += 1
-            event_id, target_name, identity, message_id, action, payload_json, attempts, _owner_user_id = row
+            event_id, target_name, identity, message_id, action, payload_json, attempts, _owner_user_id, owner_key = row
             if has_older_queued_event(str(target_name), str(identity), int(event_id)):
+                _advance_scheduler("event", str(owner_key))
                 continue
             target = TARGETS_BY_NAME.get(str(target_name))
             if target is None:
@@ -1558,6 +1596,7 @@ def replay_queue_once(limit: int = 25) -> int:
                         (time.time() + 60.0, "OCPP target unavailable for fair replay", event_id),
                     )
                     db.commit()
+                _advance_scheduler("event", str(owner_key))
                 continue
             try:
                 payload = json.loads(str(payload_json))
@@ -1587,6 +1626,8 @@ def replay_queue_once(limit: int = 25) -> int:
                     prune_queues(db)
                     db.commit()
                 QUEUE_LAST_REPLAY_ERROR = str(exc)[:300]
+            finally:
+                _advance_scheduler("event", str(owner_key))
             if processed >= limit:
                 break
     return delivered

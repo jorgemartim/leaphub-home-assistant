@@ -24,7 +24,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-VERSION = "1.12.43"
+VERSION = "1.12.44"
 OPTIONS_PATH = Path(os.getenv("LEAPHUB_OPTIONS_PATH", "/data/options.json"))
 RUNTIME = Path(os.getenv("LEAPHUB_RUNTIME_DIR", "/data/runtime"))
 LOG_DIR = Path(os.getenv("LEAPHUB_LOG_DIR", "/data/logs"))
@@ -551,6 +551,12 @@ def ocpp_queue_summary() -> dict[str, Any]:
             "quarantined_deliveries": quarantined,
             "fair_replay_enabled": bool(diagnostics.get("fair_replay_enabled", True)),
             "fairness_scope": str(diagnostics.get("fairness_scope") or "owner_user")[:40],
+            "fairness_cursor_persistent": bool(diagnostics.get("fairness_cursor_persistent", False)),
+            "fairness_strategy": str(diagnostics.get("fairness_strategy") or "owner_user")[:40],
+            "event_owner_turns": max(0, int(diagnostics.get("event_owner_turns") or 0)),
+            "result_owner_turns": max(0, int(diagnostics.get("result_owner_turns") or 0)),
+            "due_owner_event_scopes": max(0, int(diagnostics.get("due_owner_event_scopes") or 0)),
+            "due_owner_result_scopes": max(0, int(diagnostics.get("due_owner_result_scopes") or 0)),
             "owner_scopes": max(0, int(diagnostics.get("owner_scopes") or 0)),
             "largest_owner_event_backlog": max(0, int(diagnostics.get("largest_owner_event_backlog") or 0)),
             "largest_identity_event_backlog": max(0, int(diagnostics.get("largest_identity_event_backlog") or 0)),
@@ -615,7 +621,7 @@ main{max-width:1180px;margin:auto;padding:24px}.hero{display:flex;gap:18px;align
 details{margin-top:12px}summary{cursor:pointer;color:var(--muted)}pre{white-space:pre-wrap;word-break:break-word;background:#050c15;border:1px solid var(--line);border-radius:12px;padding:12px;max-height:260px;overflow:auto;color:#bcd0e8;font-size:12px}.wide{grid-column:1/-1}.routes{display:grid;grid-template-columns:1fr auto;gap:8px}.routes code{background:#050c15;border:1px solid var(--line);border-radius:10px;padding:9px;overflow:auto}.notice{border-left:3px solid var(--blue);padding:10px 12px;background:rgba(85,167,255,.08);border-radius:10px;color:#cfe4ff}.foot{color:var(--muted);text-align:center;padding:20px}
 @media(max-width:760px){main{padding:14px}.grid{grid-template-columns:1fr}.hero{align-items:flex-start}.badge{display:none}.meta{grid-template-columns:1fr 1fr}.routes{grid-template-columns:1fr}}
 </style></head><body><main>
-<div class="hero"><div class="mark">LH</div><div><h1>Leap Hub Gateway</h1><p class="sub">Telemetria resiliente, Connector, OCPP e Cloudflare em um único App</p></div><span class="badge">v1.12.43</span></div>
+<div class="hero"><div class="mark">LH</div><div><h1>Leap Hub Gateway</h1><p class="sub">Telemetria resiliente, Connector, OCPP e Cloudflare em um único App</p></div><span class="badge">v1.12.44</span></div>
 <div class="grid" id="cards"></div>
 <section class="card wide" style="margin-top:16px"><div class="head"><div><h2>Rotas do Cloudflare Tunnel</h2><p>Como o Tunnel roda dentro do mesmo App, use 127.0.0.1 nas origens.</p></div></div><div class="routes"><code>connector.leaphub.com.br → http://127.0.0.1:8094</code><span>Connector</span><code>ocpp-wallbox.leaphub.com.br → http://127.0.0.1:8092</code><span>OCPP Wallbox · ambiente ativo</span></div><p class="notice">A fila de telemetria sobrevive a reinícios do App. Uma queda do Home Assistant inteiro ainda cria uma lacuna real, que nunca será preenchida com dados inventados.</p></section>
 <div class="foot">Tokens e chaves nunca são exibidos neste painel.</div></main><script>
@@ -624,7 +630,7 @@ function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&l
 async function action(name,kind){const b=document.querySelector(`[data-action="${name}-${kind}"]`);if(b)b.disabled=true;try{const r=await fetch(`api/services/${name}/${kind}`,{method:'POST',headers:{'X-LeapHub-UI-Token':token}});const j=await r.json();alert(j.message||'Concluído');await load()}catch(e){alert('Falha: '+e)}finally{if(b)b.disabled=false}}
 function card(name,s){const health=s.health||{};const logs=(s.logs||[]).join('\n');return `<article class="card"><div class="head"><div><h2>${esc(labels[name]||s.label)}</h2><p>${s.configured?'Configuração pronta':'Configuração pendente'}</p></div><span class="state ${esc(s.state)}">${esc(s.state.replaceAll('_',' '))}</span></div><div class="meta"><div>Saúde<strong>${health.ok?'OK':'Atenção'}</strong></div><div>PID<strong>${esc(s.pid||'—')}</strong></div><div>Reinícios<strong>${esc(s.restarts)}</strong></div></div><div class="actions"><button class="btn" data-action="${name}-test" onclick="action('${name}','test')">Testar</button><button class="btn secondary" data-action="${name}-restart" onclick="action('${name}','restart')" ${!s.enabled||!s.configured?'disabled':''}>Reiniciar serviço</button></div><details><summary>Logs recentes</summary><pre>${esc(logs||'Sem logs nesta inicialização.')}</pre></details></article>`}
 function telemetryCard(t){return `<article class="card"><div class="head"><div><h2>Telemetria contínua</h2><p>Sincronização ordenada, deduplicação e fila persistente</p></div><span class="state ${t.status==='active'?'running':'disabled'}">${esc(t.status||'waiting')}</span></div><div class="meta"><div>Veículos<strong>${esc(t.tracked_vehicles||0)}</strong></div><div>Pendentes<strong>${esc(t.pending_events||0)}</strong></div><div>Confirmação de comando<strong>${esc(t.command_windows||0)}</strong></div></div><p class="notice">Última coleta: ${esc(t.last_success_at||'aguardando veículo')} · Leituras repetidas evitadas: ${esc(t.deduplicated_events||0)} · Falhas permanentes: ${esc(t.failed_events||0)}</p></article>`}
-function ocppQueueCard(q){const busy=(q.queued_events||0)+(q.queued_command_results||0)>0;return `<article class="card"><div class="head"><div><h2>Fila OCPP</h2><p>Replay justo por usuário, com FIFO preservado por wallbox</p></div><span class="state ${busy?'needs_configuration':'running'}">${busy?'processando':'isolada'}</span></div><div class="meta"><div>Eventos<strong>${esc(q.queued_events||0)}</strong></div><div>Resultados<strong>${esc(q.queued_command_results||0)}</strong></div><div>Usuários/escopos<strong>${esc(q.owner_scopes||0)}</strong></div></div><p class="notice">Maior backlog por usuário: ${esc(q.largest_owner_event_backlog||0)} · Maior backlog por wallbox: ${esc(q.largest_identity_event_backlog||0)} · Quarentena: ${esc(q.quarantined_deliveries||0)}. Uma fila de um usuário não monopoliza os lotes dos demais.</p></article>`}
+function ocppQueueCard(q){const busy=(q.queued_events||0)+(q.queued_command_results||0)>0;return `<article class="card"><div class="head"><div><h2>Fila OCPP</h2><p>Replay justo por usuário, com FIFO preservado por wallbox</p></div><span class="state ${busy?'needs_configuration':'running'}">${busy?'processando':'isolada'}</span></div><div class="meta"><div>Eventos<strong>${esc(q.queued_events||0)}</strong></div><div>Resultados<strong>${esc(q.queued_command_results||0)}</strong></div><div>Usuários/escopos<strong>${esc(q.owner_scopes||0)}</strong></div></div><p class="notice">Maior backlog por usuário: ${esc(q.largest_owner_event_backlog||0)} · Maior backlog por wallbox: ${esc(q.largest_identity_event_backlog||0)} · Quarentena: ${esc(q.quarantined_deliveries||0)}. Round-robin persistente por usuário: mesmo com mais usuários que o tamanho do lote, o cursor continua da última vez e evita starvation.</p></article>`}
 async function load(){const r=await fetch('api/status',{cache:'no-store'});const j=await r.json();document.getElementById('cards').innerHTML=Object.entries(j.services).map(([n,s])=>card(n,s)).join('')+telemetryCard(j.telemetry||{})+ocppQueueCard(j.ocpp_queue||{})}
 load();setInterval(load,5000);
 </script></body></html>'''
