@@ -8,7 +8,7 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 APP = ROOT / "leaphub_gateway"
 config = yaml.safe_load((APP / "config.yaml").read_text(encoding="utf-8"))
-assert config["version"] == "1.12.40"
+assert config["version"] == "1.12.41"
 assert config.get("image") == "ghcr.io/jorgemartim/leaphub-gateway"
 assert (APP / "Dockerfile").is_file()
 assert "/data/runtime/bin/cloudflared rix," in (APP / "apparmor.txt").read_text(encoding="utf-8")
@@ -21,7 +21,7 @@ assert "ca-certificates libstdc++6" in dockerfile
 
 manager = (APP / "gateway_manager.py").read_text(encoding="utf-8")
 for marker in (
-    'VERSION = "1.12.40"',
+    'VERSION = "1.12.41"',
     "def resolve_cloudflared()",
     "CLOUDFLARED_SHA256_AMD64",
     "MAX_CLOUDFLARED_BYTES",
@@ -37,7 +37,7 @@ for marker in (
     "cache-to: type=gha",
     "Smoke test exact published image",
     "docker buildx imagetools inspect",
-    "Verify anonymous image access for Home Assistant",
+    "Verify anonymous GHCR access before exposing update to Home Assistant",
 ):
     assert marker in workflow, marker
 

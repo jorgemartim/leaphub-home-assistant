@@ -12,10 +12,10 @@ if spec is None or spec.loader is None:
 connector = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(connector)
 
-assert connector.CONNECTOR_VERSION == "1.12.25"
-assert connector.COMMAND_METHODS["sentry_on"] == "sentry_mode_on"
-assert connector.COMMAND_METHODS["sentry_off"] == "sentry_mode_off"
-assert connector.EXPERIMENTAL_COMMANDS == {"sentry_on", "sentry_off"}
+assert tuple(map(int, connector.CONNECTOR_VERSION.split("."))) >= (1, 12, 25)
+assert connector.EXPERIMENTAL_COMMAND_METHODS["sentry_on"] == "sentry_mode_on"
+assert connector.EXPERIMENTAL_COMMAND_METHODS["sentry_off"] == "sentry_mode_off"
+assert connector.SENTRY_COMMANDS == {"sentry_on", "sentry_off"}
 
 class FakeClient:
     def __init__(self, sentry: bool | None) -> None:
@@ -32,28 +32,21 @@ class FakeClient:
             timestamp=None,
         )
 
-for command, raw_state, expected_match, expected_name in (
-    ("sentry_on", True, True, "sentry_on"),
-    ("sentry_on", False, False, "sentry_off"),
-    ("sentry_off", False, True, "sentry_off"),
-    ("sentry_off", True, False, "sentry_on"),
-):
-    client = FakeClient(raw_state)
+# A confirmação física síncrona hoje é deliberadamente restrita ao clima.
+# O Sentinela continua experimental e sua evidência é tratada pela telemetria,
+# portanto read_command_state deve falhar fechado como unsupported.
+for command in ("sentry_on", "sentry_off"):
+    client = FakeClient(True)
     sample = connector.read_command_state(client, "VIN_TEST", command, {}, [client.vehicle])
-    assert sample["evaluable"] is True
-    assert sample["matched"] is expected_match
-    assert sample["state"] == expected_name
-
-unknown = FakeClient(None)
-sample = connector.read_command_state(unknown, "VIN_TEST", "sentry_on", {}, [unknown.vehicle])
-assert sample["evaluable"] is False
-assert sample["state"] == "sentry_unknown"
+    assert sample["evaluable"] is False
+    assert sample["matched"] is False
+    assert sample["state"] == "unsupported"
 
 # The experimental guard must remain visible in source so the command cannot
 # accidentally become a normal public action during future refactors.
 source = CONNECTOR_PATH.read_text(encoding="utf-8")
-assert 'parameters.get("experimental_confirmed") is not True' in source
+assert 'confirmed not in {"1", "true", "on", "yes"}' in source
 assert '"experimental_commands": experimental_commands' in source
-assert 'return_on_fresh_mismatch=False' in source
+assert 'command in EXPERIMENTAL_COMMAND_METHODS' in source
 
-print({"ok": True, "version": "1.12.25", "feature": "sentry_probe", "cases": 5})
+print({"ok": True, "version": "1.12.25", "feature": "sentry_probe", "cases": 2})

@@ -1,42 +1,21 @@
 # Publicação do Leap Hub Gateway
 
-## Fluxo normal — imagem pré-compilada
+A versão anunciada ao Home Assistant só pode mudar depois que a imagem pré-compilada correspondente estiver disponível anonimamente no GHCR.
 
-1. Atualize o código e `version` em `leaphub_gateway/config.yaml`.
-2. Mantenha obrigatoriamente:
+## Fluxo seguro
 
-```yaml
-image: "ghcr.io/jorgemartim/leaphub-gateway"
-```
+1. O código do próximo Gateway usa a versão indicada em `leaphub_gateway/RELEASE_TARGET`.
+2. `leaphub_gateway/config.yaml` continua anunciando a última versão comprovadamente instalável.
+3. O GitHub Actions valida toda a suíte e compila a imagem `ghcr.io/jorgemartim/leaphub-gateway:<RELEASE_TARGET>`.
+4. O workflow executa smoke test da imagem exata.
+5. O login Docker é removido e o manifest é consultado anonimamente.
+6. Se o acesso anônimo falhar, o workflow falha e `config.yaml` não muda. O Home Assistant continua oferecendo a versão anterior.
+7. Somente após o acesso anônimo ser confirmado o workflow promove `config.yaml`, regenera os checksums e faz um commit automático com `[gateway-published]`.
 
-3. Envie para `main`.
-4. O GitHub Actions valida o repositório e constrói a imagem `amd64`.
-5. O build usa cache de camadas. Como `requirements.txt` é copiado antes do código, mudanças normais de Python não recompilam/rebaixam as dependências.
-6. A imagem exata é testada antes da publicação.
-7. São publicadas as tags `<version>` e `latest`.
-8. O workflow encerra a autenticação do GHCR e confirma que a tag versionada pode ser consultada anonimamente.
-9. Somente após o workflow verde, recarregue a Loja de Apps do Home Assistant.
+## Primeira publicação no GHCR
 
-O Home Assistant usa automaticamente a tag igual ao campo `version` do `config.yaml`.
+Se a imagem for criada mas a etapa de acesso anônimo falhar, abra a configuração do pacote `leaphub-gateway` no GitHub Packages e torne o pacote público. Depois execute novamente o workflow `Build and publish Leap Hub Gateway`.
 
-## Release notes
+## Segurança
 
-`leaphub_gateway/CHANGELOG.md` deve conter **somente a versão atual**. O histórico permanece no Git/GitHub e não é repetido na tela de atualização do Home Assistant.
-
-## Visibilidade
-
-O pacote GHCR precisa ser público. O Home Assistant não deve depender de token pessoal ou credenciais do GitHub para instalar o Gateway.
-
-
-## 1.12.34 — imagem pré-compilada
-
-O App declara `image: ghcr.io/jorgemartim/leaphub-gateway`. Após o push, aguarde o workflow **Build and publish Leap Hub Gateway** ficar verde. O último passo valida acesso anônimo à tag exata; isso evita anunciar uma atualização que o Home Assistant ainda não consegue baixar. Na primeira publicação do pacote GHCR pode ser necessário tornar o pacote público uma única vez e reexecutar o workflow.
-
-
-> Importante: só atualize o App no Home Assistant depois que o workflow de build da versão 1.12.34 estiver verde.
-
-## Regra de publicação desde 1.12.34
-
-O upload de uma nova versão precisa incluir a pasta `.github`. Publicar apenas `leaphub_gateway/` pode deixar um workflow antigo ativo.
-
-A versão só deve ser instalada no Home Assistant depois que o workflow **Build and publish Leap Hub Gateway** concluir o build e o smoke test da tag exata no GHCR. O check anônimo pode levar alguns segundos adicionais de propagação.
+Nunca envie ao GitHub `storage`, SQLite de runtime, senhas, tokens, chaves HMAC ou credenciais Leapmotor/OCPP.
