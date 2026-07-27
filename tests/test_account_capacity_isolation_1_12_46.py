@@ -44,7 +44,7 @@ def test_operation_limiter_exposes_background_waiters():
 
 def test_telemetry_uses_account_before_global_slot_contract():
     source = (APP / "telemetry_engine.py").read_text(encoding="utf-8")
-    anchor = source.index("# 1.12.46 — ordem única de aquisição")
+    anchor = source.index("# 1.12.47 — ordem única de aquisição")
     window = source[anchor: anchor + 8000]
     account = window.index("account_lock.acquire")
     slot = window.index("self.operation_semaphore.acquire")

@@ -1,9 +1,8 @@
-## 1.12.46
+## 1.12.47
 
-- Mantém distribuição pré-compilada via GHCR.
-- Corrige a inversão de lock da telemetria: a conta é adquirida antes da vaga global do Connector.
-- Uma conta ocupada não consome slot compartilhado enquanto aguarda.
-- Espera de slot é interrompível por comando manual da mesma conta.
-- Métricas agregadas de account wait, connector wait, yields e timeouts.
-- Exportação de diagnóstico sanitizado no painel Ingress, sem logs, tokens, segredos ou identificadores.
-- Nenhuma migration destrutiva; estado e filas existentes são preservados.
+- Circuit breaker por conta: uma conta lenta/falhando reduz somente a própria telemetria de fundo.
+- Degradação global exige falhas de contas distintas.
+- Sondas de recuperação e trabalho secundário respeitam o escopo da conta.
+- Comandos manuais continuam prioritários e não são bloqueados pelo breaker.
+- Diagnóstico agregado informa backpressure sem identificadores pessoais.
+- Distribuição continua pré-compilada via GHCR, com promoção somente após validação pública da imagem.

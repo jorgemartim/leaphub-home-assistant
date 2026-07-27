@@ -52,7 +52,7 @@ except ModuleNotFoundError:
         EVENT_TRANSPORT = _event_transport_module.EVENT_TRANSPORT
 
 LOG = logging.getLogger("leaphub.telemetry")
-ENGINE_VERSION = "1.12.46"  # confirmação idêntica entregue ao site
+ENGINE_VERSION = "1.12.47"  # confirmação idêntica entregue ao site
 
 
 def utc_iso() -> str:
@@ -1878,15 +1878,31 @@ class TelemetryEngine:
 
         environment = str(subscription["environment"])
         account_id = int(subscription["account_id"] or 0)
-        # 1.12.38 — circuit breaker global: durante uma oscilação confirmada
-        # da nuvem, telemetria de fundo é reduzida para uma sonda moderada por
-        # ambiente. Janelas interativas/comando continuam elegíveis.
+        # 1.12.47 — backpressure primeiro por conta. Uma única conta com
+        # timeout/retry repetido reduz somente a própria telemetria de fundo.
+        # O breaker global abaixo exige evidência de contas distintas.
+        if (
+            not fast_mode
+            and ORCHESTRATOR.is_account_degraded(environment, account_id)
+            and not ORCHESTRATOR.claim_account_background_probe(environment, account_id)
+        ):
+            self._reschedule(
+                sid,
+                60,
+                "account_cloud_degraded",
+                "Esta conta está em recuperação temporária; outras contas continuam com a cadência normal.",
+                failed=False,
+            )
+            return
+
+        # Breaker compartilhado: só reduz o ambiente quando contas distintas
+        # falham na mesma janela, sinalizando indisponibilidade realmente comum.
         if not fast_mode and ORCHESTRATOR.is_degraded(environment) and not ORCHESTRATOR.claim_background_probe(environment):
             self._reschedule(
                 sid,
                 60,
                 "cloud_degraded",
-                "Nuvem Leapmotor degradada; telemetria automática reduzida sem afetar comandos manuais.",
+                "Nuvem Leapmotor degradada em múltiplas contas; telemetria automática reduzida sem afetar comandos manuais.",
                 failed=False,
             )
             return
@@ -1896,7 +1912,7 @@ class TelemetryEngine:
                 sid,
                 max(30, int(global_auth.get("retry_after_seconds") or 30)),
                 "cooldown",
-                "Cooldown global ativo; nenhuma chamada à Leapmotor será feita antes da liberação.",
+                "Cooldown desta conta ativo; as demais contas continuam independentes.",
                 failed=False,
             )
             return
@@ -1949,7 +1965,7 @@ class TelemetryEngine:
             self._reschedule(sid, 2, "waiting", "Comando do usuário tem prioridade sobre a telemetria automática.", failed=False)
             return
 
-        # 1.12.46 — ordem única de aquisição: conta -> vaga global.
+        # 1.12.47 — ordem única de aquisição: conta -> vaga global.
         # Antes a telemetria podia segurar uma vaga global enquanto aguardava
         # a trava de uma conta ocupada, invertendo a ordem usada pelos comandos
         # manuais. Isso permitia uma conta lenta consumir capacidade de outras.
@@ -2122,7 +2138,7 @@ class TelemetryEngine:
                     environment, int(subscription["account_id"] or 0), "telemetry_rate_limit",
                     message, requested_delay, blocked=True,
                 )
-                LOG.warning("Proteção global contra limite ativada para %s por %ss: %s", sid, delay, message)
+                LOG.warning("Proteção da conta contra limite ativada para %s por %ss: %s", sid, delay, message)
             elif isinstance(exc, connector.ConnectorAuthenticationError) or connector.is_authentication_error(exc):
                 self._mark_auth_required(sid, message)
                 LOG.warning("A assinatura %s foi pausada até as credenciais serem confirmadas: %s", sid, message)
@@ -2408,7 +2424,7 @@ class TelemetryEngine:
             slow_last_at = float(session.get("slow_last_at") or 0)
             slow_cycle = (
                 not command_mode
-                and ORCHESTRATOR.secondary_network_allowed(environment)
+                and ORCHESTRATOR.secondary_network_allowed(environment, account_id)
                 and now_epoch - slow_last_at >= self.slow_interval_seconds
             )
             get_messages = getattr(client, "get_message_list", None)
