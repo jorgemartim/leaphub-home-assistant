@@ -52,7 +52,7 @@ except ModuleNotFoundError:
         EVENT_TRANSPORT = _event_transport_module.EVENT_TRANSPORT
 
 LOG = logging.getLogger("leaphub.telemetry")
-ENGINE_VERSION = "1.12.39"
+ENGINE_VERSION = "1.12.45"  # confirmação idêntica entregue ao site
 
 
 def utc_iso() -> str:
@@ -2103,7 +2103,19 @@ class TelemetryEngine:
             source_at = str(telemetry.get("captured_at") or utc_iso())
             state = self._state_of(telemetry)
             states.append(state)
-            queued = self._queue_event(subscription, vehicle, source_at, state, interactive=fast_mode)
+            # Durante a confirmação de comando, até um snapshot semanticamente
+            # idêntico precisa chegar ao site. Ex.: `unlock` solicitado quando o
+            # carro já estava destravado. Suprimir essa amostra deixava a
+            # interface presa em confirmation_pending e também escondia a base
+            # necessária para reconciliar um auto-lock posterior.
+            queued = self._queue_event(
+                subscription,
+                vehicle,
+                source_at,
+                state,
+                interactive=fast_mode,
+                force_delivery=command_mode,
+            )
             if queued.get("queued"):
                 queued_events += 1
             else:
@@ -2658,7 +2670,15 @@ class TelemetryEngine:
             return 300
         return 900
 
-    def _queue_event(self, subscription: sqlite3.Row, vehicle: dict[str, Any], source_at: str, state: str, interactive: bool = False) -> dict[str, Any]:
+    def _queue_event(
+        self,
+        subscription: sqlite3.Row,
+        vehicle: dict[str, Any],
+        source_at: str,
+        state: str,
+        interactive: bool = False,
+        force_delivery: bool = False,
+    ) -> dict[str, Any]:
         environment = str(subscription["environment"])
         account_id = int(subscription["account_id"])
         subscription_id = str(subscription["subscription_id"])
@@ -2685,7 +2705,11 @@ class TelemetryEngine:
                 ).fetchone()
                 unchanged = cached is not None and str(cached["semantic_hash"] or "") == semantic_hash
                 last_queued_at = float(cached["last_queued_at"] or 0) if cached is not None else 0.0
-                if unchanged and now_epoch - last_queued_at < self._heartbeat_interval(state, interactive=interactive):
+                if (
+                    unchanged
+                    and not force_delivery
+                    and now_epoch - last_queued_at < self._heartbeat_interval(state, interactive=interactive)
+                ):
                     db.execute(
                         "UPDATE vehicle_state_cache SET visual_fingerprint=?, last_source_at=?, skipped_unchanged=skipped_unchanged+1, updated_at=? WHERE subscription_id=? AND remote_id=?",
                         (visual_fingerprint or None, source_at, now_iso, subscription_id, remote_id),
@@ -2695,7 +2719,7 @@ class TelemetryEngine:
 
                 sequence = (int(cached["sequence"] or 0) if cached is not None else 0) + 1
                 state_changed = not unchanged
-                event_kind = "change" if state_changed else "heartbeat"
+                event_kind = "confirmation" if force_delivery else ("change" if state_changed else "heartbeat")
                 enriched = json.loads(canonical_json(vehicle).decode("utf-8"))
                 enriched_telemetry = enriched.get("telemetry") if isinstance(enriched.get("telemetry"), dict) else {}
                 enriched_telemetry["gateway_delivery"] = {

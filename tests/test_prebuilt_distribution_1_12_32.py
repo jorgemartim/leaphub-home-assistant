@@ -5,13 +5,13 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 APP = ROOT / "leaphub_gateway"
 config = yaml.safe_load((APP / "config.yaml").read_text(encoding="utf-8"))
-assert config["version"] == "1.12.39"
+assert config["version"] == "1.12.45"
 assert config["image"] == "ghcr.io/jorgemartim/leaphub-gateway"
 assert config["arch"] == ["amd64"]
 
 changelog = (APP / "CHANGELOG.md").read_text(encoding="utf-8")
 headings = re.findall(r"^##\s+(.+)$", changelog, flags=re.MULTILINE)
-assert headings == ["1.12.39"], headings
+assert headings == ["1.12.45"], headings
 
 workflow = (ROOT / ".github/workflows/build.yml").read_text(encoding="utf-8")
 for marker in (
@@ -22,14 +22,14 @@ for marker in (
     "Compile Python sources",
     "python3 -m compileall -q leaphub_gateway",
     "provenance: false",
-    "Verify anonymous image access for Home Assistant",
-    "continue-on-error: true",
+    "Verify anonymous GHCR access before exposing update to Home Assistant",
+    "Promote App metadata only after image is public",
     "GITHUB_STEP_SUMMARY",
 ):
     assert marker in workflow, marker
 assert "actions/checkout@v7" not in workflow
 assert "docker/login-action@v4.4.0" not in workflow
-assert (ROOT / "GITHUB-RECOVERY-1.12.39.md").is_file()
-assert (ROOT / "RELEASE-1.12.39.md").is_file()
-assert (APP / "RELEASE-1.12.39.md").is_file()
+assert (ROOT / "GITHUB-RECOVERY-1.12.45.md").is_file()
+assert (ROOT / "RELEASE-1.12.45.md").is_file()
+assert (APP / "RELEASE-1.12.45.md").is_file()
 print({"ok": True, "version": config["version"], "release_headings": headings})
