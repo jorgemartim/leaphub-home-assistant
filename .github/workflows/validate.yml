@@ -27,8 +27,8 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install validator dependency
-        run: python -m pip install --disable-pip-version-check PyYAML==6.0.2 "pytest>=8,<10"
+      - name: Install validator and runtime test dependencies
+        run: python -m pip install --disable-pip-version-check -r leaphub_gateway/requirements.txt PyYAML==6.0.2 "pytest>=8,<10"
 
       - name: Validate repository and Python files
         run: python .github/scripts/validate_repository.py
