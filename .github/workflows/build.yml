@@ -100,10 +100,39 @@ jobs:
         run: |
           set -euo pipefail
           image="${{ steps.app.outputs.image }}"
-          docker buildx imagetools inspect "${image}" >/dev/null
-          docker pull "${image}"
-          docker run --rm --entrypoint python3 "${image}" -c \
-            "import leaphub_connector, leaphub_telemetry_engine, leaphub_connection_orchestrator, leaphub_event_transport; import connector_server, ocpp_gateway, gateway_manager; print('runtime imports ok')"
+
+          # The image itself must exist in GHCR and be pullable while authenticated.
+          timeout 180s docker buildx imagetools inspect "${image}" >/dev/null
+          timeout 300s docker pull "${image}"
+
+          # IMPORTANT: gateway_manager.py is a long-running process by design.
+          # Never import it in a smoke test: importing it starts the Ingress server
+          # and service supervisor. Validate the published image without executing
+          # long-running entrypoints.
+          timeout 60s docker run --rm --entrypoint python3 "${image}" -c '
+          from pathlib import Path
+          import importlib.util
+          import leaphub_connector
+          import leaphub_telemetry_engine
+          import leaphub_connection_orchestrator
+          import leaphub_event_transport
+
+          assert leaphub_connector.CONNECTOR_VERSION
+          assert leaphub_telemetry_engine.ENGINE_VERSION
+          assert leaphub_connection_orchestrator.ORCHESTRATOR is not None
+          assert leaphub_event_transport.EVENT_TRANSPORT is not None
+
+          for module in ("connector_server", "ocpp_gateway", "gateway_manager"):
+              spec = importlib.util.find_spec(module)
+              assert spec is not None, f"missing runtime module: {module}"
+
+          for filename in ("connector_server.py", "ocpp_gateway.py", "gateway_manager.py"):
+              path = Path("/app") / filename
+              assert path.is_file() and path.stat().st_size > 1000, f"missing runtime file: {path}"
+              compile(path.read_text(encoding="utf-8"), str(path), "exec")
+
+          print("published image smoke test ok")
+          '
 
       - name: Verify anonymous GHCR access before exposing update to Home Assistant
         id: anonymous
@@ -114,7 +143,7 @@ jobs:
           docker logout "${REGISTRY}" >/dev/null 2>&1 || true
           rm -f "${HOME}/.docker/config.json" || true
           for attempt in 1 2 3 4 5 6 7 8 9 10 11 12; do
-            if docker buildx imagetools inspect "${image}" >/dev/null 2>&1; then
+            if timeout 30s docker buildx imagetools inspect "${image}" >/dev/null 2>&1; then
               echo "public=true" >> "${GITHUB_OUTPUT}"
               echo "Anonymous pull confirmed: ${image}"
               exit 0
