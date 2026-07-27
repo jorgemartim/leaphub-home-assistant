@@ -9,9 +9,9 @@ SERVER = (ROOT / "leaphub_gateway" / "connector_server.py").read_text(encoding="
 
 
 def test_current_version_and_existing_priority_are_preserved() -> None:
-    assert 'VERSION = "1.12.40"' in SERVER
-    assert 'CONNECTOR_VERSION = "1.12.40"' in CONNECTOR
-    assert 'ENGINE_VERSION = "1.12.40"' in TELEMETRY
+    assert 'VERSION = "1.12.41"' in SERVER
+    assert 'CONNECTOR_VERSION = "1.12.41"' in CONNECTOR
+    assert 'ENGINE_VERSION = "1.12.41"' in TELEMETRY
     assert "manual_operation_enter(environment, payload)" in SERVER
     assert "manual_pending_provider=manual_operation_pending" in SERVER
 
@@ -41,6 +41,6 @@ def test_picture_refresh_yields_between_network_calls() -> None:
 
 def test_no_new_physical_retry_was_added() -> None:
     assert "safe_retry_performed" in SERVER
-    # A mudança de 1.12.40 é de scheduling/telemetria, não de repetição do comando.
+    # A mudança de 1.12.41 é de scheduling/telemetria, não de repetição do comando.
     new_block = CONNECTOR[CONNECTOR.index("# 1.12.28 — o status do veículo"):]
     assert "execute_command(" not in new_block[:2200]
