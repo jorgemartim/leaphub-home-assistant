@@ -1,0 +1,37 @@
+PUBLICAR GATEWAY 1.12.41 NO GITHUB
+================================
+
+Este pacote NAO substitui o Gateway instalado e NAO altera dados.
+Ele serve somente para disparar o workflow seguro que ja esta no repositorio.
+
+PASSOS
+1. Extraia este ZIP no computador.
+2. No GitHub abra:
+   jorgemartim/leaphub-home-assistant
+3. Entre na pasta: leaphub_gateway
+4. Clique Add file > Upload files.
+5. Envie SOMENTE o arquivo:
+   PUBLISH-1.12.41.txt
+6. Commit diretamente na main com a mensagem:
+   chore(gateway): trigger safe publish 1.12.41
+7. Abra a aba Actions.
+8. Aguarde o workflow "Build and publish Leap Hub Gateway".
+
+COMPORTAMENTO ESPERADO
+- Testa o repositorio.
+- Compila a imagem amd64.
+- Publica ghcr.io/jorgemartim/leaphub-gateway:1.12.41.
+- Faz smoke test.
+- Testa acesso anonimo ao GHCR.
+- SOMENTE se tudo passar, altera config.yaml de 1.12.40 para 1.12.41.
+
+SE O WORKFLOW FALHAR EM "Verify anonymous GHCR access"
+A imagem foi criada, mas o pacote GHCR provavelmente esta privado.
+No GitHub, abra seu perfil > Packages > leaphub-gateway > Package settings > Change visibility > Public.
+Depois rode novamente o workflow em Actions.
+
+IMPORTANTE
+- Nao desinstale o Gateway 1.12.40.
+- Nao apague o armazenamento do add-on.
+- Nao altere as opcoes OCPP/telemetria.
+- Nao tente atualizar no Home Assistant ate o workflow terminar com sucesso e o config.yaml da main mostrar 1.12.41.
