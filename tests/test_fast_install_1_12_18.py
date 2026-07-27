@@ -37,7 +37,7 @@ for marker in (
     "cache-to: type=gha",
     "Smoke test exact published image",
     "docker buildx imagetools inspect",
-    "Verify anonymous image access for Home Assistant",
+    "Verify anonymous GHCR access before exposing update to Home Assistant",
 ):
     assert marker in workflow, marker
 

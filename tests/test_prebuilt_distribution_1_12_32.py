@@ -22,11 +22,12 @@ for marker in (
     "Compile Python sources",
     "python3 -m compileall -q leaphub_gateway",
     "provenance: false",
-    "Verify anonymous image access for Home Assistant",
-    "continue-on-error: true",
+    "Verify anonymous GHCR access before exposing update to Home Assistant",
+    "Promote App metadata only after image is public",
     "GITHUB_STEP_SUMMARY",
 ):
     assert marker in workflow, marker
+assert "continue-on-error: true" not in workflow
 assert "actions/checkout@v7" not in workflow
 assert "docker/login-action@v4.4.0" not in workflow
 assert (ROOT / "GITHUB-RECOVERY-1.12.41.md").is_file()

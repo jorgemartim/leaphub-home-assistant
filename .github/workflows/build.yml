@@ -5,16 +5,17 @@ on:
     branches: [main]
     paths:
       - "leaphub_gateway/**"
+      - "tests/**"
       - ".github/scripts/**"
       - ".github/workflows/build.yml"
   workflow_dispatch:
 
 concurrency:
   group: leaphub-gateway-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 permissions:
-  contents: read
+  contents: write
   packages: write
 
 env:
@@ -23,26 +24,33 @@ env:
 
 jobs:
   build:
-    name: Validate, build and publish amd64 image
+    name: Build image first, publish App version last
+    if: github.event_name == 'workflow_dispatch' || !contains(github.event.head_commit.message || '', '[gateway-published]')
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 35
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
 
-      - name: Read App version
+      - name: Read staged release metadata
         id: app
         shell: bash
         run: |
           set -euo pipefail
-          version="$(sed -n 's/^version:[[:space:]]*"\([^"]*\)".*/\1/p' leaphub_gateway/config.yaml | head -n1)"
+          target="$(tr -d '[:space:]' < leaphub_gateway/RELEASE_TARGET)"
+          published="$(sed -n 's/^version:[[:space:]]*"\([^"]*\)".*/\1/p' leaphub_gateway/config.yaml | head -n1)"
           image="$(sed -n 's/^image:[[:space:]]*"\([^"]*\)".*/\1/p' leaphub_gateway/config.yaml | head -n1)"
-          test -n "${version}"
+          test -n "${target}"
+          test -n "${published}"
           test "${image}" = "ghcr.io/jorgemartim/leaphub-gateway"
-          echo "version=${version}" >> "${GITHUB_OUTPUT}"
-          echo "image=${image}:${version}" >> "${GITHUB_OUTPUT}"
+          echo "target=${target}" >> "${GITHUB_OUTPUT}"
+          echo "published=${published}" >> "${GITHUB_OUTPUT}"
+          echo "image=${image}:${target}" >> "${GITHUB_OUTPUT}"
+          echo "Source target: ${target}; App currently advertised: ${published}"
 
-      - name: Validate repository
+      - name: Validate staged repository
         shell: bash
         run: |
           set -euo pipefail
@@ -65,7 +73,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and publish pre-compiled image
+      - name: Build and publish target image without advertising it to Home Assistant
         id: push
         uses: docker/build-push-action@v7
         with:
@@ -75,19 +83,19 @@ jobs:
           push: true
           pull: true
           tags: |
-            ghcr.io/jorgemartim/leaphub-gateway:${{ steps.app.outputs.version }}
+            ghcr.io/jorgemartim/leaphub-gateway:${{ steps.app.outputs.target }}
             ghcr.io/jorgemartim/leaphub-gateway:latest
           labels: |
             org.opencontainers.image.source=https://github.com/jorgemartim/leaphub-home-assistant
-            org.opencontainers.image.version=${{ steps.app.outputs.version }}
+            org.opencontainers.image.version=${{ steps.app.outputs.target }}
           build-args: |
             BUILD_ARCH=amd64
-            BUILD_VERSION=${{ steps.app.outputs.version }}
+            BUILD_VERSION=${{ steps.app.outputs.target }}
           cache-from: type=gha,scope=leaphub-gateway-amd64
           cache-to: type=gha,mode=max,scope=leaphub-gateway-amd64
           provenance: false
 
-      - name: Smoke test exact published image
+      - name: Smoke test exact published image while authenticated
         shell: bash
         run: |
           set -euo pipefail
@@ -97,38 +105,56 @@ jobs:
           docker run --rm --entrypoint python3 "${image}" -c \
             "import leaphub_connector, leaphub_telemetry_engine, leaphub_connection_orchestrator, leaphub_event_transport; import connector_server, ocpp_gateway, gateway_manager; print('runtime imports ok')"
 
-      - name: Verify anonymous image access for Home Assistant
+      - name: Verify anonymous GHCR access before exposing update to Home Assistant
         id: anonymous
-        continue-on-error: true
         shell: bash
         run: |
           set -euo pipefail
           image="${{ steps.app.outputs.image }}"
           docker logout "${REGISTRY}" >/dev/null 2>&1 || true
-          for attempt in 1 2 3 4 5 6; do
+          rm -f "${HOME}/.docker/config.json" || true
+          for attempt in 1 2 3 4 5 6 7 8 9 10 11 12; do
             if docker buildx imagetools inspect "${image}" >/dev/null 2>&1; then
               echo "public=true" >> "${GITHUB_OUTPUT}"
-              echo "GHCR image is public and ready for Home Assistant: ${image}"
+              echo "Anonymous pull confirmed: ${image}"
               exit 0
             fi
-            echo "Anonymous manifest check ${attempt}/6 failed; waiting for registry propagation..."
+            echo "Anonymous manifest check ${attempt}/12 failed; waiting for GHCR propagation..."
             sleep 10
           done
           echo "public=false" >> "${GITHUB_OUTPUT}"
-          echo "::warning title=GHCR access not confirmed::The image was built and published, but anonymous access was not confirmed yet. If this is the first package publication, set the leaphub-gateway package visibility to Public. Otherwise wait for GHCR propagation before updating Home Assistant."
+          echo "::error title=Gateway image is not public::The image exists but anonymous access was not confirmed. Home Assistant will keep seeing the previous App version. Set the GHCR leaphub-gateway package to Public and rerun this workflow."
           exit 1
+
+      - name: Promote App metadata only after image is public
+        if: steps.anonymous.outputs.public == 'true' && steps.app.outputs.published != steps.app.outputs.target
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/publish_release.py
+          python3 .github/scripts/validate_repository.py
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add leaphub_gateway/config.yaml SOURCE-SHA256SUMS.txt GITHUB-RECOVERY-SHA256SUMS.txt
+          if git diff --cached --quiet; then
+            echo "Nothing to promote."
+            exit 0
+          fi
+          git commit -m "chore(gateway): publish ${{ steps.app.outputs.target }} [gateway-published]"
+          git push origin HEAD:${GITHUB_REF_NAME}
 
       - name: Publish release summary
         if: always()
         shell: bash
         run: |
           {
-            echo "## Leap Hub Gateway ${{ steps.app.outputs.version }}"
+            echo "## Leap Hub Gateway ${{ steps.app.outputs.target }}"
             echo
-            echo "- Image: \`${{ steps.app.outputs.image }}\`"
+            echo "- Previously advertised App version: \`${{ steps.app.outputs.published }}\`"
+            echo "- Target image: \`${{ steps.app.outputs.image }}\`"
             echo "- Digest: \`${{ steps.push.outputs.digest }}\`"
             echo "- Architecture: \`linux/amd64\`"
-            echo "- Anonymous GHCR check: \`${{ steps.anonymous.outcome }}\`"
+            echo "- Anonymous GHCR access: \`${{ steps.anonymous.outcome }}\`"
             echo
-            echo "Only update Home Assistant after the image build and smoke test are successful."
+            echo "The Home Assistant App version is promoted only after anonymous image access succeeds."
           } >> "${GITHUB_STEP_SUMMARY}"

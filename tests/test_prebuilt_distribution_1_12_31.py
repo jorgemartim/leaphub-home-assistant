@@ -30,7 +30,7 @@ for marker in (
     "cache-from: type=gha",
     "cache-to: type=gha,mode=max",
     "Smoke test exact published image",
-    "Verify anonymous image access for Home Assistant",
+    "Verify anonymous GHCR access before exposing update to Home Assistant",
     "docker logout",
 ):
     assert marker in workflow, marker

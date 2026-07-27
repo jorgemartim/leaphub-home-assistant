@@ -17,7 +17,7 @@ checks = {
     "targeted_vehicle_wake": "vehicle_ids_json" in telemetry and "target_vehicle not in configured" in telemetry,
     "telemetry_metrics": "record_telemetry_cycle" in orchestrator and '"telemetry_latency"' in orchestrator,
     "mqtt_still_off": '"active": False' in events and '"awaiting_homologation"' in events,
-    "pipeline_frozen": "Validate, build and publish amd64 image" in build and "matrix:" not in build and '"pytest>=8,<10"' in build,
+    "pipeline_frozen": "Build image first, publish App version last" in build and "matrix:" not in build and '"pytest>=8,<10"' in build and "RELEASE_TARGET" in build,
 }
 failed = [name for name, ok in checks.items() if not ok]
 if failed:
