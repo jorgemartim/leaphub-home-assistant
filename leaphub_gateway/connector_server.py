@@ -65,7 +65,7 @@ except ModuleNotFoundError:
         _event_transport_spec.loader.exec_module(_event_transport_module)
         EVENT_TRANSPORT = _event_transport_module.EVENT_TRANSPORT
 
-VERSION = "1.12.44"
+VERSION = "1.12.49"
 API_VERSION = 2
 CAPABILITY_SCHEMA_VERSION = 1
 MIN_SUPPORTED_CLIENT_API_VERSION = 1
@@ -105,6 +105,7 @@ class PriorityOperationLimiter:
         self.capacity = max(1, int(capacity))
         self._active = 0
         self._manual_waiters = 0
+        self._background_waiters = 0
         self._condition = threading.Condition()
 
     def acquire(self, blocking: bool = True, timeout: float = -1, priority: bool = False) -> bool:
@@ -112,6 +113,8 @@ class PriorityOperationLimiter:
         with self._condition:
             if priority:
                 self._manual_waiters += 1
+            else:
+                self._background_waiters += 1
             try:
                 while self._active >= self.capacity or (not priority and self._manual_waiters > 0):
                     if not blocking:
@@ -125,7 +128,9 @@ class PriorityOperationLimiter:
             finally:
                 if priority:
                     self._manual_waiters = max(0, self._manual_waiters - 1)
-                    self._condition.notify_all()
+                else:
+                    self._background_waiters = max(0, self._background_waiters - 1)
+                self._condition.notify_all()
 
     def release(self) -> None:
         with self._condition:
@@ -140,6 +145,7 @@ class PriorityOperationLimiter:
                 "capacity": self.capacity,
                 "active": self._active,
                 "manual_waiters": self._manual_waiters,
+                "background_waiters": self._background_waiters,
             }
 
 
@@ -192,6 +198,8 @@ MANUAL_PENDING_GUARD = threading.Lock()
 COMMAND_WORKERS: dict[str, threading.Thread] = {}
 COMMAND_RETRY_TIMERS: dict[str, threading.Timer] = {}
 COMMAND_WORKERS_GUARD = threading.Lock()
+SYNC_WORKERS: dict[str, threading.Thread] = {}
+SYNC_WORKERS_GUARD = threading.Lock()
 OPTIONS_PATH = Path(os.getenv("LEAPHUB_OPTIONS_PATH", "/data/options.json"))
 
 
@@ -1095,6 +1103,243 @@ def start_command_job(
     return True
 
 
+
+def sync_payload_hash(payload: dict[str, Any]) -> str:
+    safe = {
+        "account_id": int(payload.get("account_id") or 0),
+        "vehicle_id": str(payload.get("vehicle_id") or "")[:190],
+        "request_origin": str(payload.get("request_origin") or "vehicle_sync")[:80],
+        "force_visual_bytes": bool(payload.get("force_visual_bytes")),
+        "force_debug_package": bool(payload.get("force_debug_package")),
+        "force_package_refresh": bool(payload.get("force_package_refresh")),
+    }
+    raw = json.dumps(safe, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def sync_request_hash(environment: str, request_id: str) -> str:
+    return hashlib.sha256(f"sync|{environment}|{request_id}".encode("utf-8")).hexdigest()
+
+
+def sync_journal_begin(environment: str, payload: dict[str, Any]) -> tuple[str | None, dict[str, Any] | None]:
+    request_id = request_identifier(payload)
+    if not request_id:
+        return None, None
+    now = time.time()
+    request_hash = sync_request_hash(environment, request_id)
+    payload_hash = sync_payload_hash(payload)
+    row = cached_command(request_hash)
+    if row is None:
+        try:
+            with command_db(0.35) as db:
+                persisted = db.execute(
+                    "SELECT payload_hash,status,response_json,created_at,updated_at,expires_at FROM command_requests WHERE request_hash=?",
+                    (request_hash,),
+                ).fetchone()
+            if persisted is not None:
+                row = dict(persisted)
+                cache_command(request_hash, str(row.get("payload_hash") or ""), str(row.get("status") or "queued"), str(row.get("response_json") or ""), float(row.get("created_at") or now), float(row.get("updated_at") or now), float(row.get("expires_at") or now + 600))
+        except (OSError, sqlite3.Error) as exc:
+            LOG.debug("Consulta persistente do diário de sync adiada: %s", exc)
+    if row is not None:
+        existing_payload_hash = str(row.get("payload_hash") or "")
+        if existing_payload_hash and not hmac.compare_digest(existing_payload_hash, payload_hash):
+            raise ValueError("O identificador da sincronização já pertence a outra solicitação.")
+        raw = str(row.get("response_json") or "")
+        response: dict[str, Any] = {}
+        if raw:
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, dict):
+                    response = parsed
+            except (ValueError, TypeError, json.JSONDecodeError):
+                response = {}
+        status = str(row.get("status") or "queued")
+        if status in {"completed", "failed"}:
+            response.setdefault("ok", status == "completed")
+            response["status"] = status
+            response["request_id"] = request_id
+            response["duplicate"] = True
+            return None, response
+        if now - float(row.get("updated_at") or 0) < 180:
+            return None, {
+                "ok": True, "accepted": True, "queued": True, "sync_pending": True,
+                "duplicate": True, "status": status, "request_id": request_id,
+                "poll_after_seconds": 2,
+                "message": "A sincronização já está em andamento para esta conta.",
+                "connector_version": connector.CONNECTOR_VERSION,
+            }
+    response = {
+        "ok": True, "accepted": True, "queued": True, "sync_pending": True,
+        "status": "queued", "request_id": request_id, "poll_after_seconds": 2,
+        "message": "Sincronização recebida. O Gateway continuará em segundo plano.",
+        "connector_version": connector.CONNECTOR_VERSION,
+    }
+    raw = json.dumps(response, ensure_ascii=False, separators=(",", ":"))
+    cache_command(request_hash, payload_hash, "queued", raw, now, now, now + 600)
+    try:
+        with command_db(0.5) as db:
+            db.execute(
+                "INSERT INTO command_requests(request_hash,payload_hash,status,response_json,created_at,updated_at,expires_at) VALUES(?,?,?,?,?,?,?) "
+                "ON CONFLICT(request_hash) DO UPDATE SET payload_hash=excluded.payload_hash,status=excluded.status,response_json=excluded.response_json,updated_at=excluded.updated_at,expires_at=excluded.expires_at",
+                (request_hash, payload_hash, "queued", raw, now, now, now + 600),
+            )
+            db.commit()
+    except (OSError, sqlite3.Error) as exc:
+        LOG.debug("Persistência inicial do diário de sync adiada: %s", exc)
+    return request_hash, None
+
+
+def sync_journal_update(request_hash: str, payload_hash: str, request_id: str, status: str, response: dict[str, Any]) -> None:
+    now = time.time()
+    response = dict(response)
+    response["status"] = status
+    response["request_id"] = request_id
+    raw = json.dumps(response, ensure_ascii=False, separators=(",", ":"), default=connector.json_default)
+    cache_command(request_hash, payload_hash, status, raw, now, now, now + 600)
+    try:
+        with command_db(0.5) as db:
+            db.execute(
+                "UPDATE command_requests SET status=?,response_json=?,updated_at=?,expires_at=? WHERE request_hash=?",
+                (status, raw[:200000], now, now + 600, request_hash),
+            )
+            db.commit()
+    except (OSError, sqlite3.Error) as exc:
+        LOG.debug("Persistência do estado de sync adiada: %s", exc)
+
+
+def sync_journal_status(environment: str, payload: dict[str, Any]) -> dict[str, Any]:
+    request_id = request_identifier(payload)
+    if not request_id:
+        raise ValueError("Identificador da sincronização ausente.")
+    request_hash = sync_request_hash(environment, request_id)
+    row = cached_command(request_hash)
+    if row is None:
+        try:
+            with command_db(0.3) as db:
+                persisted = db.execute(
+                    "SELECT payload_hash,status,response_json,created_at,updated_at,expires_at FROM command_requests WHERE request_hash=?",
+                    (request_hash,),
+                ).fetchone()
+            row = dict(persisted) if persisted is not None else None
+            if row is not None:
+                cache_command(request_hash, str(row.get("payload_hash") or ""), str(row.get("status") or "queued"), str(row.get("response_json") or ""), float(row.get("created_at") or time.time()), float(row.get("updated_at") or time.time()), float(row.get("expires_at") or time.time()+600))
+        except (OSError, sqlite3.Error) as exc:
+            raise connector.ConnectorTemporaryError("O diário de sincronização está ocupado. A consulta será repetida sem iniciar outro sync.") from exc
+    if row is None:
+        return {"ok": False, "status": "unknown", "request_id": request_id, "message": "O Gateway ainda não localizou esta sincronização."}
+    raw = str(row.get("response_json") or "")
+    response: dict[str, Any] = {}
+    if raw:
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict): response = parsed
+        except (ValueError, TypeError, json.JSONDecodeError):
+            response = {}
+    status = str(row.get("status") or "queued")
+    if status in {"queued", "waiting_account", "waiting_slot", "running"} and time.time() - float(row.get("updated_at") or 0) > 150:
+        status = "failed"
+        response = {"ok": False, "temporary": True, "retry_after_seconds": 3, "message": "O worker de sincronização não concluiu no tempo esperado. Uma nova sincronização pode ser iniciada com segurança."}
+        sync_journal_update(request_hash, str(row.get("payload_hash") or ""), request_id, status, response)
+    response["status"] = status
+    response["request_id"] = request_id
+    if status in {"queued", "waiting_account", "waiting_slot", "running"}:
+        response.setdefault("ok", True)
+        response.setdefault("accepted", True)
+        response["sync_pending"] = True
+        response.setdefault("poll_after_seconds", 2 if status != "waiting_account" else 4)
+    return response
+
+
+def run_sync_job(environment: str, payload: dict[str, Any], request_hash: str, request_id: str, pending_key: str) -> None:
+    payload_hash = sync_payload_hash(payload)
+    queue_started = time.monotonic()
+    account_lock: AccountOperationLock | None = None
+    account_acquired = False
+    acquired = False
+    worker_key = f"{environment}:{request_id}"
+    try:
+        sync_journal_update(request_hash, payload_hash, request_id, "waiting_account", {
+            "ok": True, "accepted": True, "queued": True, "sync_pending": True,
+            "message": "Aguardando somente a operação atual desta conta terminar.",
+        })
+        account_lock = account_operation_lock(environment, payload)
+        account_acquired = account_lock.acquire(timeout=max(30, MANUAL_WAIT_SECONDS))
+        if not account_acquired:
+            raise connector.ConnectorTemporaryError("A conta permaneceu ocupada por outra operação. A sincronização não iniciou.")
+        account_acquired_at = time.monotonic()
+        sync_journal_update(request_hash, payload_hash, request_id, "waiting_slot", {
+            "ok": True, "accepted": True, "queued": True, "sync_pending": True,
+            "message": "Conta liberada. Aguardando uma vaga do Connector.",
+        })
+        acquired = SEMAPHORE.acquire(timeout=max(30, MANUAL_WAIT_SECONDS), priority=True)
+        if not acquired:
+            raise connector.ConnectorTemporaryError("O Connector permaneceu ocupado. A sincronização não foi enviada à nuvem.")
+        slot_at = time.monotonic()
+        sync_journal_update(request_hash, payload_hash, request_id, "running", {
+            "ok": True, "accepted": True, "queued": False, "sync_pending": True,
+            "message": "Sincronização em execução na conta.",
+        })
+        execute_started = time.monotonic()
+        result = TELEMETRY.execute_account_operation(environment, payload, sync=True, origin="vehicle_sync")
+        execute_finished = time.monotonic()
+        result = dict(result) if isinstance(result, dict) else {"ok": False, "message": "Resposta inválida da sincronização."}
+        result["sync_pending"] = False
+        result["latency"] = {
+            "account_wait_ms": int(round((account_acquired_at - queue_started) * 1000)),
+            "connector_slot_ms": int(round((slot_at - account_acquired_at) * 1000)),
+            "remote_execute_ms": int(round((execute_finished - execute_started) * 1000)),
+            "total_ms": int(round((execute_finished - queue_started) * 1000)),
+        }
+        sync_journal_update(request_hash, payload_hash, request_id, "completed", result)
+        LOG.info(
+            "Sincronização de veículo concluída no worker para %s; conta=%sms vaga=%sms remoto=%sms total=%sms.",
+            environment,
+            result["latency"]["account_wait_ms"], result["latency"]["connector_slot_ms"],
+            result["latency"]["remote_execute_ms"], result["latency"]["total_ms"],
+        )
+    except BaseException as exc:  # noqa: BLE001
+        response = {
+            "ok": False,
+            "temporary": bool(connector.is_transient_cloud_error(exc) or isinstance(exc, connector.ConnectorTemporaryError)),
+            "retry_after_seconds": 3,
+            "sync_pending": False,
+            "message": connector.clean_message(str(exc)),
+            "connector_version": connector.CONNECTOR_VERSION,
+        }
+        sync_journal_update(request_hash, payload_hash, request_id, "failed", response)
+        LOG.warning("Sincronização em segundo plano falhou (%s): %s", type(exc).__name__, connector.clean_message(str(exc)))
+    finally:
+        if acquired:
+            SEMAPHORE.release()
+        if account_acquired and account_lock is not None:
+            account_lock.release()
+        manual_operation_defer(pending_key, 3)
+        manual_operation_leave(pending_key)
+        TELEMETRY.wake_event.set()
+        with SYNC_WORKERS_GUARD:
+            SYNC_WORKERS.pop(worker_key, None)
+
+
+def start_sync_job(environment: str, payload: dict[str, Any], request_hash: str | None, request_id: str) -> bool:
+    if not request_hash or not request_id:
+        return False
+    worker_key = f"{environment}:{request_id}"
+    with SYNC_WORKERS_GUARD:
+        existing = SYNC_WORKERS.get(worker_key)
+        if existing is not None and existing.is_alive():
+            return True
+        pending_key = manual_operation_enter(environment, payload)
+        worker = threading.Thread(
+            target=run_sync_job,
+            args=(environment, dict(payload), request_hash, request_id, pending_key),
+            name=f"leaphub-sync-{request_id[:8]}",
+            daemon=True,
+        )
+        SYNC_WORKERS[worker_key] = worker
+        worker.start()
+    return True
+
 def command_journal_abort(request_hash: str | None) -> None:
     if not request_hash:
         return
@@ -1368,6 +1613,12 @@ def detailed_health_payload(environment: str) -> dict[str, Any]:
         "connector_version": connector.CONNECTOR_VERSION,
         "library_version": library,
         "operation_limiter": SEMAPHORE.snapshot(),
+        "operation_isolation": {
+            "per_account_locking": True,
+            "lock_order": "account_then_connector",
+            "global_slot_held_while_waiting_account": False,
+            "manual_preemption": True,
+        },
         "connection_orchestrator": ORCHESTRATOR.snapshot(environment),
         "event_transport": EVENT_TRANSPORT.snapshot(),
         "python_version": sys.version.split()[0],
@@ -1485,7 +1736,7 @@ class Handler(BaseHTTPRequestHandler):
                 "supported_api_version": API_VERSION,
             })
             return
-        if self.path not in {"/v1/accounts/test", "/v1/vehicles/sync", "/v1/vehicles/command", "/v1/vehicles/command/status", "/v1/vehicles/command/cancel", "/v1/telemetry/subscriptions/upsert", "/v1/telemetry/subscriptions/remove", "/v1/telemetry/subscriptions/boost", "/v1/telemetry/subscriptions/release"}:
+        if self.path not in {"/v1/accounts/test", "/v1/vehicles/sync", "/v1/vehicles/sync/status", "/v1/vehicles/command", "/v1/vehicles/command/status", "/v1/vehicles/command/cancel", "/v1/telemetry/subscriptions/upsert", "/v1/telemetry/subscriptions/remove", "/v1/telemetry/subscriptions/boost", "/v1/telemetry/subscriptions/release"}:
             self.send_json(404, {"ok": False, "message": "Página não encontrada."})
             return
         try:
@@ -1513,7 +1764,7 @@ class Handler(BaseHTTPRequestHandler):
         command_journal_key: str | None = None
 
         try:
-            if self.path in {"/v1/telemetry/subscriptions/boost", "/v1/telemetry/subscriptions/release", "/v1/vehicles/command/status"}:
+            if self.path in {"/v1/telemetry/subscriptions/boost", "/v1/telemetry/subscriptions/release", "/v1/vehicles/command/status", "/v1/vehicles/sync/status"}:
                 LOG.debug("Action %s accepted for %s trace=%s", self.path, environment, self.trace_id)
             else:
                 LOG.info("Action %s accepted for %s trace=%s", self.path, environment, self.trace_id)
@@ -1536,6 +1787,9 @@ class Handler(BaseHTTPRequestHandler):
                     str(payload.get("subscription_id") or ""),
                 ))
                 return
+            if self.path == "/v1/vehicles/sync/status":
+                self.send_json(200, sync_journal_status(environment, payload))
+                return
             if self.path == "/v1/vehicles/command/status":
                 self.send_json(200, command_journal_status(environment, payload))
                 return
@@ -1543,6 +1797,21 @@ class Handler(BaseHTTPRequestHandler):
                 cancelled = command_journal_cancel(environment, payload)
                 self.send_json(200 if bool(cancelled.get("cancelled")) else 409, cancelled)
                 return
+            if self.path == "/v1/vehicles/sync":
+                sync_id = request_identifier(payload)
+                if sync_id:
+                    sync_journal_key, sync_replay = sync_journal_begin(environment, payload)
+                    if sync_replay is not None:
+                        self.send_json(200, sync_replay)
+                        return
+                    if sync_journal_key is not None and start_sync_job(environment, payload, sync_journal_key, sync_id):
+                        self.send_json(200, {
+                            "ok": True, "accepted": True, "queued": True, "sync_pending": True,
+                            "status": "queued", "request_id": sync_id, "poll_after_seconds": 2,
+                            "message": "Sincronização recebida. O worker continuará sem manter o túnel HTTP aberto.",
+                            "connector_version": connector.CONNECTOR_VERSION,
+                        })
+                        return
             if self.path == "/v1/vehicles/command":
                 command_journal_key, replay = command_journal_begin(environment, payload)
                 if replay is not None:

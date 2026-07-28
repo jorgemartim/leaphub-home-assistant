@@ -52,7 +52,7 @@ except ModuleNotFoundError:
         EVENT_TRANSPORT = _event_transport_module.EVENT_TRANSPORT
 
 LOG = logging.getLogger("leaphub.telemetry")
-ENGINE_VERSION = "1.12.44"  # confirmação idêntica entregue ao site
+ENGINE_VERSION = "1.12.49"  # sessão saudável preservada em upsert verificado
 
 
 def utc_iso() -> str:
@@ -1303,7 +1303,14 @@ class TelemetryEngine:
         protected_auth = enabled and existing_auth_required and not credentials_changed and not credentials_verified
         protected_cooldown = enabled and existing_cooldown_until > now_epoch and not credentials_changed and not credentials_verified
         existing_config_hash = str(existing["config_hash"] or "") if existing is not None else ""
-        if existing is not None and existing_config_hash and hmac.compare_digest(existing_config_hash, config_hash) and not credentials_verified:
+        session_present = existing is not None and self._has_session(subscription_id)
+        verified_healthy_session = credentials_verified and not credentials_changed and session_present
+        if (
+            existing is not None
+            and existing_config_hash
+            and hmac.compare_digest(existing_config_hash, config_hash)
+            and (not credentials_verified or verified_healthy_session)
+        ):
             status = str(existing["status"] or "waiting")
             response = {
                 "ok": not protected_auth and not protected_cooldown,
@@ -1312,7 +1319,10 @@ class TelemetryEngine:
                 "unchanged": True,
                 "deduplicated": True,
                 "credentials_changed": False,
-                "session_preserved": self._has_session(subscription_id),
+                "credentials_verified": credentials_verified,
+                "auth_reset": False,
+                "cooldown_reset": False,
+                "session_preserved": session_present,
                 "next_run_seconds": max(0, int(float(existing["next_run_at"] or 0) - now_epoch)),
                 "status": status,
             }
@@ -1370,7 +1380,13 @@ class TelemetryEngine:
             auth_required = 0
             cooldown_until = 0.0
 
-        if credentials_changed or credentials_verified or not enabled:
+        # `credentials_verified` confirma que uma consulta manual funcionou,
+        # mas não significa que a sessão ativa ficou inválida. Fechá-la aqui
+        # aguardava a operação de telemetria em curso e fazia o site repetir o
+        # mesmo upsert após o timeout. Somente uma verificação sem sessão ativa
+        # precisa limpar o estado de recuperação e preparar uma nova sessão.
+        verification_requires_reset = credentials_verified and not verified_healthy_session
+        if credentials_changed or verification_requires_reset or not enabled:
             self._close_session(subscription_id)
         encrypted = self.fernet.encrypt(canonical_json(credentials))
         with self.lock, self._db() as db:
@@ -1432,7 +1448,7 @@ class TelemetryEngine:
             "credentials_verified": credentials_verified,
             "auth_reset": credentials_verified and existing_auth_required,
             "cooldown_reset": credentials_verified and existing_cooldown_until > now_epoch,
-            "session_preserved": not credentials_changed and not credentials_verified and self._has_session(subscription_id),
+            "session_preserved": not credentials_changed and not verification_requires_reset and self._has_session(subscription_id),
         }
 
     def remove(self, subscription_id: str) -> dict[str, Any]:
@@ -1878,15 +1894,31 @@ class TelemetryEngine:
 
         environment = str(subscription["environment"])
         account_id = int(subscription["account_id"] or 0)
-        # 1.12.38 — circuit breaker global: durante uma oscilação confirmada
-        # da nuvem, telemetria de fundo é reduzida para uma sonda moderada por
-        # ambiente. Janelas interativas/comando continuam elegíveis.
+        # 1.12.47 — backpressure primeiro por conta. Uma única conta com
+        # timeout/retry repetido reduz somente a própria telemetria de fundo.
+        # O breaker global abaixo exige evidência de contas distintas.
+        if (
+            not fast_mode
+            and ORCHESTRATOR.is_account_degraded(environment, account_id)
+            and not ORCHESTRATOR.claim_account_background_probe(environment, account_id)
+        ):
+            self._reschedule(
+                sid,
+                60,
+                "account_cloud_degraded",
+                "Esta conta está em recuperação temporária; outras contas continuam com a cadência normal.",
+                failed=False,
+            )
+            return
+
+        # Breaker compartilhado: só reduz o ambiente quando contas distintas
+        # falham na mesma janela, sinalizando indisponibilidade realmente comum.
         if not fast_mode and ORCHESTRATOR.is_degraded(environment) and not ORCHESTRATOR.claim_background_probe(environment):
             self._reschedule(
                 sid,
                 60,
                 "cloud_degraded",
-                "Nuvem Leapmotor degradada; telemetria automática reduzida sem afetar comandos manuais.",
+                "Nuvem Leapmotor degradada em múltiplas contas; telemetria automática reduzida sem afetar comandos manuais.",
                 failed=False,
             )
             return
@@ -1896,7 +1928,7 @@ class TelemetryEngine:
                 sid,
                 max(30, int(global_auth.get("retry_after_seconds") or 30)),
                 "cooldown",
-                "Cooldown global ativo; nenhuma chamada à Leapmotor será feita antes da liberação.",
+                "Cooldown desta conta ativo; as demais contas continuam independentes.",
                 failed=False,
             )
             return
@@ -1949,34 +1981,108 @@ class TelemetryEngine:
             self._reschedule(sid, 2, "waiting", "Comando do usuário tem prioridade sobre a telemetria automática.", failed=False)
             return
 
-        acquired = self.operation_semaphore.acquire(timeout=5)
-        if not acquired:
-            credentials.clear()
-            self._reschedule(sid, 30, "waiting", "Aguardando vaga no Connector.", failed=False)
-            return
-
-        if self._manual_operation_blocks(environment, operation_payload, command_mode=command_mode):
-            self.operation_semaphore.release()
-            credentials.clear()
-            self._reschedule(sid, 2, "waiting", "Comando do usuário aguardando execução; telemetria cedendo a conexão.", failed=False)
-            return
-
+        # 1.12.47 — ordem única de aquisição: conta -> vaga global.
+        # Antes a telemetria podia segurar uma vaga global enquanto aguardava
+        # a trava de uma conta ocupada, invertendo a ordem usada pelos comandos
+        # manuais. Isso permitia uma conta lenta consumir capacidade de outras.
+        queue_started_at = time.monotonic()
+        account_wait_ms = 0.0
+        connector_slot_ms = 0.0
         account_lock = None
         account_acquired = False
+        acquired = False
         if self.account_lock_provider is not None:
             account_lock = self.account_lock_provider(environment, operation_payload)
+            account_wait_started_at = time.monotonic()
             account_acquired = account_lock.acquire(timeout=self.account_wait_seconds)
+            account_wait_ms = (time.monotonic() - account_wait_started_at) * 1000.0
             if not account_acquired:
-                self.operation_semaphore.release()
                 credentials.clear()
+                ORCHESTRATOR.record_telemetry_cycle(
+                    environment,
+                    profile="confirmation" if command_mode else ("interactive" if interactive else "background"),
+                    duration_ms=0.0,
+                    outcome="account_busy_yield",
+                    account_wait_ms=account_wait_ms,
+                    connector_slot_ms=0.0,
+                )
                 self._reschedule(
                     sid,
                     15,
                     "waiting",
-                    "A conta já está sendo consultada por outra operação; a telemetria aguardará sem criar outro login.",
+                    "A conta já está sendo consultada por outra operação; nenhuma vaga global foi ocupada enquanto aguardava.",
                     failed=False,
                 )
                 return
+
+        if self._manual_operation_blocks(environment, operation_payload, command_mode=command_mode):
+            if account_acquired and account_lock is not None:
+                account_lock.release()
+            credentials.clear()
+            ORCHESTRATOR.record_telemetry_cycle(
+                environment,
+                profile="confirmation" if command_mode else ("interactive" if interactive else "background"),
+                duration_ms=0.0,
+                outcome="manual_yield",
+                account_wait_ms=account_wait_ms,
+                connector_slot_ms=0.0,
+            )
+            self._reschedule(sid, 2, "waiting", "Comando do usuário aguardando execução; telemetria liberou a conta antes de usar uma vaga global.", failed=False)
+            return
+
+        slot_wait_started_at = time.monotonic()
+        slot_deadline = slot_wait_started_at + 5.0
+        while True:
+            acquired = self.operation_semaphore.acquire(timeout=0.25)
+            if acquired:
+                break
+            if self._manual_operation_blocks(environment, operation_payload, command_mode=command_mode):
+                if account_acquired and account_lock is not None:
+                    account_lock.release()
+                credentials.clear()
+                connector_slot_ms = (time.monotonic() - slot_wait_started_at) * 1000.0
+                ORCHESTRATOR.record_telemetry_cycle(
+                    environment,
+                    profile="confirmation" if command_mode else ("interactive" if interactive else "background"),
+                    duration_ms=0.0,
+                    outcome="manual_yield",
+                    account_wait_ms=account_wait_ms,
+                    connector_slot_ms=connector_slot_ms,
+                )
+                self._reschedule(sid, 2, "waiting", "Telemetria liberou a conta para um comando manual antes de ocupar o Connector.", failed=False)
+                return
+            if time.monotonic() >= slot_deadline:
+                if account_acquired and account_lock is not None:
+                    account_lock.release()
+                credentials.clear()
+                connector_slot_ms = (time.monotonic() - slot_wait_started_at) * 1000.0
+                ORCHESTRATOR.record_telemetry_cycle(
+                    environment,
+                    profile="confirmation" if command_mode else ("interactive" if interactive else "background"),
+                    duration_ms=0.0,
+                    outcome="slot_timeout",
+                    account_wait_ms=account_wait_ms,
+                    connector_slot_ms=connector_slot_ms,
+                )
+                self._reschedule(sid, 30, "waiting", "Aguardando vaga no Connector; a conta foi liberada para não bloquear comandos.", failed=False)
+                return
+
+        connector_slot_ms = (time.monotonic() - slot_wait_started_at) * 1000.0
+        if self._manual_operation_blocks(environment, operation_payload, command_mode=command_mode):
+            self.operation_semaphore.release()
+            if account_acquired and account_lock is not None:
+                account_lock.release()
+            credentials.clear()
+            ORCHESTRATOR.record_telemetry_cycle(
+                environment,
+                profile="confirmation" if command_mode else ("interactive" if interactive else "background"),
+                duration_ms=0.0,
+                outcome="manual_yield",
+                account_wait_ms=account_wait_ms,
+                connector_slot_ms=connector_slot_ms,
+            )
+            self._reschedule(sid, 2, "waiting", "Comando do usuário aguardando execução; telemetria cedeu a vaga imediatamente.", failed=False)
+            return
         manual_provider = self.manual_active_provider if command_mode else self.manual_pending_provider
         manual_should_yield = (
             (lambda: bool(manual_provider and manual_provider(environment, operation_payload)))
@@ -2000,6 +2106,8 @@ class TelemetryEngine:
                 profile="confirmation" if command_mode else ("interactive" if interactive else "background"),
                 duration_ms=(time.monotonic() - collection_started_at) * 1000.0,
                 outcome="manual_yield",
+                account_wait_ms=account_wait_ms,
+                connector_slot_ms=connector_slot_ms,
             )
             self._reschedule(sid, 2, "waiting", "Telemetria cedeu a conta para o comando do usuário.", failed=False)
             LOG.info("Telemetria de %s interrompida em ponto seguro para priorizar comando manual.", sid)
@@ -2010,6 +2118,8 @@ class TelemetryEngine:
                 profile="confirmation" if command_mode else ("interactive" if interactive else "background"),
                 duration_ms=(time.monotonic() - collection_started_at) * 1000.0,
                 outcome="failure",
+                account_wait_ms=account_wait_ms,
+                connector_slot_ms=connector_slot_ms,
             )
             message = connector.clean_message(str(exc))
             failures = int(subscription["consecutive_failures"] or 0) + 1
@@ -2044,7 +2154,7 @@ class TelemetryEngine:
                     environment, int(subscription["account_id"] or 0), "telemetry_rate_limit",
                     message, requested_delay, blocked=True,
                 )
-                LOG.warning("Proteção global contra limite ativada para %s por %ss: %s", sid, delay, message)
+                LOG.warning("Proteção da conta contra limite ativada para %s por %ss: %s", sid, delay, message)
             elif isinstance(exc, connector.ConnectorAuthenticationError) or connector.is_authentication_error(exc):
                 self._mark_auth_required(sid, message)
                 LOG.warning("A assinatura %s foi pausada até as credenciais serem confirmadas: %s", sid, message)
@@ -2074,9 +2184,11 @@ class TelemetryEngine:
                 self._reschedule(sid, delay, "error", message, failed=True)
             return
         finally:
+            # Libera primeiro o recurso global; a trava da conta sai logo depois.
+            # A ordem inversa de aquisição nunca é usada em nenhum caminho.
+            self.operation_semaphore.release()
             if account_acquired and account_lock is not None:
                 account_lock.release()
-            self.operation_semaphore.release()
             credentials.clear()
 
         collection_profile = str(result.get("collection_profile") or ("confirmation" if command_mode else "fast"))
@@ -2085,6 +2197,8 @@ class TelemetryEngine:
             profile="confirmation" if command_mode else collection_profile,
             duration_ms=(time.monotonic() - collection_started_at) * 1000.0,
             outcome="success",
+            account_wait_ms=account_wait_ms,
+            connector_slot_ms=connector_slot_ms,
         )
         ORCHESTRATOR.record_cloud_success(environment, account_id)
         vehicles = [item for item in (result.get("vehicles") or []) if isinstance(item, dict)]
@@ -2326,7 +2440,7 @@ class TelemetryEngine:
             slow_last_at = float(session.get("slow_last_at") or 0)
             slow_cycle = (
                 not command_mode
-                and ORCHESTRATOR.secondary_network_allowed(environment)
+                and ORCHESTRATOR.secondary_network_allowed(environment, account_id)
                 and now_epoch - slow_last_at >= self.slow_interval_seconds
             )
             get_messages = getattr(client, "get_message_list", None)

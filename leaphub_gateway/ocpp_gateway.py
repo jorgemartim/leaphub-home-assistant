@@ -38,7 +38,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-GATEWAY_VERSION = "1.12.44"
+GATEWAY_VERSION = "1.12.49"
 IS_RAILWAY = bool(os.getenv("RAILWAY_ENVIRONMENT_NAME") or os.getenv("RAILWAY_SERVICE_ID"))
 RUNTIME_DIR = Path(os.getenv("LEAPHUB_RUNTIME_DIR", "/tmp/leaphub-ocpp" if IS_RAILWAY else "."))
 BIND = os.getenv("LEAPHUB_OCPP_BIND", "0.0.0.0")
@@ -171,9 +171,24 @@ API_TARGETS = configured_targets()
 TARGETS_BY_NAME = {target.name: target for target in API_TARGETS}
 STATE_DB = Path(os.getenv("LEAPHUB_OCPP_STATE_DB", str(RUNTIME_DIR / "ocpp-state.sqlite")))
 STATE_DB_INIT_LOCK = threading.Lock()
+STATE_DB_WRITE_LOCK = threading.RLock()
 STATE_DB_INITIALIZED = False
+STATE_DB_LOCK_RETRIES = 0
+STATE_DB_LOCK_FAILURES = 0
+STATE_DB_LAST_LOCK_ERROR_AT = 0.0
 QUEUE_LAST_REPLAY_AT = 0.0
 QUEUE_LAST_REPLAY_ERROR = ""
+QUEUE_PRUNE_INTERVAL_SECONDS = max(30.0, float(os.getenv("LEAPHUB_OCPP_PRUNE_INTERVAL", "60")))
+QUEUE_LAST_PRUNE_AT = 0.0
+PERSIST_CACHE_LOCK = threading.Lock()
+ROUTE_PERSIST_CACHE: dict[str, tuple[str, float]] = {}
+OWNER_PERSIST_CACHE: dict[tuple[str, str], tuple[int, float]] = {}
+ROUTE_WRITE_COALESCE_SECONDS = max(5.0, float(os.getenv("LEAPHUB_OCPP_ROUTE_WRITE_COALESCE", "60")))
+RECONNECT_HISTORY_LOCK = threading.Lock()
+RECONNECT_HISTORY: dict[str, list[float]] = {}
+RECONNECT_LAST_LOG: dict[str, float] = {}
+RECONNECT_STORM_WINDOW_SECONDS = max(20.0, float(os.getenv("LEAPHUB_OCPP_RECONNECT_WINDOW", "60")))
+RECONNECT_STORM_THRESHOLD = max(4, int(os.getenv("LEAPHUB_OCPP_RECONNECT_THRESHOLD", "5")))
 ROUTE_CACHE_SECONDS = max(3600, int(os.getenv("LEAPHUB_OCPP_ROUTE_CACHE_SECONDS", str(14 * 86400))))
 RESILIENT_ACTIONS = {
     "BootNotification",
@@ -191,6 +206,7 @@ def state_db() -> sqlite3.Connection:
     db = sqlite3.connect(STATE_DB, timeout=5.0)
     db.execute("PRAGMA busy_timeout=5000")
     db.execute("PRAGMA foreign_keys=ON")
+    db.execute("PRAGMA synchronous=NORMAL")
     if not STATE_DB_INITIALIZED:
         with STATE_DB_INIT_LOCK:
             if not STATE_DB_INITIALIZED:
@@ -301,6 +317,109 @@ def prune_queues(db: sqlite3.Connection) -> None:
         )
 
 
+def _sqlite_busy(exc: BaseException) -> bool:
+    lowered = str(exc).lower()
+    return "locked" in lowered or "busy" in lowered
+
+
+def _state_write(operation: str, callback: Any) -> Any:
+    """Serializa escritores SQLite e repete apenas contenção transitória.
+
+    WAL permite leituras concorrentes, mas ainda existe um único escritor por
+    banco. A 1.12.44 abria vários escritores independentes durante tempestades
+    de reconexão; esta barreira evita que uma wallbox cause lock em outra.
+    """
+    global STATE_DB_LOCK_RETRIES, STATE_DB_LOCK_FAILURES, STATE_DB_LAST_LOCK_ERROR_AT
+    last_error: BaseException | None = None
+    for delay in (0.0, 0.03, 0.08, 0.18, 0.35):
+        if delay:
+            time.sleep(delay)
+        try:
+            with STATE_DB_WRITE_LOCK:
+                db = state_db()
+                try:
+                    result = callback(db)
+                    db.commit()
+                    return result
+                except BaseException:
+                    db.rollback()
+                    raise
+                finally:
+                    db.close()
+        except sqlite3.OperationalError as exc:
+            last_error = exc
+            if not _sqlite_busy(exc):
+                raise
+            STATE_DB_LOCK_RETRIES += 1
+            STATE_DB_LAST_LOCK_ERROR_AT = time.time()
+    STATE_DB_LOCK_FAILURES += 1
+    if isinstance(last_error, BaseException):
+        raise last_error
+    raise sqlite3.OperationalError(f"SQLite write failed: {operation}")
+
+
+def maybe_prune_queues(db: sqlite3.Connection, force: bool = False) -> bool:
+    global QUEUE_LAST_PRUNE_AT
+    now = time.monotonic()
+    if not force and QUEUE_LAST_PRUNE_AT > 0 and now - QUEUE_LAST_PRUNE_AT < QUEUE_PRUNE_INTERVAL_SECONDS:
+        return False
+    prune_queues(db)
+    QUEUE_LAST_PRUNE_AT = now
+    return True
+
+
+def enforce_queue_caps(db: sqlite3.Connection) -> None:
+    """Mantém os limites duros sem executar toda a limpeza de retenção a cada write."""
+    event_total = int(db.execute("SELECT COUNT(*) FROM event_queue").fetchone()[0])
+    if event_total > EVENT_QUEUE_MAX:
+        db.execute(
+            "DELETE FROM event_queue WHERE id IN (SELECT id FROM event_queue "
+            "ORDER BY CASE WHEN ocpp_action IN ('Heartbeat','MeterValues') THEN 0 ELSE 1 END, id ASC LIMIT ?)",
+            (event_total - EVENT_QUEUE_MAX,),
+        )
+    result_total = int(db.execute("SELECT COUNT(*) FROM command_result_queue").fetchone()[0])
+    if result_total > EVENT_QUEUE_MAX:
+        db.execute(
+            "DELETE FROM command_result_queue WHERE id IN (SELECT id FROM command_result_queue ORDER BY id ASC LIMIT ?)",
+            (result_total - EVENT_QUEUE_MAX,),
+        )
+
+
+def record_reconnect(identity: str) -> dict[str, int | bool]:
+    now = time.monotonic()
+    cutoff = now - RECONNECT_STORM_WINDOW_SECONDS
+    with RECONNECT_HISTORY_LOCK:
+        history = [stamp for stamp in RECONNECT_HISTORY.get(identity, []) if stamp >= cutoff]
+        history.append(now)
+        RECONNECT_HISTORY[identity] = history[-64:]
+        count = len(history)
+        storm = count >= RECONNECT_STORM_THRESHOLD
+        if storm and now - RECONNECT_LAST_LOG.get(identity, 0.0) >= 30.0:
+            RECONNECT_LAST_LOG[identity] = now
+            LOG.warning("OCPP reconnect storm detected for %s: %s connections in %.0fs.", identity, count, RECONNECT_STORM_WINDOW_SECONDS)
+        # Limpeza oportunista, sem expor identidades no diagnóstico público.
+        if len(RECONNECT_HISTORY) > 2048:
+            stale = [key for key, stamps in RECONNECT_HISTORY.items() if not stamps or max(stamps) < cutoff]
+            for key in stale[:512]:
+                RECONNECT_HISTORY.pop(key, None)
+                RECONNECT_LAST_LOG.pop(key, None)
+        return {"count": count, "storm": storm}
+
+
+def reconnect_diagnostics() -> dict[str, int]:
+    now = time.monotonic()
+    cutoff = now - RECONNECT_STORM_WINDOW_SECONDS
+    with RECONNECT_HISTORY_LOCK:
+        counts = [sum(1 for stamp in stamps if stamp >= cutoff) for stamps in RECONNECT_HISTORY.values()]
+    return {
+        "window_seconds": int(RECONNECT_STORM_WINDOW_SECONDS),
+        "threshold": int(RECONNECT_STORM_THRESHOLD),
+        "connections_in_window": int(sum(counts)),
+        "storm_wallboxes": int(sum(1 for count in counts if count >= RECONNECT_STORM_THRESHOLD)),
+        "max_reconnects_single_wallbox": int(max(counts or [0])),
+    }
+
+
 def _dead_letter_fingerprint(kind: str, target_name: str, identity: str, action: str, error_code: str) -> str:
     raw = f"{kind}|{target_name}|{identity}|{action}|{error_code}".encode("utf-8", "replace")
     return hashlib.sha256(raw).hexdigest()
@@ -323,17 +442,17 @@ def quarantine_delivery(
     identity_hash = hashlib.sha256(identity.encode("utf-8", "replace")).hexdigest()
     message_hash = hashlib.sha256(str(message_id).encode("utf-8", "replace")).hexdigest() if message_id else ""
     error_text = re.sub(r"\s+", " ", str(error)).strip()[:300]
+    def write(db: sqlite3.Connection) -> None:
+        db.execute(
+            "INSERT INTO dead_letter_queue(fingerprint,kind,target_name,identity_hash,message_hash,ocpp_action,status_code,error_code,error_text,occurrences,first_seen_at,last_seen_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,1,?,?) ON CONFLICT(fingerprint) DO UPDATE SET "
+            "message_hash=excluded.message_hash,status_code=excluded.status_code,error_text=excluded.error_text,"
+            "occurrences=dead_letter_queue.occurrences+1,last_seen_at=excluded.last_seen_at",
+            (fingerprint, kind[:40], target_name[:40], identity_hash, message_hash, action[:80], status_code, error_code, error_text, now, now),
+        )
+        maybe_prune_queues(db)
     try:
-        with state_db() as db:
-            db.execute(
-                "INSERT INTO dead_letter_queue(fingerprint,kind,target_name,identity_hash,message_hash,ocpp_action,status_code,error_code,error_text,occurrences,first_seen_at,last_seen_at) "
-                "VALUES(?,?,?,?,?,?,?,?,?,1,?,?) ON CONFLICT(fingerprint) DO UPDATE SET "
-                "message_hash=excluded.message_hash,status_code=excluded.status_code,error_text=excluded.error_text,"
-                "occurrences=dead_letter_queue.occurrences+1,last_seen_at=excluded.last_seen_at",
-                (fingerprint, kind[:40], target_name[:40], identity_hash, message_hash, action[:80], status_code, error_code, error_text, now, now),
-            )
-            prune_queues(db)
-            db.commit()
+        _state_write("quarantine_delivery", write)
     except sqlite3.Error as exc:
         LOG.error("Could not quarantine permanent OCPP delivery for %s: %s", action, exc)
 
@@ -349,9 +468,8 @@ def dead_letter_count() -> int:
 def remember_queue_owner(target_name: str, identity: str, owner_user_id: Any) -> None:
     """Persist a minimal owner scope so replay can be fair between users.
 
-    Existing queues remain valid. If ownership is unavailable (for example an
-    event queued before 1.12.44), replay falls back to the wallbox identity,
-    which is even more isolated and never merges unrelated users.
+    Gravações idênticas são coalescidas por alguns segundos. Em uma tempestade
+    de reconnect isso evita dezenas de UPDATEs sem mudar a semântica da fila.
     """
     try:
         owner_id = max(0, int(owner_user_id or 0))
@@ -359,14 +477,22 @@ def remember_queue_owner(target_name: str, identity: str, owner_user_id: Any) ->
         owner_id = 0
     if not target_name or not identity or owner_id <= 0:
         return
+    cache_key = (target_name, identity)
+    now = time.time()
+    with PERSIST_CACHE_LOCK:
+        cached = OWNER_PERSIST_CACHE.get(cache_key)
+        if cached and cached[0] == owner_id and now - cached[1] < ROUTE_WRITE_COALESCE_SECONDS:
+            return
+    def write(db: sqlite3.Connection) -> None:
+        db.execute(
+            "INSERT INTO queue_owners(target_name,identity,owner_user_id,updated_at) VALUES(?,?,?,?) "
+            "ON CONFLICT(target_name,identity) DO UPDATE SET owner_user_id=excluded.owner_user_id,updated_at=excluded.updated_at",
+            (target_name, identity, owner_id, now),
+        )
     try:
-        with state_db() as db:
-            db.execute(
-                "INSERT INTO queue_owners(target_name,identity,owner_user_id,updated_at) VALUES(?,?,?,?) "
-                "ON CONFLICT(target_name,identity) DO UPDATE SET owner_user_id=excluded.owner_user_id,updated_at=excluded.updated_at",
-                (target_name, identity, owner_id, time.time()),
-            )
-            db.commit()
+        _state_write("remember_queue_owner", write)
+        with PERSIST_CACHE_LOCK:
+            OWNER_PERSIST_CACHE[cache_key] = (owner_id, now)
     except sqlite3.Error as exc:
         LOG.warning("Could not persist OCPP owner scope for %s: %s", identity, exc)
 
@@ -397,65 +523,72 @@ def cached_target(identity: str) -> ApiTarget | None:
 def remember_route(identity: str, target_name: str) -> None:
     if target_name not in TARGETS_BY_NAME:
         return
+    now = time.time()
+    with PERSIST_CACHE_LOCK:
+        cached = ROUTE_PERSIST_CACHE.get(identity)
+        if cached and cached[0] == target_name and now - cached[1] < ROUTE_WRITE_COALESCE_SECONDS:
+            return
+    def write(db: sqlite3.Connection) -> None:
+        db.execute(
+            "INSERT INTO routes(identity,target_name,updated_at) VALUES(?,?,?) "
+            "ON CONFLICT(identity) DO UPDATE SET target_name=excluded.target_name, updated_at=excluded.updated_at",
+            (identity, target_name, now),
+        )
+        # Eventos e resultados gerados antes da promoção acompanham a identity.
+        db.execute(
+            "INSERT OR IGNORE INTO event_queue(target_name,identity,message_id,ocpp_action,payload_json,attempts,available_at,created_at,last_error) "
+            "SELECT ?,identity,message_id,ocpp_action,payload_json,attempts,available_at,created_at,last_error "
+            "FROM event_queue WHERE identity=? AND target_name<>? ORDER BY id ASC",
+            (target_name, identity, target_name),
+        )
+        db.execute("DELETE FROM event_queue WHERE identity=? AND target_name<>?", (identity, target_name))
+        db.execute(
+            "INSERT OR IGNORE INTO command_result_queue(target_name,identity,command_id,status,payload_json,error_text,attempts,available_at,created_at,last_error) "
+            "SELECT ?,identity,command_id,status,payload_json,error_text,attempts,available_at,created_at,last_error "
+            "FROM command_result_queue WHERE identity=? AND target_name<>? ORDER BY id ASC",
+            (target_name, identity, target_name),
+        )
+        db.execute("DELETE FROM command_result_queue WHERE identity=? AND target_name<>?", (identity, target_name))
     try:
-        with state_db() as db:
-            db.execute(
-                "INSERT INTO routes(identity,target_name,updated_at) VALUES(?,?,?) "
-                "ON CONFLICT(identity) DO UPDATE SET target_name=excluded.target_name, updated_at=excluded.updated_at",
-                (identity, target_name, time.time()),
-            )
-            # Eventos e resultados gerados antes da promoção devem acompanhar
-            # a mesma identidade para o novo ambiente. INSERT OR IGNORE evita
-            # duplicar uma mensagem que já tenha sido reencaminhada.
-            db.execute(
-                "INSERT OR IGNORE INTO event_queue(target_name,identity,message_id,ocpp_action,payload_json,attempts,available_at,created_at,last_error) "
-                "SELECT ?,identity,message_id,ocpp_action,payload_json,attempts,available_at,created_at,last_error "
-                "FROM event_queue WHERE identity=? AND target_name<>? ORDER BY id ASC",
-                (target_name, identity, target_name),
-            )
-            db.execute("DELETE FROM event_queue WHERE identity=? AND target_name<>?", (identity, target_name))
-            db.execute(
-                "INSERT OR IGNORE INTO command_result_queue(target_name,identity,command_id,status,payload_json,error_text,attempts,available_at,created_at,last_error) "
-                "SELECT ?,identity,command_id,status,payload_json,error_text,attempts,available_at,created_at,last_error "
-                "FROM command_result_queue WHERE identity=? AND target_name<>? ORDER BY id ASC",
-                (target_name, identity, target_name),
-            )
-            db.execute("DELETE FROM command_result_queue WHERE identity=? AND target_name<>?", (identity, target_name))
-            db.commit()
+        _state_write("remember_route", write)
+        with PERSIST_CACHE_LOCK:
+            ROUTE_PERSIST_CACHE[identity] = (target_name, now)
     except sqlite3.Error as exc:
         LOG.warning("Could not persist OCPP route for %s: %s", identity, exc)
 
 
 def queue_event(target: ApiTarget, identity: str, message_id: str, action: str, payload: dict[str, Any], error: str) -> None:
-    try:
-        with state_db() as db:
-            if action == "Heartbeat":
-                db.execute(
-                    "DELETE FROM event_queue WHERE target_name=? AND identity=? AND ocpp_action='Heartbeat'",
-                    (target.name, identity),
-                )
+    def write(db: sqlite3.Connection) -> None:
+        if action == "Heartbeat":
             db.execute(
-                "INSERT OR IGNORE INTO event_queue(target_name,identity,message_id,ocpp_action,payload_json,attempts,available_at,created_at,last_error) "
-                "VALUES(?,?,?,?,?,0,?,?,?)",
-                (target.name, identity, message_id, action, json.dumps(payload, ensure_ascii=False, separators=(",", ":")), time.time(), time.time(), error[:300]),
+                "DELETE FROM event_queue WHERE target_name=? AND identity=? AND ocpp_action='Heartbeat'",
+                (target.name, identity),
             )
-            prune_queues(db)
-            db.commit()
+        db.execute(
+            "INSERT OR IGNORE INTO event_queue(target_name,identity,message_id,ocpp_action,payload_json,attempts,available_at,created_at,last_error) "
+            "VALUES(?,?,?,?,?,0,?,?,?)",
+            (target.name, identity, message_id, action, json.dumps(payload, ensure_ascii=False, separators=(",", ":")), time.time(), time.time(), error[:300]),
+        )
+        enforce_queue_caps(db)
+        maybe_prune_queues(db)
+    try:
+        _state_write("queue_event", write)
     except sqlite3.Error as exc:
         LOG.error("Could not queue OCPP event %s for %s: %s", action, identity, exc)
 
 
 def queue_command_result(target: ApiTarget, identity: str, command_id: int, status: str, payload: dict[str, Any], error: str, last_error: str) -> None:
+    def write(db: sqlite3.Connection) -> None:
+        db.execute(
+            "INSERT INTO command_result_queue(target_name,identity,command_id,status,payload_json,error_text,attempts,available_at,created_at,last_error) "
+            "VALUES(?,?,?,?,?,?,0,?,?,?) ON CONFLICT(target_name,identity,command_id) DO UPDATE SET "
+            "status=excluded.status,payload_json=excluded.payload_json,error_text=excluded.error_text,available_at=excluded.available_at,last_error=excluded.last_error",
+            (target.name, identity, command_id, status, json.dumps(payload, ensure_ascii=False, separators=(",", ":")), error[:500], time.time(), time.time(), last_error[:300]),
+        )
+        enforce_queue_caps(db)
+        maybe_prune_queues(db)
     try:
-        with state_db() as db:
-            db.execute(
-                "INSERT INTO command_result_queue(target_name,identity,command_id,status,payload_json,error_text,attempts,available_at,created_at,last_error) "
-                "VALUES(?,?,?,?,?,?,0,?,?,?) ON CONFLICT(target_name,identity,command_id) DO UPDATE SET "
-                "status=excluded.status,payload_json=excluded.payload_json,error_text=excluded.error_text,available_at=excluded.available_at,last_error=excluded.last_error",
-                (target.name, identity, command_id, status, json.dumps(payload, ensure_ascii=False, separators=(",", ":")), error[:500], time.time(), time.time(), last_error[:300]),
-            )
-            prune_queues(db)
-            db.commit()
+        _state_write("queue_command_result", write)
     except sqlite3.Error as exc:
         LOG.error("Could not queue OCPP command result %s for %s: %s", command_id, identity, exc)
 
@@ -534,6 +667,12 @@ def queue_diagnostics() -> dict[str, Any]:
             "largest_owner_event_backlog": max(owner_backlogs or [0]),
             "largest_identity_event_backlog": max(identity_backlogs or [0]),
             "largest_owner_result_backlog": max(owner_result_backlogs or [0]),
+            "sqlite_single_writer": True,
+            "sqlite_lock_retries": int(STATE_DB_LOCK_RETRIES),
+            "sqlite_lock_failures": int(STATE_DB_LOCK_FAILURES),
+            "sqlite_last_lock_age_seconds": max(0, int(now - STATE_DB_LAST_LOCK_ERROR_AT)) if STATE_DB_LAST_LOCK_ERROR_AT > 0 else 0,
+            "prune_interval_seconds": int(QUEUE_PRUNE_INTERVAL_SECONDS),
+            "reconnect": reconnect_diagnostics(),
         }
     except sqlite3.Error:
         return {}
@@ -1378,7 +1517,8 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
         connection = ChargePointConnection(identity, route_target, authorization, reader, writer, remote_ip)
         CONNECTIONS[identity] = connection
         ACTIVE_BY_IP[remote_ip] = ACTIVE_BY_IP.get(remote_ip, 0) + 1
-        LOG.info("Charge point connected: %s route=%s", identity, route_target.name)
+        reconnect_state = record_reconnect(identity)
+        LOG.info("Charge point connected: %s route=%s reconnects_60s=%s", identity, route_target.name, reconnect_state["count"])
         await connection.run()
     except Exception as exc:  # noqa: BLE001
         LOG.warning("Connection failed for %s: %s", identity or peer_ip, exc)
@@ -1451,15 +1591,15 @@ def _scheduler_state(queue_kind: str) -> tuple[str, int]:
 def _advance_scheduler(queue_kind: str, owner_key: str) -> None:
     if not owner_key:
         return
+    def write(db: sqlite3.Connection) -> None:
+        db.execute(
+            "INSERT INTO queue_scheduler_state(queue_kind,last_owner_key,owner_turns,updated_at) VALUES(?,?,1,?) "
+            "ON CONFLICT(queue_kind) DO UPDATE SET last_owner_key=excluded.last_owner_key,"
+            "owner_turns=queue_scheduler_state.owner_turns+1,updated_at=excluded.updated_at",
+            (queue_kind, owner_key[:220], time.time()),
+        )
     try:
-        with state_db() as db:
-            db.execute(
-                "INSERT INTO queue_scheduler_state(queue_kind,last_owner_key,owner_turns,updated_at) VALUES(?,?,1,?) "
-                "ON CONFLICT(queue_kind) DO UPDATE SET last_owner_key=excluded.last_owner_key,"
-                "owner_turns=queue_scheduler_state.owner_turns+1,updated_at=excluded.updated_at",
-                (queue_kind, owner_key[:220], time.time()),
-            )
-            db.commit()
+        _state_write("advance_scheduler", write)
     except sqlite3.Error as exc:
         LOG.warning("Could not advance OCPP fair scheduler %s: %s", queue_kind, exc)
 
@@ -1487,9 +1627,7 @@ def replay_command_results_once(limit: int = 25) -> int:
     while processed < max(1, limit):
         now = time.time()
         try:
-            with state_db() as db:
-                prune_queues(db)
-                db.commit()
+            _state_write("periodic_prune", lambda db: maybe_prune_queues(db))
             cursor, _turns = _scheduler_state("command_result")
             rows = _due_command_result_owner_heads(now, max(1, limit - processed), cursor)
         except sqlite3.Error as exc:
@@ -1502,34 +1640,32 @@ def replay_command_results_once(limit: int = 25) -> int:
             result_id, target_name, identity, command_id, status, payload_json, error_text, attempts, _owner_user_id, owner_key = row
             target = TARGETS_BY_NAME.get(str(target_name))
             if target is None:
-                with state_db() as db:
-                    db.execute(
-                        "UPDATE command_result_queue SET available_at=?,last_error=? WHERE id=?",
-                        (time.time() + 60.0, "OCPP target unavailable for fair replay", result_id),
-                    )
-                    db.commit()
+                _state_write("result_target_wait", lambda db, rid=result_id: db.execute(
+                    "UPDATE command_result_queue SET available_at=?,last_error=? WHERE id=?",
+                    (time.time() + 60.0, "OCPP target unavailable for fair replay", rid),
+                ))
                 _advance_scheduler("command_result", str(owner_key))
                 continue
             try:
                 payload = json.loads(str(payload_json))
                 api_call(target, {"action": "command_result", "identity": identity, "command_id": int(command_id), "status": status, "payload": payload, "error": str(error_text)}, 6.0)
-                with state_db() as db:
-                    db.execute("DELETE FROM command_result_queue WHERE id=?", (result_id,)); db.commit()
+                _state_write("delete_command_result", lambda db, rid=result_id: db.execute("DELETE FROM command_result_queue WHERE id=?", (rid,)))
                 delivered += 1
             except PermanentApiError as exc:
                 quarantine_delivery(
                     kind="command_result", target_name=str(target_name), identity=str(identity),
                     message_id=str(command_id), action="command_result", error=exc,
                 )
-                with state_db() as db:
-                    db.execute("DELETE FROM command_result_queue WHERE id=?", (result_id,)); prune_queues(db); db.commit()
+                _state_write("drop_permanent_command_result", lambda db, rid=result_id: (db.execute("DELETE FROM command_result_queue WHERE id=?", (rid,)), maybe_prune_queues(db)))
                 LOG.error("Permanent OCPP command-result rejection quarantined status=%s code=%s", exc.status_code, exc.error_code)
             except Exception as exc:  # noqa: BLE001
                 attempt_count = int(attempts) + 1
                 retry_after = float(getattr(exc, "retry_after_seconds", 0) or 0)
                 delay = max(retry_after, min(900.0, 5.0 * (2 ** min(attempt_count, 7))))
-                with state_db() as db:
-                    db.execute("UPDATE command_result_queue SET attempts=?,available_at=?,last_error=? WHERE id=?", (attempt_count, time.time()+delay, str(exc)[:300], result_id)); db.commit()
+                _state_write("retry_command_result", lambda db, rid=result_id, ac=attempt_count, d=delay, e=str(exc)[:300]: db.execute(
+                    "UPDATE command_result_queue SET attempts=?,available_at=?,last_error=? WHERE id=?",
+                    (ac, time.time()+d, e, rid),
+                ))
             finally:
                 _advance_scheduler("command_result", str(owner_key))
             if processed >= limit:
@@ -1590,21 +1726,16 @@ def replay_queue_once(limit: int = 25) -> int:
                 continue
             target = TARGETS_BY_NAME.get(str(target_name))
             if target is None:
-                with state_db() as db:
-                    db.execute(
-                        "UPDATE event_queue SET available_at=?,last_error=? WHERE id=?",
-                        (time.time() + 60.0, "OCPP target unavailable for fair replay", event_id),
-                    )
-                    db.commit()
+                _state_write("event_target_wait", lambda db, eid=event_id: db.execute(
+                    "UPDATE event_queue SET available_at=?,last_error=? WHERE id=?",
+                    (time.time() + 60.0, "OCPP target unavailable for fair replay", eid),
+                ))
                 _advance_scheduler("event", str(owner_key))
                 continue
             try:
                 payload = json.loads(str(payload_json))
                 api_call(target, {"action": "ocpp_call", "identity": identity, "message_id": message_id, "ocpp_action": action, "payload": payload, "gateway_replay": True}, 6.0)
-                with state_db() as db:
-                    db.execute("DELETE FROM event_queue WHERE id=?", (event_id,))
-                    prune_queues(db)
-                    db.commit()
+                _state_write("delete_event", lambda db, eid=event_id: (db.execute("DELETE FROM event_queue WHERE id=?", (eid,)), maybe_prune_queues(db)))
                 QUEUE_LAST_REPLAY_AT = time.time()
                 QUEUE_LAST_REPLAY_ERROR = ""
                 delivered += 1
@@ -1613,18 +1744,17 @@ def replay_queue_once(limit: int = 25) -> int:
                     kind="event", target_name=str(target_name), identity=str(identity),
                     message_id=str(message_id), action=str(action), error=exc,
                 )
-                with state_db() as db:
-                    db.execute("DELETE FROM event_queue WHERE id=?", (event_id,)); prune_queues(db); db.commit()
+                _state_write("drop_permanent_event", lambda db, eid=event_id: (db.execute("DELETE FROM event_queue WHERE id=?", (eid,)), maybe_prune_queues(db)))
                 QUEUE_LAST_REPLAY_AT = time.time()
                 QUEUE_LAST_REPLAY_ERROR = f"permanent:{exc.status_code}:{exc.error_code}"[:300]
                 LOG.error("Permanent queued OCPP rejection quarantined action=%s status=%s code=%s", action, exc.status_code, exc.error_code)
             except Exception as exc:  # noqa: BLE001
                 attempt_count = int(attempts) + 1
                 delay = max(float(getattr(exc, "retry_after_seconds", 0) or 0), min(900.0, 5.0 * (2 ** min(attempt_count, 7))))
-                with state_db() as db:
-                    db.execute("UPDATE event_queue SET attempts=?,available_at=?,last_error=? WHERE id=?", (attempt_count, time.time()+delay, str(exc)[:300], event_id))
-                    prune_queues(db)
-                    db.commit()
+                _state_write("retry_event", lambda db, eid=event_id, ac=attempt_count, d=delay, e=str(exc)[:300]: (
+                    db.execute("UPDATE event_queue SET attempts=?,available_at=?,last_error=? WHERE id=?", (ac, time.time()+d, e, eid)),
+                    maybe_prune_queues(db),
+                ))
                 QUEUE_LAST_REPLAY_ERROR = str(exc)[:300]
             finally:
                 _advance_scheduler("event", str(owner_key))

@@ -45,7 +45,7 @@ def check(condition: bool, message: str) -> None:
     if not condition:
         failures.append(message)
 
-check(connector.CONNECTOR_VERSION == "1.12.44", "Versão do Connector divergente")
+check(connector.CONNECTOR_VERSION == "1.12.49", "Versão do Connector divergente")
 check(connector.COMMAND_METHODS == expected_methods, "Matriz COMMAND_METHODS divergente")
 check(len(connector.COMMAND_METHODS) == 25, "A matriz precisa conter 25 comandos")
 check(connector.EXPERIMENTAL_COMMAND_METHODS == {"sentry_on": "sentry_mode_on", "sentry_off": "sentry_mode_off"}, "Matriz experimental divergente")
