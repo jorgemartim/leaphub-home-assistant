@@ -1,16 +1,31 @@
+<<<<<<<< HEAD:CHANGED-FILES-1.12.49.txt
 CHANGED-FILES-1.12.49.txt
 GITHUB-RECOVERY-1.12.49.md
 RELEASE-1.12.49.md
 UPLOAD-1.12.49.md
 leaphub_gateway/CHANGELOG.md
 leaphub_gateway/RELEASE-1.12.49.md
+========
+CHANGED-FILES-1.12.47.txt
+CHANGED-FILES-1.12.47.txt
+GITHUB-RECOVERY-1.12.47.md
+GITHUB-RECOVERY-SHA256SUMS.txt
+RELEASE-1.12.47.md
+SOURCE-SHA256SUMS.txt
+UPLOAD-1.12.47.md
+leaphub_gateway/CHANGELOG.md
+leaphub_gateway/RELEASE-1.12.47.md
+>>>>>>>> 30d007e3e96239451c99717b1438c2df704a19b4:CHANGED-FILES-1.12.47.txt
 leaphub_gateway/RELEASE_TARGET
+leaphub_gateway/connection_orchestrator.py
 leaphub_gateway/connector.py
 leaphub_gateway/connector_server.py
 leaphub_gateway/gateway_manager.py
 leaphub_gateway/ocpp_gateway.py
 leaphub_gateway/privacy.py
 leaphub_gateway/telemetry_engine.py
+tests/test_account_capacity_isolation_1_12_46.py
+tests/test_account_cloud_breaker_isolation_1_12_47.py
 tests/test_background_telemetry_1_12_19.py
 tests/test_command_confirmation_delivery_1_12_40.py
 tests/test_command_session_reuse_1_12_39.py
@@ -26,7 +41,10 @@ tests/test_manual_preemption_1_12_28.py
 tests/test_ocpp_delivery_policy_1_12_41.py
 tests/test_ocpp_fifo_1_12_24.py
 tests/test_ocpp_user_fairness_1_12_43.py
+<<<<<<<< HEAD:CHANGED-FILES-1.12.49.txt
 tests/test_planned_restart_order_1_12_48.py
+========
+>>>>>>>> 30d007e3e96239451c99717b1438c2df704a19b4:CHANGED-FILES-1.12.47.txt
 tests/test_pre_dispatch_token_recovery_1_12_37.py
 tests/test_prebuilt_distribution_1_12_31.py
 tests/test_prebuilt_distribution_1_12_32.py
