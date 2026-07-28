@@ -1,21 +1,46 @@
 # Upload 1.12.50
 
-Envie **todos** os arquivos listados em `CHANGED-FILES-1.12.50.txt` para a `main`. São 14, e alguns
-existem só para satisfazer o `validate_repository.py` — se faltar qualquer um, o job
+Envie **todos** os arquivos listados em `CHANGED-FILES-1.12.50.txt` para a `main`. São 55, e a maior
+parte existe só para satisfazer o `validate_repository.py` — se faltar qualquer um, o job
 `Validate staged repository` falha antes de compilar.
 
-| Arquivo | Por que está aqui |
+| Grupo | Por que está aqui |
 |---|---|
+| `tests/*.py` (38 arquivos) | os contratos fixam a versão-alvo no próprio código; cada release precisa do bump. Cinco deles também ganharam `close_storage()` na limpeza |
 | `leaphub_gateway/ocpp_gateway.py` | só a constante `GATEWAY_VERSION`; o validador exige a versão-alvo em todos os módulos |
 | `leaphub_gateway/privacy.py` | idem, `PRIVACY_VERSION` |
-| `leaphub_gateway/CHANGELOG.md` | o validador exige **apenas** o heading da versão-alvo |
+| `leaphub_gateway/CHANGELOG.md` | o validador exige **apenas** o heading da versão-alvo, e o texto `pré-compilada` |
 | `leaphub_gateway/config.yaml` | nova opção `telemetry_poll_workers` no schema e padrões novos |
 | `leaphub_gateway/apparmor.txt` | mapeamento de memória em `/data`, para o WAL |
 | `.github/scripts/validate_repository.py` | a regra de WAL passa a exigir o fallback em vez de proibir |
+| `RELEASE-1.12.50.md`, `GITHUB-RECOVERY-1.12.50.md` (raiz) | `test_prebuilt_distribution_1_12_31/32/33` checam a existência dos dois |
 
 O campo `version:` do `config.yaml` continua anunciando 1.12.48; `leaphub_gateway/RELEASE_TARGET`
 aponta para 1.12.50. O workflow promove a versão somente depois de build, testes, smoke test e
 acesso público à imagem GHCR.
+
+## Verificação já feita
+
+O `validate_repository.py` foi executado contra este pacote e **passou em todas as checagens
+estáticas**: versão-alvo nos seis módulos, contrato de fallback do WAL, heading único do CHANGELOG,
+arquivos obrigatórios, marcadores do `build.yml`, `image`/`arch`/segredos vazios do `config.yaml` e
+`compileall` limpo.
+
+A suíte `tests/` roda com **65 passando** contra 58 do baseline 1.12.49 (os 7 novos são o
+`test_storage_throughput_1_12_50.py`). O único teste que falha —
+`test_ocpp_sqlite_single_writer_1_12_45` — falha **igual no 1.12.49 original**, é anterior a esta
+release e só se manifesta em Windows.
+
+Três arquivos abortam a coleta em Windows por `PermissionError`/`fcntl` e também abortam no
+baseline: `test_connection_resilience_1_12_15`, `test_open_door_visual_1_12_39` e
+`test_resilience_1_12_14`. No runner Linux do CI isso não acontece.
+
+## Uma mudança de ciclo de vida que vale conhecer
+
+A conexão SQLite passou a ser reaproveitada por thread, então o arquivo da fila fica aberto até o
+processo encerrar. `stop()` agora chama `close_storage()`, e os testes que criam um engine dentro de
+`TemporaryDirectory` receberam a mesma chamada na limpeza. Se você escrever um teste novo que
+instancie `TelemetryEngine`, lembre de chamar `engine.close_storage()` no teardown.
 
 ## Sobre a mudança na regra de WAL
 

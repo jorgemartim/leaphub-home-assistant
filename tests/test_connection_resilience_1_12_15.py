@@ -197,6 +197,7 @@ with tempfile.TemporaryDirectory(prefix="leaphub-connection-1-12-15-") as tmp:
         thread.join(timeout=3)
 
     real_telemetry.stop()
+    real_telemetry.close_storage()
     if real_telemetry._instance_lock_handle is not None:
         real_telemetry._instance_lock_handle.close()
 

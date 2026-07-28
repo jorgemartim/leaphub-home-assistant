@@ -97,6 +97,7 @@ def test_unchanged_confirmation_snapshot_is_delivered() -> None:
                 ]
             assert kinds == ["change", "confirmation"]
         finally:
+            engine.close_storage()
             if engine._instance_lock_handle is not None:
                 engine._instance_lock_handle.close()
 
@@ -105,4 +106,4 @@ def test_command_poll_forces_delivery_to_site() -> None:
     source = (APP / "telemetry_engine.py").read_text(encoding="utf-8")
     assert "force_delivery=command_mode" in source
     assert 'event_kind = "confirmation" if force_delivery' in source
-    assert 'ENGINE_VERSION = "1.12.49"' in source
+    assert 'ENGINE_VERSION = "1.12.50"' in source

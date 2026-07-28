@@ -42,6 +42,7 @@ def new_engine(base: Path, options: dict | None = None):
 
 
 def close_engine(engine) -> None:
+    engine.close_storage()
     if engine._instance_lock_handle is not None:
         engine._instance_lock_handle.close()
 
@@ -103,9 +104,14 @@ def test_maintenance_is_throttled():
             assert first > 0
             engine._maintenance()
             assert engine._maintenance_last_at == first
-            engine._maintenance_last_at = time.time() - 120.0
+            # Vencida a janela, a manutenção volta a rodar e remarca o relógio.
+            # A comparação é contra o valor forçado, não contra `first`: em
+            # plataformas com time.time() de baixa resolução os dois podem
+            # cair no mesmo tique e o teste piscaria sem motivo.
+            forced = time.time() - 120.0
+            engine._maintenance_last_at = forced
             engine._maintenance()
-            assert engine._maintenance_last_at > first
+            assert engine._maintenance_last_at > forced + 60.0
         finally:
             close_engine(engine)
 

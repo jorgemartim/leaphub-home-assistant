@@ -67,6 +67,7 @@ def test_verified_identical_upsert_preserves_healthy_session():
         finally:
             engine._close_session = original_close
             engine.sessions.pop(sid, None)
+            engine.close_storage()
             if engine._instance_lock_handle is not None:
                 engine._instance_lock_handle.close()
         assert result["ok"] is True
@@ -93,6 +94,7 @@ def test_verified_upsert_without_session_keeps_recovery_semantics():
                 "SELECT status,auth_required FROM subscriptions WHERE subscription_id=?",
                 (sid,),
             ).fetchone()
+        engine.close_storage()
         if engine._instance_lock_handle is not None:
             engine._instance_lock_handle.close()
         assert result["ok"] is True

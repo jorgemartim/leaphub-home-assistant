@@ -183,6 +183,8 @@ with tempfile.TemporaryDirectory(prefix="leaphub-resilience-") as tmp:
     check(sid not in engine.sessions, "Sessão explicitamente expirada permaneceu em memória")
     check(expired.closed == 1, "Cliente expirado não foi fechado exatamente uma vez")
 
+    engine.close_storage()
+
     if engine._instance_lock_handle is not None:
         engine._instance_lock_handle.close()
 

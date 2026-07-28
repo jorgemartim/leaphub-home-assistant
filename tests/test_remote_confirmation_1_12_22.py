@@ -46,12 +46,13 @@ with tempfile.TemporaryDirectory(prefix="leaphub-confirmation-") as tmp:
     assert list(engine.command_cadence[:5]) == [12, 20, 35, 45, 60]
     assert engine._adaptive_interval(["parked"], 0, command_mode=True, command_poll_count=1)[0] == 12
     assert engine._adaptive_interval(["parked"], 0, command_mode=True, command_poll_count=5)[0] == 60
+    engine.close_storage()
     if engine._instance_lock_handle is not None:
         engine._instance_lock_handle.close()
 
 checks = {
-    "version": ('version: "1.12.47"' in config_source or 'version: "1.12.49"' in config_source)
-        and 'VERSION = "1.12.49"' in server_source,
+    "version": ('version: "1.12.47"' in config_source or 'version: "1.12.50"' in config_source)
+        and 'VERSION = "1.12.50"' in server_source,
     "manager_migrates_legacy_limit": 'max(5, min(8' in manager_source,
     "private_posts_close": "def do_POST(self) -> None:\n        # As chamadas assinadas" in server_source
         and "self.close_connection = True" in server_source,
@@ -63,4 +64,4 @@ failed = [name for name, ok in checks.items() if not ok]
 if failed:
     raise SystemExit("remote confirmation 1.12.24 failed:\n- " + "\n- ".join(failed))
 
-print({"ok": True, "checks": len(checks) + 4, "version": "1.12.49"})
+print({"ok": True, "checks": len(checks) + 4, "version": "1.12.50"})

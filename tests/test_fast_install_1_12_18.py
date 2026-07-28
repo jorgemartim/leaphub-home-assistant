@@ -8,11 +8,11 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 APP = ROOT / "leaphub_gateway"
 config = yaml.safe_load((APP / "config.yaml").read_text(encoding="utf-8"))
-assert config["version"] in {"1.12.47", "1.12.49"}
+assert config["version"] in {"1.12.47", "1.12.50"}
 assert config.get("image") == "ghcr.io/jorgemartim/leaphub-gateway"
 assert (APP / "Dockerfile").is_file()
 assert "/data/runtime/bin/cloudflared rix," in (APP / "apparmor.txt").read_text(encoding="utf-8")
-assert len(config.get("options", {})) == 47
+assert len(config.get("options", {})) == 48
 
 dockerfile = (APP / "Dockerfile").read_text(encoding="utf-8")
 assert "cloudflared/releases/download" not in dockerfile
@@ -21,7 +21,7 @@ assert "ca-certificates libstdc++6" in dockerfile
 
 manager = (APP / "gateway_manager.py").read_text(encoding="utf-8")
 for marker in (
-    'VERSION = "1.12.49"',
+    'VERSION = "1.12.50"',
     "def resolve_cloudflared()",
     "CLOUDFLARED_SHA256_AMD64",
     "MAX_CLOUDFLARED_BYTES",

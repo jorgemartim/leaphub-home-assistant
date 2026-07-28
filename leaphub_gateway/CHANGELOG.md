@@ -9,3 +9,4 @@
 - Versão da biblioteca `leapmotor-api` resolvida uma vez por processo.
 - Padrões novos: `connector_max_parallel` 4, `telemetry_batch_size` 5, `telemetry_poll_workers` 3. Instalações existentes mantêm os valores já salvos.
 - Não altera comandos físicos, migrations, schema, filas persistidas, OCPP, credenciais, vínculos ou dados existentes.
+- Distribuição continua pré-compilada via GHCR, com promoção somente após validação pública da imagem.

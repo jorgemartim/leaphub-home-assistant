@@ -110,6 +110,7 @@ with tempfile.TemporaryDirectory(prefix="leaphub-background-on-") as tmp:
         assert float(released_row["next_run_at"]) - time.time() <= 305
     finally:
         engine._collect_with_session = original_collect
+        engine.close_storage()
         if engine._instance_lock_handle is not None:
             engine._instance_lock_handle.close()
 
@@ -124,8 +125,9 @@ with tempfile.TemporaryDirectory(prefix="leaphub-background-off-") as tmp:
             (time.time() - 60, payload["subscription_id"]),
         )
     assert engine._next_due_subscription() is None
+    engine.close_storage()
     if engine._instance_lock_handle is not None:
         engine._instance_lock_handle.close()
 
 
-print({"ok": True, "checks": 12, "version": "1.12.49"})
+print({"ok": True, "checks": 12, "version": "1.12.50"})

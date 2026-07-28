@@ -145,7 +145,9 @@ class TelemetryEngine:
         # 1.12.50 — uma conexão SQLite por thread. Abrir e fechar por consulta
         # custava _prepare_storage inteiro mais três PRAGMAs em 33 pontos do
         # motor, e em disco mecânico isso domina o tempo de cada ciclo.
-        self._local = threading.local()
+        self._connections: dict[int, sqlite3.Connection] = {}
+        self._busy_ms: dict[int, int] = {}
+        self._connections_guard = threading.RLock()
         self._storage_checked_at = 0.0
         self._maintenance_last_at = 0.0
         # 1.12.50 — a coleta de uma conta não atrasa mais a das outras. O teto
@@ -380,20 +382,44 @@ class TelemetryEngine:
             except OSError:
                 pass
 
+    def _drop_connection(self, key: int) -> None:
+        with self._connections_guard:
+            db = self._connections.pop(key, None)
+            self._busy_ms.pop(key, None)
+        if db is not None:
+            try:
+                db.close()
+            except sqlite3.Error:
+                pass
+
+    def close_storage(self) -> None:
+        """Fecha as conexões SQLite abertas por todas as threads.
+
+        Chamado por ``stop()`` depois que worker, entrega e pool já terminaram.
+        Como a conexão passou a ser reaproveitada, sem isto o arquivo da fila
+        permaneceria aberto até o processo encerrar.
+        """
+        with self._connections_guard:
+            connections = list(self._connections.values())
+            self._connections.clear()
+            self._busy_ms.clear()
+        for db in connections:
+            try:
+                db.close()
+            except sqlite3.Error:
+                pass
+
     def _connection(self) -> sqlite3.Connection:
         """Reaproveita uma conexão SQLite por thread em vez de reconectar por consulta."""
-        db = getattr(self._local, "db", None)
+        key = threading.get_ident()
+        with self._connections_guard:
+            db = self._connections.get(key)
         if db is not None:
             try:
                 db.execute("SELECT 1").fetchone()
                 return db
             except sqlite3.Error:
-                try:
-                    db.close()
-                except sqlite3.Error:
-                    pass
-                self._local.db = None
-                self._local.busy_ms = None
+                self._drop_connection(key)
 
         self._prepare_storage(probe=False)
         db = sqlite3.connect(
@@ -410,28 +436,28 @@ class TelemetryEngine:
         mode_row = db.execute("PRAGMA journal_mode").fetchone()
         mode = str(mode_row[0] if mode_row else "").lower()
         db.execute("PRAGMA synchronous=NORMAL" if mode == "wal" else "PRAGMA synchronous=FULL")
-        self._local.db = db
-        self._local.busy_ms = 30000
+        with self._connections_guard:
+            self._connections[key] = db
+            self._busy_ms[key] = 30000
         return db
 
     @contextmanager
     def _db(self, timeout_seconds: float = 30.0) -> Iterator[sqlite3.Connection]:
+        key = threading.get_ident()
         db = self._connection()
         milliseconds = max(50, int(max(0.05, min(30.0, float(timeout_seconds))) * 1000))
-        if milliseconds != getattr(self._local, "busy_ms", None):
+        with self._connections_guard:
+            current = self._busy_ms.get(key)
+        if milliseconds != current:
             db.execute(f"PRAGMA busy_timeout={milliseconds}")
-            self._local.busy_ms = milliseconds
+            with self._connections_guard:
+                self._busy_ms[key] = milliseconds
         try:
             yield db
         except sqlite3.Error:
             # Uma conexão que falhou pode ter transação pendente. Descartar aqui
             # garante que a próxima consulta abra uma limpa, sem herdar estado.
-            try:
-                db.close()
-            except sqlite3.Error:
-                pass
-            self._local.db = None
-            self._local.busy_ms = None
+            self._drop_connection(key)
             raise
 
     def _configure_journal(self, db: sqlite3.Connection) -> None:
@@ -1372,6 +1398,7 @@ class TelemetryEngine:
         if pool is not None:
             pool.shutdown(wait=True, cancel_futures=True)
         self._close_all_sessions()
+        self.close_storage()
 
     def upsert(self, environment: str, payload: dict[str, Any]) -> dict[str, Any]:
         subscription_id = str(payload.get("subscription_id") or "").strip()[:190]

@@ -234,6 +234,7 @@ with tempfile.TemporaryDirectory(prefix="leaphub-gateway-test-") as tmp:
     persisted_delay = engine.record_account_auth_failure(
         "staging", 77, "restart_test", "login blocked", 135, blocked=True
     )
+    engine.close_storage()
     if engine._instance_lock_handle is not None:
         engine._instance_lock_handle.close()
         engine._instance_lock_handle = None
@@ -245,6 +246,7 @@ with tempfile.TemporaryDirectory(prefix="leaphub-gateway-test-") as tmp:
     persisted = restarted.account_auth_status("staging", 77)
     check(persisted_delay == 300, "Cooldown persistido não iniciou em cinco minutos")
     check(bool(persisted.get("cooldown")) and int(persisted.get("retry_after_seconds") or 0) > 0, "Cooldown não sobreviveu ao reinício")
+    restarted.close_storage()
     if restarted._instance_lock_handle is not None:
         restarted._instance_lock_handle.close()
 

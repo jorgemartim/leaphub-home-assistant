@@ -77,4 +77,7 @@ with tempfile.TemporaryDirectory(prefix="leaphub-health-") as tmp:
     os.utime(status_path, (old, old))
     assert server.gateway_services_health() == {}
 
-print({"ok": True, "checks": 9, "version": "1.12.49"})
+    # A conexão da fila é reaproveitada desde 1.12.50; libere antes do tempdir sair.
+    server.TELEMETRY.close_storage()
+
+print({"ok": True, "checks": 9, "version": "1.12.50"})
