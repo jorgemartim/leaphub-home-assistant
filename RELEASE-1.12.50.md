@@ -3,7 +3,8 @@
 ## Armazenamento
 
 - A fila de telemetria passa a usar WAL com `synchronous=NORMAL`. Antes, `journal_mode=DELETE` com `synchronous=FULL` criava e apagava um journal a cada escrita, com vários `fsync`, e leitura bloqueava escrita. Em disco mecânico isso custava dezenas de milissegundos por transação e fazia o `/health` local passar de 3s, derrubando o watchdog do supervisor e provocando o corte das requisições vindas do site.
-- Se o volume não aceitar WAL, o PRAGMA devolve o modo anterior e o caminho DELETE continua valendo integralmente, sem intervenção.
+- **WAL é permitido, nunca imposto.** Se o volume não aceitar o arquivo `-shm`, o PRAGMA devolve o modo anterior, o motivo é registrado no log e o caminho DELETE continua valendo integralmente, sem intervenção. Foi essa ausência de saída que motivou o veto anterior a WAL; `validate_repository.py` passa a exigir o fallback em vez de proibir a string.
+- `apparmor.txt` concede mapeamento de memória em `/data`, para que o perfil não seja o fator limitante. A fila continua restrita a `/data`.
 - Uma conexão SQLite por thread substitui a reconexão por consulta. Antes, cada uma das 33 chamadas ao banco reabria o arquivo e reexecutava três PRAGMAs.
 - A revalidação de permissões do diretório passa de "antes de cada consulta" para uma vez por minuto. O probe explícito de boot e de diagnóstico de falha não muda.
 - A manutenção da fila passa de cada volta do laço (até duas vezes por segundo) para uma vez por minuto. A retenção continua diária.

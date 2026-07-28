@@ -16,7 +16,10 @@ profile leaphub_gateway flags=(attach_disconnected,mediate_deleted) {
   /bin/** ix,
 
   /app/** rix,
-  /data/** rwk,
+  # 1.12.50 — inclui mapeamento de memória para o arquivo -shm quando a fila
+  # de telemetria opera em WAL. O motor cai para DELETE sozinho se o volume
+  # recusar; esta regra apenas evita que o perfil seja o fator limitante.
+  /data/** rwkm,
   /tmp/** rwk,
 
   /etc/ssl/** r,

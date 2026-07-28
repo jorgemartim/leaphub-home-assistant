@@ -1,11 +1,15 @@
+.github/scripts/validate_repository.py
 RELEASE-1.12.50.md
 UPLOAD-1.12.50.md
 leaphub_gateway/CHANGELOG.md
 leaphub_gateway/RELEASE-1.12.50.md
 leaphub_gateway/RELEASE_TARGET
+leaphub_gateway/apparmor.txt
 leaphub_gateway/config.yaml
 leaphub_gateway/connector.py
 leaphub_gateway/connector_server.py
 leaphub_gateway/gateway_manager.py
+leaphub_gateway/ocpp_gateway.py
+leaphub_gateway/privacy.py
 leaphub_gateway/telemetry_engine.py
 tests/test_storage_throughput_1_12_50.py

@@ -117,8 +117,24 @@ for marker in (
 ):
     if marker not in telemetry_source:
         fail(f"telemetry_engine.py não contém a proteção SQLite obrigatória: {marker}")
+# 1.12.50 — WAL passa a ser permitido, mas nunca imposto. A regra anterior
+# proibia a string inteira porque uma tentativa antiga passou a exigir WAL sem
+# saída: em um /data que recusasse o arquivo -shm, a fila ficava inacessível.
+# O contrato agora é outro: quem usar WAL precisa manter o caminho DELETE e cair
+# nele sozinho, registrando o motivo. O journal deixa de ser uma imposição do
+# código e passa a ser uma escolha do volume.
 if "PRAGMA journal_mode=WAL" in telemetry_source:
-    fail("telemetry_engine.py voltou a forçar WAL, incompatível com o armazenamento protegido do App.")
+    for guard in (
+        "WAL indisponível neste volume",
+        'self.storage_journal_mode = "wal"',
+        "PRAGMA synchronous=NORMAL",
+        "except sqlite3.OperationalError as exc:",
+    ):
+        if guard not in telemetry_source:
+            fail(
+                "telemetry_engine.py usa WAL sem a proteção obrigatória de fallback "
+                f"para DELETE: {guard}"
+            )
 
 for required_file in (
     "README.md",
