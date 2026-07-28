@@ -14,6 +14,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -52,7 +53,7 @@ except ModuleNotFoundError:
         EVENT_TRANSPORT = _event_transport_module.EVENT_TRANSPORT
 
 LOG = logging.getLogger("leaphub.telemetry")
-ENGINE_VERSION = "1.12.49"  # sessão saudável preservada em upsert verificado
+ENGINE_VERSION = "1.12.50"  # armazenamento WAL, coleta paralela e entrega dedicada
 
 
 def utc_iso() -> str:
@@ -141,6 +142,21 @@ class TelemetryEngine:
         self.wake_event = threading.Event()
         self.worker: threading.Thread | None = None
         self.lock = threading.RLock()
+        # 1.12.50 — uma conexão SQLite por thread. Abrir e fechar por consulta
+        # custava _prepare_storage inteiro mais três PRAGMAs em 33 pontos do
+        # motor, e em disco mecânico isso domina o tempo de cada ciclo.
+        self._local = threading.local()
+        self._storage_checked_at = 0.0
+        self._maintenance_last_at = 0.0
+        # 1.12.50 — a coleta de uma conta não atrasa mais a das outras. O teto
+        # real de chamadas simultâneas à nuvem continua sendo o semáforo global
+        # do Connector; isto apenas deixa de serializar tudo antes dele.
+        self.poll_workers = self._bounded("telemetry_poll_workers", 3, 1, 6)
+        self._poll_pool: ThreadPoolExecutor | None = None
+        self._inflight: set[str] = set()
+        self._inflight_guard = threading.RLock()
+        self.delivery_event = threading.Event()
+        self.delivery_worker: threading.Thread | None = None
         self.active_seconds = self._bounded("telemetry_active_seconds", 20, 15, 300)
         self.interactive_seconds = self._bounded("telemetry_interactive_seconds", 20, 15, 60)
         # Janela curta após comandos remotos. É propositalmente separada da
@@ -257,7 +273,18 @@ class TelemetryEngine:
         return bool(provider and provider(environment, operation_payload))
 
     def _prepare_storage(self, probe: bool = False) -> None:
-        """Garante que a fila persistente continue gravável após atualização/reinício."""
+        """Garante que a fila persistente continue gravável após atualização/reinício.
+
+        1.12.50 — a revalidação de permissões continua acontecendo, agora a cada
+        60s em vez de antes de cada consulta. Em disco mecânico o chmod repetido
+        gerava escrita de metadado no caminho quente. O probe explícito, usado no
+        boot e no diagnóstico de falha de armazenamento, não é afetado.
+        """
+        if not probe:
+            now = time.monotonic()
+            if now - self._storage_checked_at < 60.0:
+                return
+            self._storage_checked_at = now
         with self.storage_lock:
             if self.data_dir.exists() and not self.data_dir.is_dir():
                 raise OSError(f"O caminho de telemetria não é um diretório: {self.data_dir}")
@@ -353,26 +380,89 @@ class TelemetryEngine:
             except OSError:
                 pass
 
+    def _connection(self) -> sqlite3.Connection:
+        """Reaproveita uma conexão SQLite por thread em vez de reconectar por consulta."""
+        db = getattr(self._local, "db", None)
+        if db is not None:
+            try:
+                db.execute("SELECT 1").fetchone()
+                return db
+            except sqlite3.Error:
+                try:
+                    db.close()
+                except sqlite3.Error:
+                    pass
+                self._local.db = None
+                self._local.busy_ms = None
+
+        self._prepare_storage(probe=False)
+        db = sqlite3.connect(
+            self.db_path,
+            timeout=30.0,
+            isolation_level=None,
+            check_same_thread=False,
+        )
+        db.row_factory = sqlite3.Row
+        db.execute("PRAGMA busy_timeout=30000")
+        db.execute("PRAGMA foreign_keys=ON")
+        db.execute("PRAGMA temp_store=MEMORY")
+        # journal_mode é persistente no arquivo; synchronous é por conexão.
+        mode_row = db.execute("PRAGMA journal_mode").fetchone()
+        mode = str(mode_row[0] if mode_row else "").lower()
+        db.execute("PRAGMA synchronous=NORMAL" if mode == "wal" else "PRAGMA synchronous=FULL")
+        self._local.db = db
+        self._local.busy_ms = 30000
+        return db
+
     @contextmanager
     def _db(self, timeout_seconds: float = 30.0) -> Iterator[sqlite3.Connection]:
-        self._prepare_storage(probe=False)
-        db: sqlite3.Connection | None = None
+        db = self._connection()
+        milliseconds = max(50, int(max(0.05, min(30.0, float(timeout_seconds))) * 1000))
+        if milliseconds != getattr(self._local, "busy_ms", None):
+            db.execute(f"PRAGMA busy_timeout={milliseconds}")
+            self._local.busy_ms = milliseconds
         try:
-            timeout_seconds = max(0.05, min(30.0, float(timeout_seconds)))
-            db = sqlite3.connect(self.db_path, timeout=timeout_seconds, isolation_level=None)
-            db.row_factory = sqlite3.Row
-            db.execute(f"PRAGMA busy_timeout={max(50, int(timeout_seconds * 1000))}")
-            db.execute("PRAGMA foreign_keys=ON")
-            db.execute("PRAGMA temp_store=MEMORY")
             yield db
-        finally:
-            if db is not None:
+        except sqlite3.Error:
+            # Uma conexão que falhou pode ter transação pendente. Descartar aqui
+            # garante que a próxima consulta abra uma limpa, sem herdar estado.
+            try:
                 db.close()
+            except sqlite3.Error:
+                pass
+            self._local.db = None
+            self._local.busy_ms = None
+            raise
 
     def _configure_journal(self, db: sqlite3.Connection) -> None:
-        """Migra WAL com espera e não pede trava exclusiva quando já está em DELETE."""
+        """Prefere WAL e mantém DELETE como fallback quando o volume não o aceita.
+
+        1.12.50 — com DELETE e synchronous=FULL cada escrita cria e apaga um
+        journal com vários fsync, e leitor bloqueia escritor. Em disco mecânico
+        isso custa dezenas de milissegundos por transação e era a causa direta
+        do /health passar de 3s e derrubar o watchdog. WAL transforma a escrita
+        em append sequencial e não bloqueia leitura. Nenhuma linha, tabela ou
+        migration é tocada; se o volume não aceitar o arquivo -shm, o PRAGMA
+        devolve o modo anterior e o caminho antigo continua valendo integralmente.
+        """
         current_row = db.execute("PRAGMA journal_mode").fetchone()
         current = str(current_row[0] if current_row else "unknown").lower()
+
+        if current != "wal":
+            try:
+                mode_row = db.execute("PRAGMA journal_mode=WAL").fetchone()
+                current = str(mode_row[0] if mode_row else current).lower()
+            except sqlite3.OperationalError as exc:
+                LOG.warning("WAL indisponível neste volume (%s); mantendo o journal atual.", exc)
+                current_row = db.execute("PRAGMA journal_mode").fetchone()
+                current = str(current_row[0] if current_row else current).lower()
+
+        if current == "wal":
+            self.storage_journal_mode = "wal"
+            db.execute("PRAGMA synchronous=NORMAL")
+            db.execute("PRAGMA wal_autocheckpoint=256")
+            LOG.info("Fila de telemetria em WAL; leituras deixam de bloquear a escrita.")
+            return
 
         # PRAGMA journal_mode=DELETE exige trava exclusiva até quando o banco já
         # está em DELETE. Evitar a escrita desnecessária elimina a disputa com o painel.
@@ -1120,7 +1210,14 @@ class TelemetryEngine:
                 max(30, int(cooldown_until - time.time())),
             )
 
+        # 1.12.50 — a espera pela trava de sessão e a autenticação feitas aqui
+        # não tinham contador. Elas ficavam dentro de remote_execute_ms sem
+        # aparecer em nenhuma fase, e session_prepare_ms media apenas o
+        # open_client() de handle_command, que é ~0ms com cliente emprestado.
+        session_wait_started = time.monotonic()
         with self._session_operation_lock(subscription_id):
+            session_wait_ms = int(round((time.monotonic() - session_wait_started) * 1000))
+            session_login_ms = 0
             command_credentials = payload.get("credentials") if isinstance(payload.get("credentials"), dict) else {}
             session_credentials = dict(command_credentials)
             session_credentials.pop("operation_password", None)
@@ -1140,6 +1237,7 @@ class TelemetryEngine:
                 or (self.session_idle_seconds > 0 and now_epoch - float(session.get("last_used_at") or 0) >= self.session_idle_seconds)
             )
             if session_stale:
+                login_started = time.monotonic()
                 self._close_session_locked(subscription_id)
                 session = self._create_persistent_session_locked(
                     subscription_id,
@@ -1148,6 +1246,7 @@ class TelemetryEngine:
                     session_credentials,
                     "command",
                 )
+                session_login_ms = int(round((time.monotonic() - login_started) * 1000))
 
             session["last_used_at"] = now_epoch
             try:
@@ -1159,6 +1258,10 @@ class TelemetryEngine:
                 )
                 session["last_used_at"] = time.time()
                 self.record_account_auth_success(environment, account_id, "command_session")
+                phase = result.get("phase_latency_ms")
+                if isinstance(phase, dict):
+                    phase["session_wait_ms"] = session_wait_ms
+                    phase["session_login_ms"] = session_login_ms
                 result["session_retained_for_fast_confirmation"] = True
                 return result
             except Exception as exc:
@@ -1241,15 +1344,33 @@ class TelemetryEngine:
             return
         # O worker respeita next_run_at exatamente como foi persistido. Reiniciar
         # o App não antecipa cooldown nem espera progressiva.
+        self._poll_pool = ThreadPoolExecutor(
+            max_workers=self.poll_workers,
+            thread_name_prefix="leaphub-telemetry-poll",
+        )
         self.worker = threading.Thread(target=self._run, name="leaphub-telemetry", daemon=True)
         self.worker.start()
-        LOG.info("Telemetria contínua iniciada com fila persistente em %s.", self.db_path)
+        self.delivery_worker = threading.Thread(
+            target=self._run_delivery, name="leaphub-telemetry-delivery", daemon=True
+        )
+        self.delivery_worker.start()
+        LOG.info(
+            "Telemetria contínua iniciada com fila persistente em %s; %s coletas paralelas e entrega dedicada.",
+            self.db_path,
+            self.poll_workers,
+        )
 
     def stop(self) -> None:
         self.stop_event.set()
         self.wake_event.set()
+        self.delivery_event.set()
         if self.worker and self.worker.is_alive():
             self.worker.join(timeout=12)
+        if self.delivery_worker and self.delivery_worker.is_alive():
+            self.delivery_worker.join(timeout=12)
+        pool, self._poll_pool = self._poll_pool, None
+        if pool is not None:
+            pool.shutdown(wait=True, cancel_futures=True)
         self._close_all_sessions()
 
     def upsert(self, environment: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -1810,15 +1931,12 @@ class TelemetryEngine:
         self.storage_next_log_at = 0.0
 
     def _run(self) -> None:
+        """Escalonador. A coleta em si vai para o pool; a entrega tem thread própria."""
         while not self.stop_event.is_set():
             did_work = False
             storage_wait: float | None = None
             try:
-                did_work = self._deliver_due() or did_work
-                subscription = self._next_due_subscription()
-                if subscription is not None:
-                    self._poll_subscription(subscription)
-                    did_work = True
+                did_work = self._dispatch_due_subscriptions()
                 self._maintenance()
                 self._record_storage_success()
             except (OSError, sqlite3.Error) as exc:
@@ -1835,7 +1953,70 @@ class TelemetryEngine:
             self.wake_event.wait(max(0.25, wait))
             self.wake_event.clear()
 
+    def _run_delivery(self) -> None:
+        """Entrega ao site em thread dedicada.
+
+        1.12.50 — o POST tem timeout próprio e a hospedagem do site pode demorar.
+        Enquanto ele morava no laço principal, uma lentidão do site parava a
+        coleta de todas as contas pelo mesmo tempo.
+        """
+        while not self.stop_event.is_set():
+            wait = 2.0
+            try:
+                if self._deliver_due():
+                    wait = 0.25
+                # A recuperação do armazenamento é declarada apenas pelo
+                # escalonador, que abre o banco em todo ciclo. Duas threads
+                # zerando o mesmo contador só produziria log oscilante.
+            except (OSError, sqlite3.Error) as exc:
+                wait = self._record_storage_failure(exc)
+            except Exception:  # noqa: BLE001
+                LOG.exception("Falha na entrega de telemetria")
+                wait = 5.0
+            self.delivery_event.wait(max(0.25, wait))
+            self.delivery_event.clear()
+
+    def _dispatch_due_subscriptions(self) -> bool:
+        """Entrega ao pool as assinaturas vencidas que ainda não estão em coleta."""
+        pool = self._poll_pool
+        if pool is None:
+            return False
+        dispatched = False
+        while not self.stop_event.is_set():
+            with self._inflight_guard:
+                free = self.poll_workers - len(self._inflight)
+            if free <= 0:
+                break
+            subscription = self._next_due_subscription()
+            if subscription is None:
+                break
+            sid = str(subscription["subscription_id"])
+            with self._inflight_guard:
+                if sid in self._inflight:
+                    break
+                self._inflight.add(sid)
+            dispatched = True
+            pool.submit(self._poll_subscription_guarded, subscription, sid)
+        return dispatched
+
+    def _poll_subscription_guarded(self, subscription: sqlite3.Row, sid: str) -> None:
+        try:
+            self._poll_subscription(subscription)
+        except (OSError, sqlite3.Error) as exc:
+            self._record_storage_failure(exc)
+        except Exception:  # noqa: BLE001
+            LOG.exception("Falha ao consultar a assinatura %s", sid)
+        finally:
+            with self._inflight_guard:
+                self._inflight.discard(sid)
+            self.wake_event.set()
+
     def _next_due_subscription(self) -> sqlite3.Row | None:
+        # A ordem de prioridade (comando -> interativo -> fundo) é preservada.
+        # Uma assinatura já em coleta mantém next_run_at no passado até reagendar;
+        # o conjunto _inflight é o que impede coleta duplicada da mesma conta.
+        with self._inflight_guard:
+            busy = set(self._inflight)
         with self.lock, self._db() as db:
             now_epoch = time.time()
             active_filter = "" if self.background_enabled else " AND active_until>?"
@@ -1844,13 +2025,17 @@ class TelemetryEngine:
                 parameters = (now_epoch, now_epoch, now_epoch)
             else:
                 parameters = (now_epoch, now_epoch, now_epoch, now_epoch)
-            return db.execute(
+            rows = db.execute(
                 "SELECT * FROM subscriptions WHERE enabled=1 AND auth_required=0"
                 + active_filter
                 + " AND next_run_at<=? "
-                "ORDER BY CASE WHEN command_until>? THEN 0 WHEN interactive_until>? THEN 1 ELSE 2 END, next_run_at ASC LIMIT 1",
+                "ORDER BY CASE WHEN command_until>? THEN 0 WHEN interactive_until>? THEN 1 ELSE 2 END, next_run_at ASC LIMIT 12",
                 parameters,
-            ).fetchone()
+            ).fetchall()
+        for row in rows:
+            if str(row["subscription_id"]) not in busy:
+                return row
+        return None
 
     def _seconds_until_next(self) -> float:
         with self.lock, self._db() as db:
@@ -2966,7 +3151,11 @@ class TelemetryEngine:
             },
         )
         try:
-            with urllib.request.urlopen(request, timeout=45) as response:
+            # 1.12.50 — o PHP da hospedagem compartilhada costuma ser encerrado
+            # por max_execution_time antes deste limite. Desistir primeiro devolve
+            # o lote à fila com backoff curto em vez de segurar a thread de
+            # entrega num socket que já não tem ninguém do outro lado.
+            with urllib.request.urlopen(request, timeout=25) as response:
                 raw = response.read(2 * 1024 * 1024)
                 payload = json.loads(raw.decode("utf-8"))
             if not isinstance(payload, dict):
@@ -2996,7 +3185,12 @@ class TelemetryEngine:
         updates = []
         for row in rows:
             attempts = int(row["attempts"] or 0) + 1
-            delay = min(1800, max(10, 5 * (2 ** min(attempts, 8)))) + random.uniform(0, 5)
+            # 1.12.50 — o teto anterior de 1800s deixava a telemetria de um
+            # usuário muda por meia hora depois de duas lentidões da hospedagem.
+            # A fila é persistente e o event_id é idempotente; repetir em até 2min
+            # não duplica nada e não custa nenhuma chamada à nuvem Leapmotor,
+            # porque esta entrega é Gateway -> site.
+            delay = min(120, max(10, 5 * (2 ** min(attempts, 5)))) + random.uniform(0, 5)
             updates.append((attempts, now + delay, str(message)[:500], str(row["event_id"])))
         with self.lock, self._db() as db:
             db.executemany("UPDATE events SET attempts=?, next_attempt_at=?, last_error=? WHERE event_id=?", updates)
@@ -3022,6 +3216,13 @@ class TelemetryEngine:
 
     def _maintenance(self) -> None:
         now_epoch = time.time()
+        # 1.12.50 — antes rodava a cada volta do laço (até 2x/s), com SELECT,
+        # DELETE e COUNT(*) na tabela events inteira. Em disco mecânico isso
+        # mantinha a cabeça do disco ocupada sem necessidade: a retenção é
+        # diária e um minuto é folgado.
+        if now_epoch - self._maintenance_last_at < 60.0:
+            return
+        self._maintenance_last_at = now_epoch
         # Executada de forma barata; o SQLite ignora as remoções quando não há registros antigos.
         cutoff = time.time() - self.retention_days * 86400
         cutoff_iso = datetime.fromtimestamp(cutoff, timezone.utc).isoformat().replace("+00:00", "Z")

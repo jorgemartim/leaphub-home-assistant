@@ -65,7 +65,7 @@ except ModuleNotFoundError:
         _event_transport_spec.loader.exec_module(_event_transport_module)
         EVENT_TRANSPORT = _event_transport_module.EVENT_TRANSPORT
 
-VERSION = "1.12.49"
+VERSION = "1.12.50"
 API_VERSION = 2
 CAPABILITY_SCHEMA_VERSION = 1
 MIN_SUPPORTED_CLIENT_API_VERSION = 1
@@ -941,6 +941,11 @@ def run_command_job(
             "connector_slot_ms": int(round((slot_acquired_at - account_acquired_at) * 1000)),
             "remote_execute_ms": int(round((execute_finished_at - execute_started_at) * 1000)),
             "total_ms": int(round((execute_finished_at - queue_started) * 1000)),
+            # 1.12.50 — estas duas fases existiam mas não eram medidas. Sem elas,
+            # a soma das fases não fechava com remote_execute_ms e a maior parte
+            # do tempo de um comando ficava invisível no log.
+            "session_wait_ms": int(phase_latency.get("session_wait_ms") or 0),
+            "session_login_ms": int(phase_latency.get("session_login_ms") or 0),
             "session_prepare_ms": int(phase_latency.get("session_prepare_ms") or 0),
             "dispatch_ms": int(phase_latency.get("dispatch_ms") or 0),
             "verification_ms": int(phase_latency.get("verification_ms") or 0),
@@ -950,10 +955,17 @@ def run_command_job(
         latency.update({
             "queue_account_ms": latency["account_wait_ms"],
             "queue_connector_ms": latency["connector_slot_ms"],
+            "queue_session_ms": latency["session_wait_ms"],
+            "remote_login_ms": latency["session_login_ms"],
             "remote_dispatch_ms": latency["dispatch_ms"],
             "remote_result_ms": None,
             "remote_result_bundled_with_dispatch": True,
             "post_state_verify_ms": latency["verification_ms"],
+            "unaccounted_ms": max(0, latency["remote_execute_ms"] - (
+                latency["session_wait_ms"] + latency["session_login_ms"]
+                + latency["session_prepare_ms"] + latency["dispatch_ms"]
+                + latency["verification_ms"]
+            )),
         })
         result["latency"] = latency
         ORCHESTRATOR.record_command_latency(
@@ -987,16 +999,19 @@ def run_command_job(
         )
         remote_summary_text = connector.clean_message(remote_summary_text)[:320]
         LOG.info(
-            "Comando remoto %s finalizado no worker para %s; resultado=%s, espera_fila=%ss, latência_conta=%sms, vaga_connector=%sms, preparo_sessao=%sms, dispatch=%sms, verificacao=%sms, execução_remota=%sms, total=%sms, tentativas=%s, despertar_real=%s, repetição_segura=%s, estratégia=%s, confirmado_direto=%s, confirmação_pendente=%s, motivo=%s, ack=%s, resultado_remoto=%s, evidencia=%s, sinal=%s, resumo=%s.",
+            "Comando remoto %s finalizado no worker para %s; resultado=%s, espera_fila=%ss, latência_conta=%sms, vaga_connector=%sms, espera_sessao=%sms, login=%sms, preparo_sessao=%sms, dispatch=%sms, verificacao=%sms, nao_atribuido=%sms, execução_remota=%sms, total=%sms, tentativas=%s, despertar_real=%s, repetição_segura=%s, estratégia=%s, confirmado_direto=%s, confirmação_pendente=%s, motivo=%s, ack=%s, resultado_remoto=%s, evidencia=%s, sinal=%s, resumo=%s.",
             str(payload.get("command") or "desconhecido")[:40],
             environment,
             str(result.get("final_outcome") or ("confirmed" if result.get("verified_by_gateway") else "confirmation_pending"))[:40],
             int(result.get("queue_wait_seconds") or 0),
             int(latency.get("account_wait_ms") or 0),
             int(latency.get("connector_slot_ms") or 0),
+            int(latency.get("session_wait_ms") or 0),
+            int(latency.get("session_login_ms") or 0),
             int(latency.get("session_prepare_ms") or 0),
             int(latency.get("dispatch_ms") or 0),
             int(latency.get("verification_ms") or 0),
+            int(latency.get("unaccounted_ms") or 0),
             int(latency.get("remote_execute_ms") or 0),
             int(latency.get("total_ms") or 0),
             int(result.get("attempts") or 1),

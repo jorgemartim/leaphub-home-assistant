@@ -43,7 +43,7 @@ except ImportError:
         _privacy_spec.loader.exec_module(_privacy_module)
         sanitize_log = _privacy_module.sanitize_log
 
-CONNECTOR_VERSION = "1.12.49"
+CONNECTOR_VERSION = "1.12.50"
 MAX_INPUT_BYTES = 1024 * 1024
 logging.getLogger("leapmotor_api").setLevel(logging.WARNING)
 LOGGER = logging.getLogger("leaphub.connector")
@@ -431,11 +431,26 @@ def reconnect_message(value: Any) -> str:
     )[:900]
 
 
+_PACKAGE_VERSION_CACHED = False
+_PACKAGE_VERSION_VALUE: str | None = None
+
+
 def package_version() -> str | None:
-    try:
-        return version("leapmotor-api")
-    except PackageNotFoundError:
-        return None
+    """Versão da biblioteca, resolvida uma única vez por processo.
+
+    1.12.50 — importlib.metadata.version varre o sys.path e lê os arquivos
+    dist-info a cada chamada. Isso acontecia em todo /health/details e em todo
+    payload de telemetria; em disco mecânico era I/O no caminho quente. A versão
+    só muda com reinstalação do add-on, que reinicia o processo.
+    """
+    global _PACKAGE_VERSION_CACHED, _PACKAGE_VERSION_VALUE
+    if not _PACKAGE_VERSION_CACHED:
+        try:
+            _PACKAGE_VERSION_VALUE = version("leapmotor-api")
+        except PackageNotFoundError:
+            _PACKAGE_VERSION_VALUE = None
+        _PACKAGE_VERSION_CACHED = True
+    return _PACKAGE_VERSION_VALUE
 
 
 def read_request() -> dict[str, Any]:

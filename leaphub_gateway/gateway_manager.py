@@ -24,7 +24,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-VERSION = "1.12.49"
+VERSION = "1.12.50"
 OPTIONS_PATH = Path(os.getenv("LEAPHUB_OPTIONS_PATH", "/data/options.json"))
 RUNTIME = Path(os.getenv("LEAPHUB_RUNTIME_DIR", "/data/runtime"))
 LOG_DIR = Path(os.getenv("LEAPHUB_LOG_DIR", "/data/logs"))
@@ -391,10 +391,14 @@ def write_connector_options() -> Path:
         "telemetry_presence_window_seconds": int(OPTIONS.get("telemetry_presence_window_seconds") or 420),
         "telemetry_rate_limit_cooldown_seconds": int(OPTIONS.get("telemetry_rate_limit_cooldown_seconds") or 900),
         "telemetry_request_timeout_seconds": int(OPTIONS.get("telemetry_request_timeout_seconds") or 15),
+        # 1.12.50 — coletas simultâneas de contas diferentes. O teto real continua
+        # sendo connector_max_parallel; contas iguais seguem serializadas pela
+        # trava por conta e pela trava de sessão.
+        "telemetry_poll_workers": max(1, min(6, int(OPTIONS.get("telemetry_poll_workers") or 3))),
         "telemetry_session_idle_seconds": int(OPTIONS.get("telemetry_session_idle_seconds") or 21600),
         "telemetry_vehicle_list_cache_seconds": int(OPTIONS.get("telemetry_vehicle_list_cache_seconds") or 1800),
         "telemetry_message_cache_seconds": int(OPTIONS.get("telemetry_message_cache_seconds") or 1800),
-        "telemetry_batch_size": int(OPTIONS.get("telemetry_batch_size") or 25),
+        "telemetry_batch_size": int(OPTIONS.get("telemetry_batch_size") or 5),
         "telemetry_retention_days": int(OPTIONS.get("telemetry_retention_days") or 7),
         "telemetry_queue_max_events": int(OPTIONS.get("telemetry_queue_max_events") or 10000),
         "log_level": LOG_LEVEL,
