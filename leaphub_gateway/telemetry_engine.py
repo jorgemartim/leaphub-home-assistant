@@ -54,7 +54,14 @@ except ModuleNotFoundError:
         EVENT_TRANSPORT = _event_transport_module.EVENT_TRANSPORT
 
 LOG = logging.getLogger("leaphub.telemetry")
-ENGINE_VERSION = "1.12.51"  # entrega com conexão reaproveitada e journal observável
+ENGINE_VERSION = "1.12.52"  # entrega com keep-alive ciente da janela do servidor
+
+# Hospedagem compartilhada (Apache/LiteSpeed) fecha a conexão ociosa em poucos
+# segundos. Reaproveitar depois disso escreve num socket já fechado e devolve
+# "Remote end closed connection without response" sem que o PHP chegue a rodar.
+DELIVERY_IDLE_DEFAULT_SECONDS = 5.0
+DELIVERY_IDLE_MIN_SECONDS = 2.0
+DELIVERY_IDLE_MAX_SECONDS = 30.0
 
 TELEMETRY_CONFIRMABLE_COMMANDS = frozenset({
     "lock",
@@ -188,6 +195,11 @@ class TelemetryEngine:
         self._delivery_connection: http.client.HTTPConnection | None = None
         self._delivery_connection_key = ""
         self._delivery_guard = threading.RLock()
+        # 1.12.52 — a conexao so pode ser reaproveitada dentro da janela de
+        # keep-alive do servidor. Os lotes saem a cada 20-120s e a hospedagem
+        # fecha a conexao ociosa muito antes disso.
+        self._delivery_connection_idle_since = 0.0
+        self._delivery_idle_max = DELIVERY_IDLE_DEFAULT_SECONDS
         self.active_seconds = self._bounded("telemetry_active_seconds", 20, 15, 300)
         self.interactive_seconds = self._bounded("telemetry_interactive_seconds", 20, 15, 60)
         # Janela curta após comandos remotos. É propositalmente separada da
@@ -3354,25 +3366,35 @@ class TelemetryEngine:
         body = canonical_json({"events": events, "gateway_version": ENGINE_VERSION, "sent_at": utc_iso()})
         parsed = urllib.parse.urlparse(url)
         path = parsed.path or "/"
-        timestamp = str(int(time.time()))
-        nonce = os.urandom(16).hex()
-        canonical = f"POST\n{path}\n{timestamp}\n{nonce}\n{hashlib.sha256(body).hexdigest()}".encode()
-        signature = hmac.new(secret.encode(), canonical, hashlib.sha256).hexdigest()
-        headers = {
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "User-Agent": f"LeapHubGateway/{ENGINE_VERSION}",
-            "X-LeapHub-Timestamp": timestamp,
-            "X-LeapHub-Nonce": nonce,
-            "X-LeapHub-Environment": environment,
-            "X-LeapHub-Signature": signature,
-        }
+
+        def sign_headers() -> dict[str, str]:
+            """Assina o mesmo corpo com timestamp e nonce novos.
+
+            1.12.52 — o site trata o nonce como uso único (`gateway_telemetry_nonces`).
+            Repetir a entrega com o cabeçalho anterior seria recusado como
+            repetição, então cada tentativa recebe sua própria assinatura.
+            """
+            timestamp = str(int(time.time()))
+            nonce = os.urandom(16).hex()
+            canonical = f"POST\n{path}\n{timestamp}\n{nonce}\n{hashlib.sha256(body).hexdigest()}".encode()
+            signature = hmac.new(secret.encode(), canonical, hashlib.sha256).hexdigest()
+            return {
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "User-Agent": f"LeapHubGateway/{ENGINE_VERSION}",
+                "X-LeapHub-Timestamp": timestamp,
+                "X-LeapHub-Nonce": nonce,
+                "X-LeapHub-Environment": environment,
+                "X-LeapHub-Signature": signature,
+            }
+
+        headers = sign_headers()
         try:
             # 1.12.50 — o PHP da hospedagem compartilhada costuma ser encerrado
             # por max_execution_time antes do timeout. Desistir primeiro devolve
             # o lote à fila com backoff curto em vez de segurar a thread de
             # entrega num socket que já não tem ninguém do outro lado.
-            payload = self._post_delivery(url, headers, body)
+            payload = self._post_delivery(url, headers, body, sign=sign_headers)
             if not isinstance(payload, dict):
                 raise RuntimeError("Resposta de entrega inválida.")
             by_id = {str(item.get("event_id")): item for item in (payload.get("results") or []) if isinstance(item, dict)}
@@ -3405,7 +3427,13 @@ class TelemetryEngine:
             self._close_delivery_connection()
             self._delivery_failed(valid_rows, connector.clean_message(str(exc)))
 
-    def _post_delivery(self, url: str, headers: dict[str, str], body: bytes) -> Any:
+    def _post_delivery(
+        self,
+        url: str,
+        headers: dict[str, str],
+        body: bytes,
+        sign: Callable[[], dict[str, str]] | None = None,
+    ) -> Any:
         """POST assinado ao site reaproveitando a conexão TLS entre lotes.
 
         1.12.51 — cada lote abria uma conexão nova. Com o lote menor recomendado
@@ -3414,6 +3442,16 @@ class TelemetryEngine:
         própria entrega. A conexão é usada apenas pela thread de entrega e é
         descartada em qualquer erro de transporte, então nenhuma resposta pode
         ser lida fora de ordem.
+
+        1.12.52 — faltava a outra metade do keep-alive. `http.client` não
+        verifica se o socket do pool continua aberto: ele escreve e só descobre
+        no `getresponse()`. Como a hospegadem fecha a conexão ociosa em poucos
+        segundos e os lotes saem a cada 20-120s, praticamente toda entrega
+        reaproveitada falhava com "Remote end closed connection without
+        response" — sem o PHP sequer rodar — e o lote voltava para o backoff.
+        Agora a conexão ociosa além da janela é descartada antes do envio, e uma
+        falha de transporte sobre conexão reaproveitada ganha uma tentativa
+        imediata em conexão nova, com assinatura nova.
         """
         parsed = urllib.parse.urlparse(url)
         host = parsed.hostname or ""
@@ -3423,41 +3461,91 @@ class TelemetryEngine:
         if parsed.query:
             target = f"{target}?{parsed.query}"
         key = f"{parsed.scheme}://{host}:{parsed.port or ''}"
+        # Sem `sign` não há como renovar o nonce, e o site recusaria a repetição
+        # como requisição repetida. Nesse caso vale a tentativa única de antes.
+        attempts = 2 if sign is not None else 1
 
         with self._delivery_guard:
-            connection = self._delivery_connection
-            if connection is not None and self._delivery_connection_key != key:
-                self._close_delivery_connection()
-                connection = None
-            if connection is None:
-                if parsed.scheme == "https":
-                    connection = http.client.HTTPSConnection(host, parsed.port, timeout=25)
-                elif parsed.scheme == "http":
-                    connection = http.client.HTTPConnection(host, parsed.port, timeout=25)
-                else:
-                    raise RuntimeError("Esquema de entrega não suportado.")
-                self._delivery_connection = connection
-                self._delivery_connection_key = key
-
-            request_headers = dict(headers)
-            request_headers["Content-Length"] = str(len(body))
-            request_headers.setdefault("Connection", "keep-alive")
-            try:
-                connection.request("POST", target, body=body, headers=request_headers)
-                response = connection.getresponse()
-                raw = response.read(2 * 1024 * 1024)
-                status = int(response.status)
-                if response.will_close:
+            for attempt in range(attempts):
+                reused = self._prepare_delivery_connection(key, parsed)
+                connection = self._delivery_connection
+                if connection is None:
+                    raise RuntimeError("Conexão de entrega indisponível.")
+                request_headers = dict(headers if attempt == 0 else sign())
+                request_headers["Content-Length"] = str(len(body))
+                request_headers.setdefault("Connection", "keep-alive")
+                try:
+                    connection.request("POST", target, body=body, headers=request_headers)
+                    response = connection.getresponse()
+                    raw = response.read(2 * 1024 * 1024)
+                    status = int(response.status)
+                    if response.will_close:
+                        self._close_delivery_connection()
+                    else:
+                        self._delivery_connection_idle_since = time.monotonic()
+                        self._remember_delivery_idle_window(response.getheader("Keep-Alive", ""))
+                    break
+                except Exception:
+                    # Um socket meio-fechado nunca volta ao pool: a próxima
+                    # entrega leria a resposta do lote anterior.
                     self._close_delivery_connection()
-            except Exception:
-                # Um socket meio-fechado nunca volta ao pool: a próxima entrega
-                # leria a resposta do lote anterior.
-                self._close_delivery_connection()
-                raise
+                    # Só a primeira tentativa sobre conexão reaproveitada pode
+                    # repetir. Ali o servidor comprovadamente não respondeu, a
+                    # ingestão é idempotente pelo event_id e a alternativa era
+                    # esperar o backoff inteiro por um socket morto.
+                    if reused and attempt + 1 < attempts:
+                        LOG.debug("Conexão de entrega reaproveitada estava fechada; repetindo em conexão nova.")
+                        continue
+                    raise
 
         if status < 200 or status >= 300:
             raise RuntimeError(f"O site respondeu HTTP {status} à entrega de telemetria.")
         return json.loads(raw.decode("utf-8"))
+
+    def _prepare_delivery_connection(self, key: str, parsed: urllib.parse.ParseResult) -> bool:
+        """Devolve True quando a conexão do pool pôde ser reaproveitada."""
+        connection = self._delivery_connection
+        if connection is not None and self._delivery_connection_key != key:
+            self._close_delivery_connection()
+            connection = None
+        if connection is not None and time.monotonic() - self._delivery_connection_idle_since >= self._delivery_idle_max:
+            # Passou da janela de keep-alive anunciada/presumida do servidor. O
+            # socket provavelmente já foi fechado do outro lado e escrever nele
+            # custaria o lote inteiro.
+            self._close_delivery_connection()
+            connection = None
+        if connection is not None:
+            return True
+        if parsed.scheme == "https":
+            connection = http.client.HTTPSConnection(parsed.hostname or "", parsed.port, timeout=25)
+        elif parsed.scheme == "http":
+            connection = http.client.HTTPConnection(parsed.hostname or "", parsed.port, timeout=25)
+        else:
+            raise RuntimeError("Esquema de entrega não suportado.")
+        self._delivery_connection = connection
+        self._delivery_connection_key = key
+        self._delivery_connection_idle_since = time.monotonic()
+        return False
+
+    def _remember_delivery_idle_window(self, keep_alive_header: str) -> None:
+        """Usa o `Keep-Alive: timeout=N` do servidor quando ele informa um.
+
+        Sem o cabeçalho vale o padrão conservador. A margem de um segundo cobre
+        a latência da própria requisição seguinte.
+        """
+        for part in str(keep_alive_header or "").split(","):
+            name, _, value = part.strip().partition("=")
+            if name.strip().lower() != "timeout":
+                continue
+            try:
+                advertised = float(value.strip())
+            except ValueError:
+                return
+            self._delivery_idle_max = max(
+                DELIVERY_IDLE_MIN_SECONDS,
+                min(DELIVERY_IDLE_MAX_SECONDS, advertised - 1.0),
+            )
+            return
 
     def _close_delivery_connection(self) -> None:
         with self._delivery_guard:

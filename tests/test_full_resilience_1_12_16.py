@@ -112,4 +112,4 @@ with tempfile.TemporaryDirectory(prefix="leaphub-1-12-16-") as tmp:
 
 if failures:
     raise SystemExit("full resilience 1.12.24 failed:\n- " + "\n- ".join(failures))
-print({"ok": True, "checks": 12, "version": "1.12.51"})
+print({"ok": True, "checks": 12, "version": "1.12.52"})

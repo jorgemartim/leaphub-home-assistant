@@ -269,6 +269,11 @@ def test_delivery_reuses_one_connection_across_batches():
                 def read(self, _limit: int) -> bytes:
                     return b'{"ok": true, "results": []}'
 
+                def getheader(self, _name: str, default: str = "") -> str:
+                    # O HTTPResponse real sempre expõe getheader; a 1.12.52 lê o
+                    # Keep-Alive da resposta para dimensionar o reaproveitamento.
+                    return default
+
             class _Connection:
                 def __init__(self, *_args, **_kwargs) -> None:
                     opened["count"] += 1

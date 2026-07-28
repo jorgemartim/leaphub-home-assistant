@@ -7,7 +7,7 @@ CONNECTOR = (ROOT / "leaphub_gateway" / "connector.py").read_text(encoding="utf-
 CONFIG = (ROOT / "leaphub_gateway" / "config.yaml").read_text(encoding="utf-8")
 
 checks = {
-    "version": ('version: \"1.12.48\"' in CONFIG or 'version: \"1.12.51\"' in CONFIG) and 'VERSION = "1.12.51"' in SERVER,
+    "version": ('version: \"1.12.48\"' in CONFIG or 'version: \"1.12.51\"' in CONFIG) and 'VERSION = "1.12.52"' in SERVER,
     "optional_close_argument": "close_connection: bool = False" in SERVER,
     "close_header": 'self.send_header("Connection", "close")' in SERVER,
     "public_health_keeps_alive": "public_health_payload(), close_connection=True" not in SERVER,
@@ -21,4 +21,4 @@ failed = [name for name, ok in checks.items() if not ok]
 if failed:
     raise SystemExit("status delivery 1.12.24 failed:\n- " + "\n- ".join(failed))
 
-print({"ok": True, "checks": len(checks), "version": "1.12.51"})
+print({"ok": True, "checks": len(checks), "version": "1.12.52"})
