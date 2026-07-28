@@ -38,7 +38,7 @@ def test_mqtt_is_not_claimed_active_before_homologation() -> None:
 
 
 def test_event_layer_is_wired_without_new_physical_command_path() -> None:
-    assert 'ENGINE_VERSION = "1.12.50"' in TELEMETRY
+    assert 'ENGINE_VERSION = "1.12.49"' in TELEMETRY
     assert 'EVENT_TRANSPORT.register_wake_callback(self._wake_from_event)' in TELEMETRY
     assert '"event_transport": EVENT_TRANSPORT.snapshot()' in SERVER
     assert 'event_transport.py' in DOCKER

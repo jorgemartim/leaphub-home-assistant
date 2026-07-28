@@ -9,9 +9,9 @@ SERVER = (ROOT / "leaphub_gateway" / "connector_server.py").read_text(encoding="
 
 
 def test_current_version_and_existing_priority_are_preserved() -> None:
-    assert 'VERSION = "1.12.50"' in SERVER
-    assert 'CONNECTOR_VERSION = "1.12.50"' in CONNECTOR
-    assert 'ENGINE_VERSION = "1.12.50"' in TELEMETRY
+    assert 'VERSION = "1.12.49"' in SERVER
+    assert 'CONNECTOR_VERSION = "1.12.49"' in CONNECTOR
+    assert 'ENGINE_VERSION = "1.12.49"' in TELEMETRY
     assert "manual_operation_enter(environment, payload)" in SERVER
     assert "manual_pending_provider=manual_operation_pending" in SERVER
 
