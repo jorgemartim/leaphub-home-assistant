@@ -7,7 +7,7 @@ TARGET = (ROOT / "leaphub_gateway" / "RELEASE_TARGET").read_text(encoding="utf-8
 
 
 def test_staged_release_metadata():
-    assert any(v in CONFIG for v in ('version: \"1.12.48\"', 'version: \"1.12.51\"'))
+    assert any(v in CONFIG for v in ('version: \"1.12.48\"', 'version: \"1.12.52\"'))
     assert TARGET == "1.12.52"
     assert 'VERSION = "1.12.52"' in MANAGER
 
