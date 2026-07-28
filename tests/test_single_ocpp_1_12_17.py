@@ -8,7 +8,7 @@ config = (APP / "config.yaml").read_text(encoding="utf-8")
 privacy = (APP / "privacy.py").read_text(encoding="utf-8")
 
 checks = {
-    "version": ('version: \"1.12.47\"' in config or 'version: \"1.12.50\"' in config) and 'VERSION = "1.12.50"' in manager,
+    "version": ('version: \"1.12.48\"' in config or 'version: \"1.12.50\"' in config) and 'VERSION = "1.12.50"' in manager,
     "privacy_version": 'PRIVACY_VERSION = "1.12.50"' in privacy,
     "single_selection": "def selected_ocpp_configuration()" in manager,
     "ambiguous_blocked": "mantenha somente Beta ou Produção ativo" in manager,

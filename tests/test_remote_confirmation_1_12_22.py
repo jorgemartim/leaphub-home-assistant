@@ -51,7 +51,7 @@ with tempfile.TemporaryDirectory(prefix="leaphub-confirmation-") as tmp:
         engine._instance_lock_handle.close()
 
 checks = {
-    "version": ('version: "1.12.47"' in config_source or 'version: "1.12.50"' in config_source)
+    "version": ('version: "1.12.48"' in config_source or 'version: "1.12.50"' in config_source)
         and 'VERSION = "1.12.50"' in server_source,
     "manager_migrates_legacy_limit": 'max(5, min(8' in manager_source,
     "private_posts_close": "def do_POST(self) -> None:\n        # As chamadas assinadas" in server_source

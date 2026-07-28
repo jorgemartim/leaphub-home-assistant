@@ -53,7 +53,34 @@ except ModuleNotFoundError:
         EVENT_TRANSPORT = _event_transport_module.EVENT_TRANSPORT
 
 LOG = logging.getLogger("leaphub.telemetry")
-ENGINE_VERSION = "1.12.50"  # armazenamento WAL, coleta paralela e entrega dedicada
+ENGINE_VERSION = "1.12.50"  # confirmação FAST do Gateway, WAL, coleta paralela e entrega dedicada
+
+TELEMETRY_CONFIRMABLE_COMMANDS = frozenset({
+    "lock",
+    "unlock",
+    "climate_on",
+    "climate_off",
+    "quick_cool",
+    "quick_heat",
+    "windshield_defrost",
+    "battery_preheat_on",
+    "battery_preheat_off",
+    "steering_wheel_heat_on",
+    "steering_wheel_heat_off",
+    "rearview_mirror_heat_on",
+    "rearview_mirror_heat_off",
+    "trunk_open",
+    "trunk_close",
+    "sunshade_open",
+    "sunshade_close",
+    "windows_open",
+    "windows_close",
+    "sentry_on",
+    "sentry_off",
+    "start_charging",
+    "stop_charging",
+    "set_charge_limit",
+})
 
 
 def utc_iso() -> str:
@@ -142,9 +169,6 @@ class TelemetryEngine:
         self.wake_event = threading.Event()
         self.worker: threading.Thread | None = None
         self.lock = threading.RLock()
-        # 1.12.50 — uma conexão SQLite por thread. Abrir e fechar por consulta
-        # custava _prepare_storage inteiro mais três PRAGMAs em 33 pontos do
-        # motor, e em disco mecânico isso domina o tempo de cada ciclo.
         self._connections: dict[int, sqlite3.Connection] = {}
         self._busy_ms: dict[int, int] = {}
         self._connections_guard = threading.RLock()
@@ -275,13 +299,7 @@ class TelemetryEngine:
         return bool(provider and provider(environment, operation_payload))
 
     def _prepare_storage(self, probe: bool = False) -> None:
-        """Garante que a fila persistente continue gravável após atualização/reinício.
-
-        1.12.50 — a revalidação de permissões continua acontecendo, agora a cada
-        60s em vez de antes de cada consulta. Em disco mecânico o chmod repetido
-        gerava escrita de metadado no caminho quente. O probe explícito, usado no
-        boot e no diagnóstico de falha de armazenamento, não é afetado.
-        """
+        """Garante que a fila persistente continue gravável após atualização/reinício."""
         if not probe:
             now = time.monotonic()
             if now - self._storage_checked_at < 60.0:
@@ -460,6 +478,7 @@ class TelemetryEngine:
             self._drop_connection(key)
             raise
 
+
     def _configure_journal(self, db: sqlite3.Connection) -> None:
         """Prefere WAL e mantém DELETE como fallback quando o volume não o aceita.
 
@@ -496,6 +515,41 @@ class TelemetryEngine:
             self.storage_journal_mode = current
             db.execute("PRAGMA synchronous=FULL")
             return
+
+        last_error: Exception | None = None
+        for attempt in range(12):
+            try:
+                if current == "wal":
+                    try:
+                        db.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+                    except sqlite3.OperationalError as exc:
+                        if "locked" not in str(exc).lower() and "busy" not in str(exc).lower():
+                            raise
+                mode_row = db.execute("PRAGMA journal_mode=DELETE").fetchone()
+                mode = str(mode_row[0] if mode_row else current).lower()
+                self.storage_journal_mode = mode
+                if mode != "delete":
+                    raise sqlite3.OperationalError(f"journal SQLite incompatível: {mode}")
+                db.execute("PRAGMA synchronous=FULL")
+                return
+            except sqlite3.OperationalError as exc:
+                last_error = exc
+                message = str(exc).lower()
+                if "locked" not in message and "busy" not in message:
+                    raise
+                # Dá tempo para uma leitura curta terminar. O painel respeita o
+                # marcador e deixa de abrir novas conexões durante esta janela.
+                time.sleep(min(3.0, 0.25 * (attempt + 1)))
+                current_row = db.execute("PRAGMA journal_mode").fetchone()
+                current = str(current_row[0] if current_row else current).lower()
+                if current == "delete":
+                    self.storage_journal_mode = current
+                    db.execute("PRAGMA synchronous=FULL")
+                    return
+        raise sqlite3.OperationalError(
+            "Não foi possível obter acesso exclusivo para migrar a fila SQLite."
+        ) from last_error
+
 
         last_error: Exception | None = None
         for attempt in range(12):
@@ -1237,9 +1291,9 @@ class TelemetryEngine:
             )
 
         # 1.12.50 — a espera pela trava de sessão e a autenticação feitas aqui
-        # não tinham contador. Elas ficavam dentro de remote_execute_ms sem
-        # aparecer em nenhuma fase, e session_prepare_ms media apenas o
-        # open_client() de handle_command, que é ~0ms com cliente emprestado.
+        # não tinham contador: ficavam dentro de remote_execute_ms sem aparecer
+        # em nenhuma fase, e session_prepare_ms mede apenas o open_client() do
+        # conector, que é ~0ms com cliente emprestado.
         session_wait_started = time.monotonic()
         with self._session_operation_lock(subscription_id):
             session_wait_ms = int(round((time.monotonic() - session_wait_started) * 1000))
@@ -1289,6 +1343,7 @@ class TelemetryEngine:
                     phase["session_wait_ms"] = session_wait_ms
                     phase["session_login_ms"] = session_login_ms
                 result["session_retained_for_fast_confirmation"] = True
+                self._arm_command_confirmation(subscription_id, payload, result)
                 return result
             except Exception as exc:
                 session["last_used_at"] = time.time()
@@ -1335,12 +1390,70 @@ class TelemetryEngine:
                     recovered["session_recovered"] = True
                     recovered["session_reused"] = True
                     recovered["session_retained_for_fast_confirmation"] = True
+                    self._arm_command_confirmation(subscription_id, payload, recovered)
                     return recovered
                 if isinstance(exc, connector.ConnectorLoginCooldownError):
                     self._set_account_login_cooldown(environment, account_id, exc.retry_after_seconds, str(exc))
                 if connector.is_authentication_error(exc):
                     self._close_session_locked(subscription_id)
                 raise
+
+    def _arm_command_confirmation(
+        self,
+        subscription_id: str,
+        payload: dict[str, Any],
+        result: dict[str, Any],
+    ) -> None:
+        """Arm FAST telemetry before the site starts polling command status.
+
+        The command worker already knows the exact subscription, remote vehicle
+        and immutable request id. Persisting that context here removes the
+        dependency on a later PHP worker round-trip. The site may repeat the
+        boost as a recovery signal; ``boost`` preserves an active window for the
+        same request instead of resetting its samples.
+        """
+        command = str(payload.get("command") or "").strip().lower()
+        if (
+            command not in TELEMETRY_CONFIRMABLE_COMMANDS
+            or not bool(result.get("confirmation_pending"))
+            or not bool(result.get("command_dispatched") or result.get("cloud_accepted"))
+        ):
+            result["confirmation_armed_by_gateway"] = False
+            return
+
+        context = {
+            "command_key": command,
+            "command_id": 0,
+            "vehicle_remote_id": str(payload.get("vehicle_id") or "").strip()[:190],
+            "parameters": payload.get("parameters") if isinstance(payload.get("parameters"), dict) else {},
+            "request_id": str(payload.get("request_id") or "").strip()[:96],
+        }
+        try:
+            armed = self.boost(
+                subscription_id,
+                seconds=180,
+                profile="command",
+                context=context,
+            )
+            result["confirmation_armed_by_gateway"] = bool(armed.get("ok"))
+            result["confirmation_window_reused"] = bool(armed.get("confirmation_window_reused"))
+            if not armed.get("ok"):
+                LOG.warning(
+                    "Comando %s foi aceito, mas a janela FAST interna de %s não pôde ser armada: %s",
+                    command,
+                    subscription_id,
+                    connector.clean_message(str(armed.get("message") or "indisponível")),
+                )
+        except Exception as exc:  # noqa: BLE001
+            # A ação física já foi aceita. Uma falha local ao armar a leitura
+            # não transforma sucesso remoto em erro nem autoriza reenvio.
+            result["confirmation_armed_by_gateway"] = False
+            LOG.warning(
+                "Comando %s foi aceito, mas a janela FAST interna de %s será recuperada pelo site: %s",
+                command,
+                subscription_id,
+                connector.clean_message(str(exc)),
+            )
 
     def invalidate_account_session(self, environment: str, payload: dict[str, Any]) -> int:
         """Feche a sessão automática antes de uma operação manual da conta.
@@ -1686,7 +1799,9 @@ class TelemetryEngine:
         now_iso = utc_iso()
         with self.lock, self._db() as db:
             row = db.execute(
-                "SELECT auth_required, cooldown_until, cooldown_reason, enabled, next_run_at, status FROM subscriptions WHERE subscription_id=? LIMIT 1",
+                "SELECT auth_required, cooldown_until, cooldown_reason, enabled, next_run_at, status,"
+                "command_until,command_key,command_vehicle_id,command_context_json,command_poll_count,command_started_at "
+                "FROM subscriptions WHERE subscription_id=? LIMIT 1",
                 (subscription_id,),
             ).fetchone()
             if row is None or int(row["enabled"] or 0) != 1:
@@ -1714,39 +1829,93 @@ class TelemetryEngine:
             next_run = current_next if protected_wait else (min(current_next, requested_next) if current_next > now_epoch else requested_next)
             interactive_until = now_epoch + seconds if profile == "interactive" else 0.0
             command_until = now_epoch + seconds if profile == "command" else 0.0
-            if protected_wait:
-                cursor = db.execute(
-                    "UPDATE subscriptions SET active_until=MAX(active_until,?),interactive_until=MAX(interactive_until,?),"
-                    "command_until=MAX(command_until,?),last_presence_at=?,updated_at=? WHERE subscription_id=? AND enabled=1",
-                    (now_epoch + seconds, interactive_until, command_until, now_iso, now_iso, subscription_id),
+            existing_context: dict[str, Any] = {}
+            try:
+                parsed_context = json.loads(str(row["command_context_json"] or "{}"))
+                if isinstance(parsed_context, dict):
+                    existing_context = parsed_context
+            except (TypeError, ValueError, json.JSONDecodeError):
+                existing_context = {}
+            requested_request_id = str(safe_context.get("request_id") or "")
+            existing_request_id = str(existing_context.get("request_id") or "")
+            same_command_window = (
+                profile == "command"
+                and float(row["command_until"] or 0) > now_epoch
+                and str(row["command_key"] or "") == command_key
+                and str(row["command_vehicle_id"] or "") == command_vehicle_id
+                and (
+                    requested_request_id == existing_request_id
+                    or (not requested_request_id and bool(existing_request_id))
                 )
+            )
+            if protected_wait:
+                if profile == "command" and not same_command_window:
+                    cursor = db.execute(
+                        "UPDATE subscriptions SET active_until=MAX(active_until,?),"
+                        "command_until=MAX(command_until,?),command_key=?,command_vehicle_id=?,command_context_json=?,"
+                        "command_poll_count=0,command_started_at=?,last_presence_at=?,updated_at=? "
+                        "WHERE subscription_id=? AND enabled=1",
+                        (
+                            now_epoch + seconds,
+                            command_until,
+                            command_key or None,
+                            command_vehicle_id or None,
+                            command_context_json,
+                            now_epoch,
+                            now_iso,
+                            now_iso,
+                            subscription_id,
+                        ),
+                    )
+                else:
+                    cursor = db.execute(
+                        "UPDATE subscriptions SET active_until=MAX(active_until,?),interactive_until=MAX(interactive_until,?),"
+                        "command_until=MAX(command_until,?),last_presence_at=?,updated_at=? WHERE subscription_id=? AND enabled=1",
+                        (now_epoch + seconds, interactive_until, command_until, now_iso, now_iso, subscription_id),
+                    )
                 return {
                     "ok": True,
                     "subscription_id": subscription_id,
                     "profile": profile,
                     "protected_wait": True,
+                    "confirmation_window_reused": same_command_window,
                     "retry_after_seconds": max(1, int(current_next - now_epoch)),
                 }
             if profile == "command":
-                cursor = db.execute(
-                    "UPDATE subscriptions SET status='waiting', next_run_at=?, active_until=MAX(active_until, ?), "
-                    "interactive_until=MAX(interactive_until, ?), command_until=?, command_key=?, command_vehicle_id=?, "
-                    "command_context_json=?, command_poll_count=0, command_started_at=?, "
-                    "last_presence_at=?, last_error=NULL, updated_at=? WHERE subscription_id=? AND enabled=1",
-                    (
-                        next_run,
-                        now_epoch + seconds,
-                        interactive_until,
-                        command_until,
-                        command_key or None,
-                        command_vehicle_id or None,
-                        command_context_json,
-                        now_epoch,
-                        now_iso,
-                        now_iso,
-                        subscription_id,
-                    ),
-                )
+                if same_command_window:
+                    cursor = db.execute(
+                        "UPDATE subscriptions SET status='waiting',next_run_at=?,active_until=MAX(active_until,?),"
+                        "command_until=MAX(command_until,?),last_presence_at=?,last_error=NULL,updated_at=? "
+                        "WHERE subscription_id=? AND enabled=1",
+                        (
+                            next_run,
+                            now_epoch + seconds,
+                            command_until,
+                            now_iso,
+                            now_iso,
+                            subscription_id,
+                        ),
+                    )
+                else:
+                    cursor = db.execute(
+                        "UPDATE subscriptions SET status='waiting', next_run_at=?, active_until=MAX(active_until, ?), "
+                        "interactive_until=MAX(interactive_until, ?), command_until=?, command_key=?, command_vehicle_id=?, "
+                        "command_context_json=?, command_poll_count=0, command_started_at=?, "
+                        "last_presence_at=?, last_error=NULL, updated_at=? WHERE subscription_id=? AND enabled=1",
+                        (
+                            next_run,
+                            now_epoch + seconds,
+                            interactive_until,
+                            command_until,
+                            command_key or None,
+                            command_vehicle_id or None,
+                            command_context_json,
+                            now_epoch,
+                            now_iso,
+                            now_iso,
+                            subscription_id,
+                        ),
+                    )
             elif profile == "interactive":
                 cursor = db.execute(
                     "UPDATE subscriptions SET status='waiting', next_run_at=?, active_until=MAX(active_until, ?), "
@@ -1768,6 +1937,7 @@ class TelemetryEngine:
             "profile": profile,
             "interactive": profile in {"interactive", "command"},
             "command_confirmation": profile == "command",
+            "confirmation_window_reused": same_command_window if profile == "command" else False,
             "adaptive_polling": profile == "command",
             "poll_schedule_seconds": list(self.command_cadence) if profile == "command" else [self.interactive_seconds],
             "max_command_polls": self.command_max_polls if profile == "command" else None,
@@ -1958,7 +2128,7 @@ class TelemetryEngine:
         self.storage_next_log_at = 0.0
 
     def _run(self) -> None:
-        """Escalonador. A coleta em si vai para o pool; a entrega tem thread própria."""
+        """Escalonador. A coleta vai para o pool; a entrega tem thread própria."""
         while not self.stop_event.is_set():
             did_work = False
             storage_wait: float | None = None
@@ -3215,8 +3385,7 @@ class TelemetryEngine:
             # 1.12.50 — o teto anterior de 1800s deixava a telemetria de um
             # usuário muda por meia hora depois de duas lentidões da hospedagem.
             # A fila é persistente e o event_id é idempotente; repetir em até 2min
-            # não duplica nada e não custa nenhuma chamada à nuvem Leapmotor,
-            # porque esta entrega é Gateway -> site.
+            # não duplica nada e não custa chamada à nuvem Leapmotor.
             delay = min(120, max(10, 5 * (2 ** min(attempts, 5)))) + random.uniform(0, 5)
             updates.append((attempts, now + delay, str(message)[:500], str(row["event_id"])))
         with self.lock, self._db() as db:
@@ -3256,15 +3425,12 @@ class TelemetryEngine:
         for subscription_id in stale_sessions:
             self._close_session(subscription_id)
 
+
     def _maintenance(self) -> None:
         now_epoch = time.time()
         # A expiração de sessão é barata e precisa continuar acontecendo em todo
         # ciclo. Só a retenção da fila, que toca o disco, entra no throttle.
         self._expire_idle_sessions(now_epoch)
-        # 1.12.50 — antes rodava a cada volta do laço (até 2x/s), com SELECT,
-        # DELETE e COUNT(*) na tabela events inteira. Em disco mecânico isso
-        # mantinha a cabeça do disco ocupada sem necessidade: a retenção é
-        # diária e um minuto é folgado.
         if now_epoch - self._maintenance_last_at < 60.0:
             return
         self._maintenance_last_at = now_epoch

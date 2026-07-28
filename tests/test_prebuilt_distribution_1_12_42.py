@@ -7,7 +7,7 @@ config = yaml.safe_load((APP / 'config.yaml').read_text(encoding='utf-8'))
 target = (APP / 'RELEASE_TARGET').read_text(encoding='utf-8').strip()
 build = (ROOT / '.github/workflows/build.yml').read_text(encoding='utf-8')
 assert target == '1.12.50'
-assert config['version'] in {'1.12.47', '1.12.50'}
+assert config['version'] in {'1.12.48', '1.12.50'}
 assert config['image'] == 'ghcr.io/jorgemartim/leaphub-gateway'
 assert 'Smoke test exact published image while authenticated' in build
 assert 'import gateway_manager' not in build

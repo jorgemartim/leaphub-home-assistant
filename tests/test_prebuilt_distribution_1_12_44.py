@@ -4,7 +4,7 @@ ROOT=Path(__file__).resolve().parents[1]
 config=yaml.safe_load((ROOT/'leaphub_gateway'/'config.yaml').read_text())
 target=(ROOT/'leaphub_gateway'/'RELEASE_TARGET').read_text().strip()
 ocpp=(ROOT/'leaphub_gateway'/'ocpp_gateway.py').read_text()
-assert config['version'] in {'1.12.47','1.12.50'}
+assert config['version'] in {'1.12.48','1.12.50'}
 assert target=='1.12.50'
 assert 'CREATE TABLE IF NOT EXISTS queue_scheduler_state' in ocpp
 assert 'persistent_round_robin' in ocpp

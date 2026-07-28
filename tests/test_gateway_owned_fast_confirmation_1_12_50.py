@@ -71,6 +71,7 @@ def command_payload(request_id: str = "request-fast-confirmation-150") -> dict:
 
 def close_engine(engine) -> None:
     engine.sessions.clear()
+    engine.close_storage()
     if engine._instance_lock_handle is not None:
         engine._instance_lock_handle.close()
 

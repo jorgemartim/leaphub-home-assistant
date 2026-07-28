@@ -8,7 +8,7 @@ CONFIG = yaml.safe_load((ROOT / 'leaphub_gateway/config.yaml').read_text(encodin
 CHANGELOG = (ROOT / 'leaphub_gateway/CHANGELOG.md').read_text(encoding='utf-8')
 
 checks = {
-    'version': CONFIG.get('version') in {'1.12.47', '1.12.50'},
+    'version': CONFIG.get('version') in {'1.12.48', '1.12.50'},
     'prebuilt_image': CONFIG.get('image') == 'ghcr.io/jorgemartim/leaphub-gateway',
     'amd64_only': CONFIG.get('arch') == ['amd64'],
     'single_build_job': 'Build image first, publish App version last' in BUILD and 'matrix:' not in BUILD,

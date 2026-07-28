@@ -6,7 +6,7 @@ ROOT = Path(__file__).resolve().parents[1]
 APP = ROOT / "leaphub_gateway"
 
 config = yaml.safe_load((APP / "config.yaml").read_text(encoding="utf-8"))
-assert config["version"] in {"1.12.47", "1.12.50"}
+assert config["version"] in {"1.12.48", "1.12.50"}
 assert config["image"] == "ghcr.io/jorgemartim/leaphub-gateway"
 assert config["arch"] == ["amd64"]
 

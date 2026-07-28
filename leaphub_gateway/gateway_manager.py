@@ -391,9 +391,6 @@ def write_connector_options() -> Path:
         "telemetry_presence_window_seconds": int(OPTIONS.get("telemetry_presence_window_seconds") or 420),
         "telemetry_rate_limit_cooldown_seconds": int(OPTIONS.get("telemetry_rate_limit_cooldown_seconds") or 900),
         "telemetry_request_timeout_seconds": int(OPTIONS.get("telemetry_request_timeout_seconds") or 15),
-        # 1.12.50 — coletas simultâneas de contas diferentes. O teto real continua
-        # sendo connector_max_parallel; contas iguais seguem serializadas pela
-        # trava por conta e pela trava de sessão.
         "telemetry_poll_workers": max(1, min(6, int(OPTIONS.get("telemetry_poll_workers") or 3))),
         "telemetry_session_idle_seconds": int(OPTIONS.get("telemetry_session_idle_seconds") or 21600),
         "telemetry_vehicle_list_cache_seconds": int(OPTIONS.get("telemetry_vehicle_list_cache_seconds") or 1800),

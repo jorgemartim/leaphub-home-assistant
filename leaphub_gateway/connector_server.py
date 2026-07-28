@@ -941,9 +941,9 @@ def run_command_job(
             "connector_slot_ms": int(round((slot_acquired_at - account_acquired_at) * 1000)),
             "remote_execute_ms": int(round((execute_finished_at - execute_started_at) * 1000)),
             "total_ms": int(round((execute_finished_at - queue_started) * 1000)),
-            # 1.12.50 — estas duas fases existiam mas não eram medidas. Sem elas,
-            # a soma das fases não fechava com remote_execute_ms e a maior parte
-            # do tempo de um comando ficava invisível no log.
+            # 1.12.50 - estas duas fases existiam mas nao eram medidas. Sem elas
+            # a soma das fases nao fechava com remote_execute_ms e a maior parte
+            # do tempo de um comando ficava invisivel no log.
             "session_wait_ms": int(phase_latency.get("session_wait_ms") or 0),
             "session_login_ms": int(phase_latency.get("session_login_ms") or 0),
             "session_prepare_ms": int(phase_latency.get("session_prepare_ms") or 0),
@@ -999,7 +999,7 @@ def run_command_job(
         )
         remote_summary_text = connector.clean_message(remote_summary_text)[:320]
         LOG.info(
-            "Comando remoto %s finalizado no worker para %s; resultado=%s, espera_fila=%ss, latência_conta=%sms, vaga_connector=%sms, espera_sessao=%sms, login=%sms, preparo_sessao=%sms, dispatch=%sms, verificacao=%sms, nao_atribuido=%sms, execução_remota=%sms, total=%sms, tentativas=%s, despertar_real=%s, repetição_segura=%s, estratégia=%s, confirmado_direto=%s, confirmação_pendente=%s, motivo=%s, ack=%s, resultado_remoto=%s, evidencia=%s, sinal=%s, resumo=%s.",
+            "Comando remoto %s finalizado no worker para %s; resultado=%s, espera_fila=%ss, latência_conta=%sms, vaga_connector=%sms, espera_sessao=%sms, login=%sms, preparo_sessao=%sms, dispatch=%sms, verificacao=%sms, nao_atribuido=%sms, execução_remota=%sms, total=%sms, tentativas=%s, despertar_real=%s, repetição_segura=%s, estratégia=%s, confirmado_direto=%s, confirmação_pendente=%s, fast_interno=%s, janela_reutilizada=%s, motivo=%s, ack=%s, resultado_remoto=%s, evidencia=%s, sinal=%s, resumo=%s.",
             str(payload.get("command") or "desconhecido")[:40],
             environment,
             str(result.get("final_outcome") or ("confirmed" if result.get("verified_by_gateway") else "confirmation_pending"))[:40],
@@ -1020,6 +1020,8 @@ def run_command_job(
             str(result.get("safe_retry_strategy") or "none")[:48],
             bool(result.get("verified_by_gateway")),
             bool(result.get("confirmation_pending")),
+            bool(result.get("confirmation_armed_by_gateway")),
+            bool(result.get("confirmation_window_reused")),
             str(result.get("confirmation_reason") or "none")[:48],
             str(result.get("dispatch_ack") or "unknown")[:48],
             str(result.get("remote_result_status") or "unknown")[:48],

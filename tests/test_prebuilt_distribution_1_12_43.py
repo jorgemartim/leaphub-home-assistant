@@ -11,7 +11,7 @@ ocpp = (APP / "ocpp_gateway.py").read_text(encoding="utf-8")
 manager = (APP / "gateway_manager.py").read_text(encoding="utf-8")
 
 assert target == "1.12.50"
-assert config["version"] in {"1.12.47", "1.12.50"}
+assert config["version"] in {"1.12.48", "1.12.50"}
 assert config["image"] == "ghcr.io/jorgemartim/leaphub-gateway"
 assert re.findall(r"^##\s+(.+)$", (APP / "CHANGELOG.md").read_text(encoding="utf-8"), re.M) == ["1.12.50"]
 assert "CREATE TABLE IF NOT EXISTS queue_owners" in ocpp

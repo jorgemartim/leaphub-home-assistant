@@ -43,6 +43,7 @@ def new_engine(base: Path, options: dict | None = None):
 
 def close_engine(engine) -> None:
     engine.close_storage()
+    engine.close_storage()
     if engine._instance_lock_handle is not None:
         engine._instance_lock_handle.close()
 
