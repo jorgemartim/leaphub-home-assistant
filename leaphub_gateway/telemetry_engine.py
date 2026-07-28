@@ -52,7 +52,34 @@ except ModuleNotFoundError:
         EVENT_TRANSPORT = _event_transport_module.EVENT_TRANSPORT
 
 LOG = logging.getLogger("leaphub.telemetry")
-ENGINE_VERSION = "1.12.49"  # sessão saudável preservada em upsert verificado
+ENGINE_VERSION = "1.12.50"  # confirmação FAST armada pelo próprio Gateway
+
+TELEMETRY_CONFIRMABLE_COMMANDS = frozenset({
+    "lock",
+    "unlock",
+    "climate_on",
+    "climate_off",
+    "quick_cool",
+    "quick_heat",
+    "windshield_defrost",
+    "battery_preheat_on",
+    "battery_preheat_off",
+    "steering_wheel_heat_on",
+    "steering_wheel_heat_off",
+    "rearview_mirror_heat_on",
+    "rearview_mirror_heat_off",
+    "trunk_open",
+    "trunk_close",
+    "sunshade_open",
+    "sunshade_close",
+    "windows_open",
+    "windows_close",
+    "sentry_on",
+    "sentry_off",
+    "start_charging",
+    "stop_charging",
+    "set_charge_limit",
+})
 
 
 def utc_iso() -> str:
@@ -1160,6 +1187,7 @@ class TelemetryEngine:
                 session["last_used_at"] = time.time()
                 self.record_account_auth_success(environment, account_id, "command_session")
                 result["session_retained_for_fast_confirmation"] = True
+                self._arm_command_confirmation(subscription_id, payload, result)
                 return result
             except Exception as exc:
                 session["last_used_at"] = time.time()
@@ -1206,12 +1234,70 @@ class TelemetryEngine:
                     recovered["session_recovered"] = True
                     recovered["session_reused"] = True
                     recovered["session_retained_for_fast_confirmation"] = True
+                    self._arm_command_confirmation(subscription_id, payload, recovered)
                     return recovered
                 if isinstance(exc, connector.ConnectorLoginCooldownError):
                     self._set_account_login_cooldown(environment, account_id, exc.retry_after_seconds, str(exc))
                 if connector.is_authentication_error(exc):
                     self._close_session_locked(subscription_id)
                 raise
+
+    def _arm_command_confirmation(
+        self,
+        subscription_id: str,
+        payload: dict[str, Any],
+        result: dict[str, Any],
+    ) -> None:
+        """Arm FAST telemetry before the site starts polling command status.
+
+        The command worker already knows the exact subscription, remote vehicle
+        and immutable request id. Persisting that context here removes the
+        dependency on a later PHP worker round-trip. The site may repeat the
+        boost as a recovery signal; ``boost`` preserves an active window for the
+        same request instead of resetting its samples.
+        """
+        command = str(payload.get("command") or "").strip().lower()
+        if (
+            command not in TELEMETRY_CONFIRMABLE_COMMANDS
+            or not bool(result.get("confirmation_pending"))
+            or not bool(result.get("command_dispatched") or result.get("cloud_accepted"))
+        ):
+            result["confirmation_armed_by_gateway"] = False
+            return
+
+        context = {
+            "command_key": command,
+            "command_id": 0,
+            "vehicle_remote_id": str(payload.get("vehicle_id") or "").strip()[:190],
+            "parameters": payload.get("parameters") if isinstance(payload.get("parameters"), dict) else {},
+            "request_id": str(payload.get("request_id") or "").strip()[:96],
+        }
+        try:
+            armed = self.boost(
+                subscription_id,
+                seconds=180,
+                profile="command",
+                context=context,
+            )
+            result["confirmation_armed_by_gateway"] = bool(armed.get("ok"))
+            result["confirmation_window_reused"] = bool(armed.get("confirmation_window_reused"))
+            if not armed.get("ok"):
+                LOG.warning(
+                    "Comando %s foi aceito, mas a janela FAST interna de %s não pôde ser armada: %s",
+                    command,
+                    subscription_id,
+                    connector.clean_message(str(armed.get("message") or "indisponível")),
+                )
+        except Exception as exc:  # noqa: BLE001
+            # A ação física já foi aceita. Uma falha local ao armar a leitura
+            # não transforma sucesso remoto em erro nem autoriza reenvio.
+            result["confirmation_armed_by_gateway"] = False
+            LOG.warning(
+                "Comando %s foi aceito, mas a janela FAST interna de %s será recuperada pelo site: %s",
+                command,
+                subscription_id,
+                connector.clean_message(str(exc)),
+            )
 
     def invalidate_account_session(self, environment: str, payload: dict[str, Any]) -> int:
         """Feche a sessão automática antes de uma operação manual da conta.
@@ -1538,7 +1624,9 @@ class TelemetryEngine:
         now_iso = utc_iso()
         with self.lock, self._db() as db:
             row = db.execute(
-                "SELECT auth_required, cooldown_until, cooldown_reason, enabled, next_run_at, status FROM subscriptions WHERE subscription_id=? LIMIT 1",
+                "SELECT auth_required, cooldown_until, cooldown_reason, enabled, next_run_at, status,"
+                "command_until,command_key,command_vehicle_id,command_context_json,command_poll_count,command_started_at "
+                "FROM subscriptions WHERE subscription_id=? LIMIT 1",
                 (subscription_id,),
             ).fetchone()
             if row is None or int(row["enabled"] or 0) != 1:
@@ -1566,39 +1654,93 @@ class TelemetryEngine:
             next_run = current_next if protected_wait else (min(current_next, requested_next) if current_next > now_epoch else requested_next)
             interactive_until = now_epoch + seconds if profile == "interactive" else 0.0
             command_until = now_epoch + seconds if profile == "command" else 0.0
-            if protected_wait:
-                cursor = db.execute(
-                    "UPDATE subscriptions SET active_until=MAX(active_until,?),interactive_until=MAX(interactive_until,?),"
-                    "command_until=MAX(command_until,?),last_presence_at=?,updated_at=? WHERE subscription_id=? AND enabled=1",
-                    (now_epoch + seconds, interactive_until, command_until, now_iso, now_iso, subscription_id),
+            existing_context: dict[str, Any] = {}
+            try:
+                parsed_context = json.loads(str(row["command_context_json"] or "{}"))
+                if isinstance(parsed_context, dict):
+                    existing_context = parsed_context
+            except (TypeError, ValueError, json.JSONDecodeError):
+                existing_context = {}
+            requested_request_id = str(safe_context.get("request_id") or "")
+            existing_request_id = str(existing_context.get("request_id") or "")
+            same_command_window = (
+                profile == "command"
+                and float(row["command_until"] or 0) > now_epoch
+                and str(row["command_key"] or "") == command_key
+                and str(row["command_vehicle_id"] or "") == command_vehicle_id
+                and (
+                    requested_request_id == existing_request_id
+                    or (not requested_request_id and bool(existing_request_id))
                 )
+            )
+            if protected_wait:
+                if profile == "command" and not same_command_window:
+                    cursor = db.execute(
+                        "UPDATE subscriptions SET active_until=MAX(active_until,?),"
+                        "command_until=MAX(command_until,?),command_key=?,command_vehicle_id=?,command_context_json=?,"
+                        "command_poll_count=0,command_started_at=?,last_presence_at=?,updated_at=? "
+                        "WHERE subscription_id=? AND enabled=1",
+                        (
+                            now_epoch + seconds,
+                            command_until,
+                            command_key or None,
+                            command_vehicle_id or None,
+                            command_context_json,
+                            now_epoch,
+                            now_iso,
+                            now_iso,
+                            subscription_id,
+                        ),
+                    )
+                else:
+                    cursor = db.execute(
+                        "UPDATE subscriptions SET active_until=MAX(active_until,?),interactive_until=MAX(interactive_until,?),"
+                        "command_until=MAX(command_until,?),last_presence_at=?,updated_at=? WHERE subscription_id=? AND enabled=1",
+                        (now_epoch + seconds, interactive_until, command_until, now_iso, now_iso, subscription_id),
+                    )
                 return {
                     "ok": True,
                     "subscription_id": subscription_id,
                     "profile": profile,
                     "protected_wait": True,
+                    "confirmation_window_reused": same_command_window,
                     "retry_after_seconds": max(1, int(current_next - now_epoch)),
                 }
             if profile == "command":
-                cursor = db.execute(
-                    "UPDATE subscriptions SET status='waiting', next_run_at=?, active_until=MAX(active_until, ?), "
-                    "interactive_until=MAX(interactive_until, ?), command_until=?, command_key=?, command_vehicle_id=?, "
-                    "command_context_json=?, command_poll_count=0, command_started_at=?, "
-                    "last_presence_at=?, last_error=NULL, updated_at=? WHERE subscription_id=? AND enabled=1",
-                    (
-                        next_run,
-                        now_epoch + seconds,
-                        interactive_until,
-                        command_until,
-                        command_key or None,
-                        command_vehicle_id or None,
-                        command_context_json,
-                        now_epoch,
-                        now_iso,
-                        now_iso,
-                        subscription_id,
-                    ),
-                )
+                if same_command_window:
+                    cursor = db.execute(
+                        "UPDATE subscriptions SET status='waiting',next_run_at=?,active_until=MAX(active_until,?),"
+                        "command_until=MAX(command_until,?),last_presence_at=?,last_error=NULL,updated_at=? "
+                        "WHERE subscription_id=? AND enabled=1",
+                        (
+                            next_run,
+                            now_epoch + seconds,
+                            command_until,
+                            now_iso,
+                            now_iso,
+                            subscription_id,
+                        ),
+                    )
+                else:
+                    cursor = db.execute(
+                        "UPDATE subscriptions SET status='waiting', next_run_at=?, active_until=MAX(active_until, ?), "
+                        "interactive_until=MAX(interactive_until, ?), command_until=?, command_key=?, command_vehicle_id=?, "
+                        "command_context_json=?, command_poll_count=0, command_started_at=?, "
+                        "last_presence_at=?, last_error=NULL, updated_at=? WHERE subscription_id=? AND enabled=1",
+                        (
+                            next_run,
+                            now_epoch + seconds,
+                            interactive_until,
+                            command_until,
+                            command_key or None,
+                            command_vehicle_id or None,
+                            command_context_json,
+                            now_epoch,
+                            now_iso,
+                            now_iso,
+                            subscription_id,
+                        ),
+                    )
             elif profile == "interactive":
                 cursor = db.execute(
                     "UPDATE subscriptions SET status='waiting', next_run_at=?, active_until=MAX(active_until, ?), "
@@ -1620,6 +1762,7 @@ class TelemetryEngine:
             "profile": profile,
             "interactive": profile in {"interactive", "command"},
             "command_confirmation": profile == "command",
+            "confirmation_window_reused": same_command_window if profile == "command" else False,
             "adaptive_polling": profile == "command",
             "poll_schedule_seconds": list(self.command_cadence) if profile == "command" else [self.interactive_seconds],
             "max_command_polls": self.command_max_polls if profile == "command" else None,

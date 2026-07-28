@@ -65,7 +65,7 @@ except ModuleNotFoundError:
         _event_transport_spec.loader.exec_module(_event_transport_module)
         EVENT_TRANSPORT = _event_transport_module.EVENT_TRANSPORT
 
-VERSION = "1.12.49"
+VERSION = "1.12.50"
 API_VERSION = 2
 CAPABILITY_SCHEMA_VERSION = 1
 MIN_SUPPORTED_CLIENT_API_VERSION = 1
@@ -987,7 +987,7 @@ def run_command_job(
         )
         remote_summary_text = connector.clean_message(remote_summary_text)[:320]
         LOG.info(
-            "Comando remoto %s finalizado no worker para %s; resultado=%s, espera_fila=%ss, latência_conta=%sms, vaga_connector=%sms, preparo_sessao=%sms, dispatch=%sms, verificacao=%sms, execução_remota=%sms, total=%sms, tentativas=%s, despertar_real=%s, repetição_segura=%s, estratégia=%s, confirmado_direto=%s, confirmação_pendente=%s, motivo=%s, ack=%s, resultado_remoto=%s, evidencia=%s, sinal=%s, resumo=%s.",
+            "Comando remoto %s finalizado no worker para %s; resultado=%s, espera_fila=%ss, latência_conta=%sms, vaga_connector=%sms, preparo_sessao=%sms, dispatch=%sms, verificacao=%sms, execução_remota=%sms, total=%sms, tentativas=%s, despertar_real=%s, repetição_segura=%s, estratégia=%s, confirmado_direto=%s, confirmação_pendente=%s, fast_interno=%s, janela_reutilizada=%s, motivo=%s, ack=%s, resultado_remoto=%s, evidencia=%s, sinal=%s, resumo=%s.",
             str(payload.get("command") or "desconhecido")[:40],
             environment,
             str(result.get("final_outcome") or ("confirmed" if result.get("verified_by_gateway") else "confirmation_pending"))[:40],
@@ -1005,6 +1005,8 @@ def run_command_job(
             str(result.get("safe_retry_strategy") or "none")[:48],
             bool(result.get("verified_by_gateway")),
             bool(result.get("confirmation_pending")),
+            bool(result.get("confirmation_armed_by_gateway")),
+            bool(result.get("confirmation_window_reused")),
             str(result.get("confirmation_reason") or "none")[:48],
             str(result.get("dispatch_ack") or "unknown")[:48],
             str(result.get("remote_result_status") or "unknown")[:48],

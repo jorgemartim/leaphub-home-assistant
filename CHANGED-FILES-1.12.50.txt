@@ -1,9 +1,10 @@
-CHANGED-FILES-1.12.49.txt
-GITHUB-RECOVERY-1.12.49.md
-RELEASE-1.12.49.md
-UPLOAD-1.12.49.md
+Gateway 1.12.50 — arquivos alterados sobre a base 1.12.49
+
+GITHUB-RECOVERY-1.12.50.md
+RELEASE-1.12.50.md
+UPLOAD-1.12.50.md
 leaphub_gateway/CHANGELOG.md
-leaphub_gateway/RELEASE-1.12.49.md
+leaphub_gateway/RELEASE-1.12.50.md
 leaphub_gateway/RELEASE_TARGET
 leaphub_gateway/connector.py
 leaphub_gateway/connector_server.py
@@ -21,6 +22,7 @@ tests/test_contracts.py
 tests/test_event_transport_1_12_30.py
 tests/test_fast_install_1_12_18.py
 tests/test_full_resilience_1_12_16.py
+tests/test_gateway_owned_fast_confirmation_1_12_50.py
 tests/test_manual_command_priority_1_12_23.py
 tests/test_manual_preemption_1_12_28.py
 tests/test_ocpp_delivery_policy_1_12_41.py
@@ -43,4 +45,5 @@ tests/test_sentry_evidence_1_12_27.py
 tests/test_sentry_experimental_1_12_25.py
 tests/test_single_ocpp_1_12_17.py
 tests/test_status_delivery_1_12_21.py
-tests/test_verified_upsert_session_1_12_49.py
+
+Sem exclusões. config.yaml permanece na versão publicada e não integra este delta.

@@ -128,4 +128,4 @@ with tempfile.TemporaryDirectory(prefix="leaphub-background-off-") as tmp:
         engine._instance_lock_handle.close()
 
 
-print({"ok": True, "checks": 12, "version": "1.12.49"})
+print({"ok": True, "checks": 12, "version": "1.12.50"})
