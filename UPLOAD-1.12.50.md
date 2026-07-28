@@ -1,6 +1,6 @@
 # Upload 1.12.50
 
-Envie **todos** os arquivos listados em `CHANGED-FILES-1.12.50.txt` para a `main`. São 55, e a maior
+Envie **todos** os arquivos listados em `CHANGED-FILES-1.12.50.txt` para a `main`. São 53, e a maior
 parte existe só para satisfazer o `validate_repository.py` — se faltar qualquer um, o job
 `Validate staged repository` falha antes de compilar.
 
@@ -21,19 +21,32 @@ acesso público à imagem GHCR.
 
 ## Verificação já feita
 
-O `validate_repository.py` foi executado contra este pacote e **passou em todas as checagens
-estáticas**: versão-alvo nos seis módulos, contrato de fallback do WAL, heading único do CHANGELOG,
-arquivos obrigatórios, marcadores do `build.yml`, `image`/`arch`/segredos vazios do `config.yaml` e
-`compileall` limpo.
+O `.github/scripts/validate_repository.py` foi executado de ponta a ponta contra este pacote, com as
+mesmas dependências do CI (`pyyaml`, `pytest 9.1.1`, `Pillow`, `leapmotor-api 0.3.2`) e terminou em:
 
-A suíte `tests/` roda com **65 passando** contra 58 do baseline 1.12.49 (os 7 novos são o
-`test_storage_throughput_1_12_50.py`). O único teste que falha —
-`test_ocpp_sqlite_single_writer_1_12_45` — falha **igual no 1.12.49 original**, é anterior a esta
-release e só se manifesta em Windows.
+```
+Repositório válido. Gateway alvo 1.12.50; App 1.12.48 (staged; imagem ainda não anunciada).
+```
 
-Três arquivos abortam a coleta em Windows por `PermissionError`/`fcntl` e também abortam no
-baseline: `test_connection_resilience_1_12_15`, `test_open_door_visual_1_12_39` e
-`test_resilience_1_12_14`. No runner Linux do CI isso não acontece.
+| Suíte | 1.12.49 baseline | 1.12.50 |
+|---|---|---|
+| `tests/` | 61 passando | **69 passando** |
+| `leaphub_gateway/tests/` | 5 passando | **5 passando** |
+
+Os 8 testes a mais são o `test_storage_throughput_1_12_50.py`.
+
+## Uma regressão que o CI pegou e vale conhecer
+
+A primeira versão do throttle do `_maintenance()` saía do método **antes** da varredura de sessões.
+Resultado: uma sessão Leapmotor realmente inativa deixava de ser descartada enquanto a janela de um
+minuto não vencesse, e o `test_resilience_1_12_14` reprovou com "Sessão realmente inativa não foi
+descartada".
+
+A correção separa as duas coisas: `_expire_idle_sessions()` roda em **todo** ciclo, porque é uma
+varredura em memória e é ela que devolve o cliente após a inatividade real; só a retenção da fila,
+que toca o disco, entra no throttle de 60s. O `test_storage_throughput_1_12_50.py` ganhou o
+`test_maintenance_throttle_never_delays_session_expiry`, que reprova se alguém voltar a colocar a
+expiração atrás do throttle.
 
 ## Uma mudança de ciclo de vida que vale conhecer
 

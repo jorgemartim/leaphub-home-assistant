@@ -116,6 +116,43 @@ def test_maintenance_is_throttled():
             close_engine(engine)
 
 
+def test_maintenance_throttle_never_delays_session_expiry():
+    """O throttle vale só para a retenção da fila, nunca para a sessão.
+
+    Regressão de 1.12.50: a primeira versão do throttle saía do método antes da
+    varredura de sessões, e uma sessão realmente inativa deixava de ser
+    descartada enquanto a janela de um minuto não vencesse.
+    """
+    with tempfile.TemporaryDirectory(prefix="leaphub-idle-session-") as tmp:
+        engine = new_engine(Path(tmp))
+        try:
+            closed = {"count": 0}
+
+            class _Client:
+                def close(self) -> None:
+                    closed["count"] += 1
+
+            sid = "leaphub-staging-account-150"
+            engine.sessions[sid] = {
+                "client": _Client(),
+                "temp_dir": None,
+                "credential_hash": "hash",
+                "created_at": time.time(),
+                "last_used_at": time.time(),
+            }
+            # Consome a janela do throttle com uma manutenção recente.
+            engine._maintenance()
+            assert sid in engine.sessions
+
+            # Mesma janela, mas agora a sessão está inativa de verdade.
+            engine.sessions[sid]["last_used_at"] = time.time() - (engine.session_idle_seconds + 60)
+            engine._maintenance()
+            assert sid not in engine.sessions
+            assert closed["count"] == 1
+        finally:
+            close_engine(engine)
+
+
 def test_delivery_backoff_stays_under_two_minutes():
     """Uma lentidão da hospedagem não pode calar a telemetria por meia hora."""
     with tempfile.TemporaryDirectory(prefix="leaphub-backoff-") as tmp:

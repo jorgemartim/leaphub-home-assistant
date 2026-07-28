@@ -3241,8 +3241,26 @@ class TelemetryEngine:
                     (status, time.time() + delay, now, str(error or "")[:500] or None, now, subscription_id),
                 )
 
+    def _expire_idle_sessions(self, now_epoch: float) -> None:
+        """Descarta sessões por inatividade real, não pelo fim da janela de coleta.
+
+        Roda a cada ciclo: é uma varredura em memória, sem disco, e é ela que
+        devolve o cliente Leapmotor depois da inatividade. Nunca deve ficar
+        atrás do throttle da retenção da fila.
+        """
+        with self.session_lock:
+            stale_sessions = [
+                sid for sid, session in self.sessions.items()
+                if now_epoch - float(session.get("last_used_at") or 0) >= self.session_idle_seconds
+            ]
+        for subscription_id in stale_sessions:
+            self._close_session(subscription_id)
+
     def _maintenance(self) -> None:
         now_epoch = time.time()
+        # A expiração de sessão é barata e precisa continuar acontecendo em todo
+        # ciclo. Só a retenção da fila, que toca o disco, entra no throttle.
+        self._expire_idle_sessions(now_epoch)
         # 1.12.50 — antes rodava a cada volta do laço (até 2x/s), com SELECT,
         # DELETE e COUNT(*) na tabela events inteira. Em disco mecânico isso
         # mantinha a cabeça do disco ocupada sem necessidade: a retenção é
@@ -3275,12 +3293,3 @@ class TelemetryEngine:
                     "DELETE FROM events WHERE event_id IN (SELECT event_id FROM events WHERE status='delivered' ORDER BY delivered_at ASC LIMIT ?)",
                     (excess,),
                 )
-        # Sessões são descartadas somente por inatividade real, não pelo fim
-        # da janela de coleta. Isso evita relogins periódicos desnecessários.
-        with self.session_lock:
-            stale_sessions = [
-                sid for sid, session in self.sessions.items()
-                if now_epoch - float(session.get("last_used_at") or 0) >= self.session_idle_seconds
-            ]
-        for subscription_id in stale_sessions:
-            self._close_session(subscription_id)
