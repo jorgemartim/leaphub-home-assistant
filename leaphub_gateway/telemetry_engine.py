@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import http.client
 import hmac
 import json
 import logging
@@ -53,7 +54,7 @@ except ModuleNotFoundError:
         EVENT_TRANSPORT = _event_transport_module.EVENT_TRANSPORT
 
 LOG = logging.getLogger("leaphub.telemetry")
-ENGINE_VERSION = "1.12.50"  # confirmação FAST do Gateway, WAL, coleta paralela e entrega dedicada
+ENGINE_VERSION = "1.12.51"  # entrega com conexão reaproveitada e journal observável
 
 TELEMETRY_CONFIRMABLE_COMMANDS = frozenset({
     "lock",
@@ -183,6 +184,10 @@ class TelemetryEngine:
         self._inflight_guard = threading.RLock()
         self.delivery_event = threading.Event()
         self.delivery_worker: threading.Thread | None = None
+        # 1.12.51 — conexao TLS reaproveitada entre lotes de entrega.
+        self._delivery_connection: http.client.HTTPConnection | None = None
+        self._delivery_connection_key = ""
+        self._delivery_guard = threading.RLock()
         self.active_seconds = self._bounded("telemetry_active_seconds", 20, 15, 300)
         self.interactive_seconds = self._bounded("telemetry_interactive_seconds", 20, 15, 60)
         # Janela curta após comandos remotos. É propositalmente separada da
@@ -1512,6 +1517,7 @@ class TelemetryEngine:
             pool.shutdown(wait=True, cancel_futures=True)
         self._close_all_sessions()
         self.close_storage()
+        self._close_delivery_connection()
 
     def upsert(self, environment: str, payload: dict[str, Any]) -> dict[str, Any]:
         subscription_id = str(payload.get("subscription_id") or "").strip()[:190]
@@ -1955,6 +1961,23 @@ class TelemetryEngine:
             "retry_in_seconds": max(0, int(self.storage_next_retry_at - now)),
         }
 
+    def collection_status(self) -> dict[str, Any]:
+        """Saturação da coleta paralela, sem tocar no banco.
+
+        1.12.51 — diagnosticar a lentidão anterior exigiu ler o log linha a linha.
+        Estes três números respondem de imediato se as coletas estão enfileiradas
+        atrás dos workers e se o journal que ficou valendo é o esperado.
+        """
+        with self._inflight_guard:
+            in_flight = len(self._inflight)
+        return {
+            "poll_workers": int(self.poll_workers),
+            "polls_in_flight": in_flight,
+            "workers_saturated": in_flight >= int(self.poll_workers),
+            "delivery_connection_reused": self._delivery_connection is not None,
+            "journal_mode": self.storage_journal_mode,
+        }
+
     def status_fast(self) -> dict[str, Any]:
         """Bounded health snapshot that never holds Cloudflare health checks hostage."""
         acquired = self.lock.acquire(timeout=0.15)
@@ -1964,6 +1987,7 @@ class TelemetryEngine:
                 "busy": True,
                 "message": "Telemetria ocupada em uma coleta; armazenamento continua ativo.",
                 "storage": self.storage_status(),
+                "collection": self.collection_status(),
             }
         try:
             with self._db(0.2) as db:
@@ -1981,6 +2005,7 @@ class TelemetryEngine:
                 "enabled_subscriptions": int(row["enabled"] or 0),
                 "subscriptions_with_errors": int(row["errors"] or 0),
                 "pending_events": int(pending or 0),
+                "collection": self.collection_status(),
             }
         except (OSError, sqlite3.Error) as exc:
             return {
@@ -3333,28 +3358,21 @@ class TelemetryEngine:
         nonce = os.urandom(16).hex()
         canonical = f"POST\n{path}\n{timestamp}\n{nonce}\n{hashlib.sha256(body).hexdigest()}".encode()
         signature = hmac.new(secret.encode(), canonical, hashlib.sha256).hexdigest()
-        request = urllib.request.Request(
-            url,
-            data=body,
-            method="POST",
-            headers={
-                "Content-Type": "application/json",
-                "Accept": "application/json",
-                "User-Agent": f"LeapHubGateway/{ENGINE_VERSION}",
-                "X-LeapHub-Timestamp": timestamp,
-                "X-LeapHub-Nonce": nonce,
-                "X-LeapHub-Environment": environment,
-                "X-LeapHub-Signature": signature,
-            },
-        )
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": f"LeapHubGateway/{ENGINE_VERSION}",
+            "X-LeapHub-Timestamp": timestamp,
+            "X-LeapHub-Nonce": nonce,
+            "X-LeapHub-Environment": environment,
+            "X-LeapHub-Signature": signature,
+        }
         try:
             # 1.12.50 — o PHP da hospedagem compartilhada costuma ser encerrado
-            # por max_execution_time antes deste limite. Desistir primeiro devolve
+            # por max_execution_time antes do timeout. Desistir primeiro devolve
             # o lote à fila com backoff curto em vez de segurar a thread de
             # entrega num socket que já não tem ninguém do outro lado.
-            with urllib.request.urlopen(request, timeout=25) as response:
-                raw = response.read(2 * 1024 * 1024)
-                payload = json.loads(raw.decode("utf-8"))
+            payload = self._post_delivery(url, headers, body)
             if not isinstance(payload, dict):
                 raise RuntimeError("Resposta de entrega inválida.")
             by_id = {str(item.get("event_id")): item for item in (payload.get("results") or []) if isinstance(item, dict)}
@@ -3374,8 +3392,82 @@ class TelemetryEngine:
                     db.executemany("UPDATE subscriptions SET last_delivery_at=?, updated_at=? WHERE subscription_id=?", [(now, now, sid) for sid in subscription_ids])
             if failed_rows:
                 self._delivery_failed(failed_rows, "O site recusou parte do lote.")
-        except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, ValueError, RuntimeError, json.JSONDecodeError) as exc:
+        except (
+            urllib.error.URLError,
+            urllib.error.HTTPError,
+            http.client.HTTPException,
+            OSError,
+            TimeoutError,
+            ValueError,
+            RuntimeError,
+            json.JSONDecodeError,
+        ) as exc:
+            self._close_delivery_connection()
             self._delivery_failed(valid_rows, connector.clean_message(str(exc)))
+
+    def _post_delivery(self, url: str, headers: dict[str, str], body: bytes) -> Any:
+        """POST assinado ao site reaproveitando a conexão TLS entre lotes.
+
+        1.12.51 — cada lote abria uma conexão nova. Com o lote menor recomendado
+        para hospedagem compartilhada isso multiplicou os handshakes TLS saindo
+        de uma conexão residencial, e o handshake passou a custar mais que a
+        própria entrega. A conexão é usada apenas pela thread de entrega e é
+        descartada em qualquer erro de transporte, então nenhuma resposta pode
+        ser lida fora de ordem.
+        """
+        parsed = urllib.parse.urlparse(url)
+        host = parsed.hostname or ""
+        if not host:
+            raise RuntimeError("Destino de entrega sem host válido.")
+        target = parsed.path or "/"
+        if parsed.query:
+            target = f"{target}?{parsed.query}"
+        key = f"{parsed.scheme}://{host}:{parsed.port or ''}"
+
+        with self._delivery_guard:
+            connection = self._delivery_connection
+            if connection is not None and self._delivery_connection_key != key:
+                self._close_delivery_connection()
+                connection = None
+            if connection is None:
+                if parsed.scheme == "https":
+                    connection = http.client.HTTPSConnection(host, parsed.port, timeout=25)
+                elif parsed.scheme == "http":
+                    connection = http.client.HTTPConnection(host, parsed.port, timeout=25)
+                else:
+                    raise RuntimeError("Esquema de entrega não suportado.")
+                self._delivery_connection = connection
+                self._delivery_connection_key = key
+
+            request_headers = dict(headers)
+            request_headers["Content-Length"] = str(len(body))
+            request_headers.setdefault("Connection", "keep-alive")
+            try:
+                connection.request("POST", target, body=body, headers=request_headers)
+                response = connection.getresponse()
+                raw = response.read(2 * 1024 * 1024)
+                status = int(response.status)
+                if response.will_close:
+                    self._close_delivery_connection()
+            except Exception:
+                # Um socket meio-fechado nunca volta ao pool: a próxima entrega
+                # leria a resposta do lote anterior.
+                self._close_delivery_connection()
+                raise
+
+        if status < 200 or status >= 300:
+            raise RuntimeError(f"O site respondeu HTTP {status} à entrega de telemetria.")
+        return json.loads(raw.decode("utf-8"))
+
+    def _close_delivery_connection(self) -> None:
+        with self._delivery_guard:
+            connection, self._delivery_connection = self._delivery_connection, None
+            self._delivery_connection_key = ""
+        if connection is not None:
+            try:
+                connection.close()
+            except Exception:  # noqa: BLE001
+                pass
 
     def _delivery_failed(self, rows: list[sqlite3.Row], message: str) -> None:
         now = time.time()

@@ -81,10 +81,24 @@ import threading
 with tempfile.TemporaryDirectory() as temp_dir:
     os.environ['LEAPHUB_TELEMETRY_DIR'] = temp_dir
     engine = TelemetryEngine({}, {'staging': 'x' * 32, 'production': ''}, threading.BoundedSemaphore(1))
-    with sqlite3.connect(engine.db_path) as db:
-        journal = str(db.execute('PRAGMA journal_mode').fetchone()[0]).lower()
-    assert journal == 'delete', journal
+    # sqlite3.connect como context manager encerra a transacao, nao a conexao:
+    # sem o close explicito o arquivo da fila fica aberto ate o processo sair.
+    probe = sqlite3.connect(engine.db_path)
+    try:
+        journal = str(probe.execute('PRAGMA journal_mode').fetchone()[0]).lower()
+    finally:
+        probe.close()
+    # 1.12.51 — o journal deixou de ser fixo. O contrato agora e: WAL quando o
+    # volume aceita, DELETE quando nao aceita, e o motor precisa reportar o modo
+    # que realmente ficou valendo. Prender a imagem a um unico modo foi o que
+    # reprovou o build da 1.12.50 assim que o volume da imagem aceitou WAL.
+    assert journal in ('wal', 'delete'), journal
+    assert engine.storage_journal_mode == journal, (engine.storage_journal_mode, journal)
+    assert engine.storage_status()['journal_mode'] == journal
     assert engine.storage_status()['healthy'] is True
+    with engine.lock, engine._db() as db:
+        assert int(db.execute('SELECT COUNT(*) FROM subscriptions').fetchone()[0]) == 0
+    engine.close_storage()
 for module in ('connector_server', 'ocpp_gateway', 'gateway_manager'):
     spec = importlib.util.find_spec(module)
     if spec is None:
