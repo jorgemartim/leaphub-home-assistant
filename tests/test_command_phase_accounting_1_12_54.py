@@ -1,4 +1,4 @@
-"""Contrato 1.12.54 — as fases do comando precisam fechar `remote_execute_ms`.
+"""Contrato 1.12.55 — as fases do comando precisam fechar `remote_execute_ms`.
 
 Dois comandos de campo deixaram ~90s de 94s sem atribuição, com todas as fases
 medidas em zero e o dispatch em ~4s. A soma precisa ser fechável, senão a
@@ -86,5 +86,5 @@ def test_new_phases_reach_the_log_line():
 
 
 def test_version_follows_the_release():
-    assert 'ENGINE_VERSION = "1.12.54"' in ENGINE
-    assert 'CONNECTOR_VERSION = "1.12.54"' in CONNECTOR
+    assert 'ENGINE_VERSION = "1.12.55"' in ENGINE
+    assert 'CONNECTOR_VERSION = "1.12.55"' in CONNECTOR

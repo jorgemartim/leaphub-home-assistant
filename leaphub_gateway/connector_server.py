@@ -65,7 +65,7 @@ except ModuleNotFoundError:
         _event_transport_spec.loader.exec_module(_event_transport_module)
         EVENT_TRANSPORT = _event_transport_module.EVENT_TRANSPORT
 
-VERSION = "1.12.54"
+VERSION = "1.12.55"
 API_VERSION = 2
 CAPABILITY_SCHEMA_VERSION = 1
 MIN_SUPPORTED_CLIENT_API_VERSION = 1
@@ -949,11 +949,18 @@ def run_command_job(
             "session_prepare_ms": int(phase_latency.get("session_prepare_ms") or 0),
             "dispatch_ms": int(phase_latency.get("dispatch_ms") or 0),
             "verification_ms": int(phase_latency.get("verification_ms") or 0),
-            # 1.12.54 - as tres fases que faltavam para fechar remote_execute_ms.
+            # 1.12.55 - as tres fases que faltavam para fechar remote_execute_ms.
             # engine_precheck + session_wait + session_login + handle_command +
             # confirmation_arm cobrem o metodo inteiro; progress_ms e a quebra de
             # handle_command para o diario de progresso.
             "engine_precheck_ms": int(phase_latency.get("engine_precheck_ms") or 0),
+            # 1.12.55 - a quebra de engine_precheck_ms. Um comando de campo
+            # mediu 135718ms nele com todas as demais fases somando ~5s; as
+            # tres abaixo dizem qual das partes gastou. Vivem DENTRO de
+            # engine_precheck_ms, entao nao entram no calculo de nao atribuido.
+            "auth_status_ms": int(phase_latency.get("auth_status_ms") or 0),
+            "engine_lock_wait_ms": int(phase_latency.get("engine_lock_wait_ms") or 0),
+            "subscription_read_ms": int(phase_latency.get("subscription_read_ms") or 0),
             "handle_command_ms": int(phase_latency.get("handle_command_ms") or 0),
             "confirmation_arm_ms": int(phase_latency.get("confirmation_arm_ms") or 0),
             "progress_ms": int(phase_latency.get("progress_ms") or 0),
@@ -969,7 +976,7 @@ def run_command_job(
             "remote_result_ms": None,
             "remote_result_bundled_with_dispatch": True,
             "post_state_verify_ms": latency["verification_ms"],
-            # 1.12.54 - session_prepare/dispatch/verification/progress vivem
+            # 1.12.55 - session_prepare/dispatch/verification/progress vivem
             # DENTRO de handle_command_ms; somá-los aqui contaria duas vezes.
             "unaccounted_ms": max(0, latency["remote_execute_ms"] - (
                 latency["engine_precheck_ms"] + latency["session_wait_ms"]
@@ -1009,7 +1016,7 @@ def run_command_job(
         )
         remote_summary_text = connector.clean_message(remote_summary_text)[:320]
         LOG.info(
-            "Comando remoto %s finalizado no worker para %s; resultado=%s, espera_fila=%ss, latência_conta=%sms, vaga_connector=%sms, precheck_motor=%sms, espera_sessao=%sms, login=%sms, handle_command=%sms, arme_confirmacao=%sms, [preparo_sessao=%sms, dispatch=%sms, verificacao=%sms, progresso=%sms], nao_atribuido=%sms, execução_remota=%sms, total=%sms, tentativas=%s, despertar_real=%s, repetição_segura=%s, estratégia=%s, confirmado_direto=%s, confirmação_pendente=%s, fast_interno=%s, janela_reutilizada=%s, motivo=%s, ack=%s, resultado_remoto=%s, evidencia=%s, sinal=%s, resumo=%s.",
+            "Comando remoto %s finalizado no worker para %s; resultado=%s, espera_fila=%ss, latência_conta=%sms, vaga_connector=%sms, precheck_motor=%sms [status_conta=%sms, trava_motor=%sms, leitura_assinatura=%sms], espera_sessao=%sms, login=%sms, handle_command=%sms, arme_confirmacao=%sms, [preparo_sessao=%sms, dispatch=%sms, verificacao=%sms, progresso=%sms], nao_atribuido=%sms, execução_remota=%sms, total=%sms, tentativas=%s, despertar_real=%s, repetição_segura=%s, estratégia=%s, confirmado_direto=%s, confirmação_pendente=%s, fast_interno=%s, janela_reutilizada=%s, motivo=%s, ack=%s, resultado_remoto=%s, evidencia=%s, sinal=%s, resumo=%s.",
             str(payload.get("command") or "desconhecido")[:40],
             environment,
             str(result.get("final_outcome") or ("confirmed" if result.get("verified_by_gateway") else "confirmation_pending"))[:40],
@@ -1017,6 +1024,9 @@ def run_command_job(
             int(latency.get("account_wait_ms") or 0),
             int(latency.get("connector_slot_ms") or 0),
             int(latency.get("engine_precheck_ms") or 0),
+            int(latency.get("auth_status_ms") or 0),
+            int(latency.get("engine_lock_wait_ms") or 0),
+            int(latency.get("subscription_read_ms") or 0),
             int(latency.get("session_wait_ms") or 0),
             int(latency.get("session_login_ms") or 0),
             int(latency.get("handle_command_ms") or 0),

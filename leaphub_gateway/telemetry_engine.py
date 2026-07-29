@@ -54,7 +54,7 @@ except ModuleNotFoundError:
         EVENT_TRANSPORT = _event_transport_module.EVENT_TRANSPORT
 
 LOG = logging.getLogger("leaphub.telemetry")
-ENGINE_VERSION = "1.12.54"  # fases do comando remoto fecham a soma de remote_execute_ms
+ENGINE_VERSION = "1.12.55"  # precheck do comando quebrado em tres e com teto na trava
 
 # Hospedagem compartilhada (Apache/LiteSpeed) fecha a conexão ociosa em poucos
 # segundos. Reaproveitar depois disso escreve num socket já fechado e devolve
@@ -62,6 +62,14 @@ ENGINE_VERSION = "1.12.54"  # fases do comando remoto fecham a soma de remote_ex
 DELIVERY_IDLE_DEFAULT_SECONDS = 5.0
 DELIVERY_IDLE_MIN_SECONDS = 2.0
 DELIVERY_IDLE_MAX_SECONDS = 30.0
+
+# 1.12.55 — teto para o comando esperar a trava global do motor. `with self.lock`
+# no caminho do comando era a única aquisição sem limite do arquivo; compare com
+# `self.lock.acquire(timeout=0.15)` e `account_lock.acquire(timeout=...)`. Um
+# comando de campo mediu precheck_motor=135718ms com todas as demais fases
+# somando ~5s. Sem teto, trava presa e leitura lenta são indistinguíveis e o
+# dono fica dois minutos olhando a tela sem resposta.
+ENGINE_LOCK_COMMAND_TIMEOUT_SECONDS = 20.0
 
 TELEMETRY_CONFIRMABLE_COMMANDS = frozenset({
     "lock",
@@ -1290,18 +1298,38 @@ class TelemetryEngine:
         if account_id < 1:
             return connector.handle_command(payload, progress=progress)
 
-        # 1.12.54 — nada entre a entrada do método e a trava de sessão tinha
+        # 1.12.55 — nada entre a entrada do método e a trava de sessão tinha
         # contador. Com session_wait/login/prepare/verification todos em 0 e o
         # dispatch em ~4s, comandos de 94s deixavam 90s sem atribuição nenhuma.
         engine_started = time.monotonic()
         self.assert_account_cloud_allowed(environment, account_id, "command")
-        with self.lock, self._db() as db:
-            row = db.execute(
-                "SELECT subscription_id,cooldown_until,status FROM subscriptions "
-                "WHERE environment=? AND account_id=? AND enabled=1 "
-                "ORDER BY updated_at DESC LIMIT 1",
-                (str(environment or ""), account_id),
-            ).fetchone()
+        auth_status_ms = int(round((time.monotonic() - engine_started) * 1000))
+
+        # 1.12.55 — `engine_precheck_ms` virou um balde de 135s em campo, e ele
+        # cobre três coisas distintas. Sem separar, a próxima investigação vira
+        # palpite outra vez. A aquisição também ganha teto: se a trava não sair,
+        # o comando falha rápido como transitório (503, `temporary: true`), o
+        # site o mantém na fila e nenhuma ação física chega ao veículo — o
+        # dispatch acontece bem depois deste ponto.
+        engine_lock_started = time.monotonic()
+        if not self.lock.acquire(timeout=ENGINE_LOCK_COMMAND_TIMEOUT_SECONDS):
+            raise connector.ConnectorTemporaryError(
+                "O Gateway estava ocupado com outra leitura e não liberou o motor a tempo. "
+                "O comando não foi enviado ao veículo e continua na fila."
+            )
+        engine_lock_wait_ms = int(round((time.monotonic() - engine_lock_started) * 1000))
+        subscription_read_started = time.monotonic()
+        try:
+            with self._db() as db:
+                row = db.execute(
+                    "SELECT subscription_id,cooldown_until,status FROM subscriptions "
+                    "WHERE environment=? AND account_id=? AND enabled=1 "
+                    "ORDER BY updated_at DESC LIMIT 1",
+                    (str(environment or ""), account_id),
+                ).fetchone()
+        finally:
+            self.lock.release()
+        subscription_read_ms = int(round((time.monotonic() - subscription_read_started) * 1000))
         if row is None:
             return self._execute_isolated_command(environment, payload, account_id, progress)
 
@@ -1382,6 +1410,10 @@ class TelemetryEngine:
                     phase["session_wait_ms"] = session_wait_ms
                     phase["session_login_ms"] = session_login_ms
                     phase["engine_precheck_ms"] = engine_precheck_ms
+                    # As três somam engine_precheck_ms e dizem qual delas gastou.
+                    phase["auth_status_ms"] = auth_status_ms
+                    phase["engine_lock_wait_ms"] = engine_lock_wait_ms
+                    phase["subscription_read_ms"] = subscription_read_ms
                     phase["handle_command_ms"] = handle_command_ms
                     phase["confirmation_arm_ms"] = confirmation_arm_ms
                 return result

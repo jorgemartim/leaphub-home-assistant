@@ -94,4 +94,4 @@ def test_client_without_any_refresh_does_not_break():
 def test_alias_chain_declares_the_real_method_name():
     source = (APP / "telemetry_engine.py").read_text(encoding="utf-8")
     assert '"token_refresh", "refresh_session", "refresh_token", "refresh"' in source
-    assert 'ENGINE_VERSION = "1.12.54"' in source
+    assert 'ENGINE_VERSION = "1.12.55"' in source
