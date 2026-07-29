@@ -1,26 +1,18 @@
-## 1.12.52
+## 1.12.53
 
 Distribuição pré-compilada preservada, com publicação em duas fases.
 
-### Entrega ao site: a outra metade do keep-alive
+### Renovação de sessão: o alias que faltava
 
-- A conexão TLS reaproveitada da 1.12.51 não verificava se o socket continuava aberto. `http.client` só descobre isso no `getresponse()`, depois de já ter escrito a requisição inteira. Como a hospedagem compartilhada fecha a conexão ociosa em poucos segundos e os lotes saem a cada 20-120s, praticamente toda entrega reaproveitada falhava com `Remote end closed connection without response` — sem o PHP do site chegar a executar — e o lote inteiro voltava para o backoff.
-- A conexão ociosa além da janela de keep-alive é descartada antes do envio. O padrão é conservador (5s) e passa a seguir o `Keep-Alive: timeout=N` quando o servidor informa um.
-- Uma falha de transporte sobre conexão reaproveitada ganha uma tentativa imediata em conexão nova. É seguro: ali o servidor comprovadamente não respondeu, e a ingestão do site é idempotente pelo `event_id`.
-- Cada tentativa recebe assinatura própria. O site trata o nonce como uso único, então repetir com o cabeçalho anterior seria recusado como requisição repetida.
+- `_try_refresh_client_session` procurava o método de renovação por `refresh_session`, `refresh_token` e `refresh`. O nome real na `leapmotor-api` é `token_refresh`. Nenhum dos três existia, a renovação nunca acontecia e toda sessão vencida caía no login completo — de 5 a 18 s por conta, medidos em campo.
+- `token_refresh` passa a ser o primeiro alias da cadeia. A proteção contra multiplicar chamadas à nuvem continua: deduplicação por identidade da função, parada na primeira resposta conclusiva e classificação única de exceções.
+- Se a versão instalada da biblioteca não tiver o método, o comportamento é exatamente o anterior.
 
-### Efeito
+### Mantido da 1.12.52
 
-- A telemetria volta a chegar no primeiro envio. Como a reconciliação de comandos roda dentro da ingestão do site, a confirmação de `lock`/`unlock` deixa de esperar ciclos inteiros de backoff.
-- O ganho da 1.12.51 é preservado: dentro de uma rajada de lotes a conexão continua sendo reaproveitada, que é justamente quando o handshake pesava.
-
-### Mantido da 1.12.51
-
-- Fila em WAL com `synchronous=NORMAL` e queda automática para DELETE, conexão SQLite por thread, retenção com throttle e expiração de sessão em todo ciclo.
-- Coleta paralela por conta, entrega em thread dedicada, backoff de entrega limitado a 120s.
-- Confirmação FAST armada dentro do Gateway ao fim do comando remoto, com `boost` idempotente por `request_id`.
-- `/health/details` expondo `collection`, incluindo se a conexão de entrega está sendo reaproveitada e qual journal ficou valendo.
-- `session_wait_ms`, `session_login_ms` e `unaccounted_ms` nos comandos remotos.
+- Entrega com keep-alive ciente da janela do servidor, com repetição imediata em conexão nova e assinatura própria por tentativa.
+- Fila em WAL, conexão SQLite por thread, coleta paralela por conta e entrega em thread dedicada.
+- Confirmação FAST armada dentro do Gateway ao fim do comando remoto.
 
 ### Sem alteração
 

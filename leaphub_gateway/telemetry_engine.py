@@ -54,7 +54,7 @@ except ModuleNotFoundError:
         EVENT_TRANSPORT = _event_transport_module.EVENT_TRANSPORT
 
 LOG = logging.getLogger("leaphub.telemetry")
-ENGINE_VERSION = "1.12.52"  # entrega com keep-alive ciente da janela do servidor
+ENGINE_VERSION = "1.12.53"  # entrega com keep-alive ciente da janela do servidor
 
 # Hospedagem compartilhada (Apache/LiteSpeed) fecha a conexão ociosa em poucos
 # segundos. Reaproveitar depois disso escreve num socket já fechado e devolve
@@ -957,7 +957,11 @@ class TelemetryEngine:
         any exception is classified once and stops the chain.
         """
         seen: set[tuple[int, int]] = set()
-        for method_name in ("refresh_session", "refresh_token", "refresh"):
+        # 1.12.53 — "token_refresh" é o nome real na leapmotor-api ("token refresh
+        # is handled automatically (...) see token_refresh() for manual control").
+        # Faltando da lista, nenhuma renovação acontecia e toda sessão vencida
+        # caía direto no login completo, que custa de 5 a 18 s por conta.
+        for method_name in ("token_refresh", "refresh_session", "refresh_token", "refresh"):
             method = getattr(client, method_name, None)
             if not callable(method):
                 continue
