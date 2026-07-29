@@ -43,7 +43,7 @@ except ImportError:
         _privacy_spec.loader.exec_module(_privacy_module)
         sanitize_log = _privacy_module.sanitize_log
 
-CONNECTOR_VERSION = "1.12.56"
+CONNECTOR_VERSION = "1.12.57"
 MAX_INPUT_BYTES = 1024 * 1024
 logging.getLogger("leapmotor_api").setLevel(logging.WARNING)
 LOGGER = logging.getLogger("leaphub.connector")
@@ -86,7 +86,23 @@ COMMAND_METHODS: dict[str, str] = {
     "steering_wheel_heat_off": "steering_wheel_heat_off",
     "rearview_mirror_heat_on": "rearview_mirror_heat_on",
     "rearview_mirror_heat_off": "rearview_mirror_heat_off",
+    # Comandos gateados pela capacidade do veículo (ver COMMAND_REQUIRED_RIGHT).
+    # Cada um só é anunciado para o carro que possui o direito correspondente.
+    "hotspot": "hotspot",
+    "fuel_heating_on": "fuel_heating_on",
+    "fuel_heating_off": "fuel_heating_off",
+    "healthy_charging_on": "healthy_charging_on",
+    "healthy_charging_off": "healthy_charging_off",
+    "ble_key_restart": "ble_key_restart",
+    # Conforto de assento: recebem posição (1-6) e nível (0-3) em `parameters`.
+    # Ver SEAT_COMFORT_COMMANDS e o tratamento em execute_vehicle_command.
+    "seat_heat": "seat_heat",
+    "seat_ventilation": "seat_ventilation",
 }
+
+# Comandos que exigem posição e nível de assento. Mantidos em conjunto próprio
+# porque são os primeiros da matriz estável que não são de argumento zero.
+SEAT_COMFORT_COMMANDS = frozenset({"seat_heat", "seat_ventilation"})
 
 # Recursos deliberadamente fora da matriz estável. Eles só são aceitos quando
 # o site envia confirmação experimental explícita para um proprietário
@@ -98,6 +114,94 @@ EXPERIMENTAL_COMMAND_METHODS: dict[str, str] = {
 }
 SENTRY_COMMANDS = frozenset(EXPERIMENTAL_COMMAND_METHODS)
 ALL_COMMAND_METHODS: dict[str, str] = {**COMMAND_METHODS, **EXPERIMENTAL_COMMAND_METHODS}
+
+# Direito (VehicleRight) exigido por cada comando. Serve para filtrar a matriz
+# conforme a capacidade real de cada veículo (um C10 REEV expõe fuel_heating; um
+# C10 BEV não). Códigos idênticos aos de leapmotor_api.mappings.REMOTE_ACTION_SPECS.
+COMMAND_REQUIRED_RIGHT: dict[str, int] = {
+    "lock": 110, "unlock": 110,
+    "find_car": 120,
+    "trunk_open": 130, "trunk_close": 130,
+    "windows_open": 230, "windows_close": 230,
+    "sunshade_open": 161, "sunshade_close": 161,
+    "climate_on": 170, "climate_off": 170,
+    "quick_cool": 171, "quick_heat": 171,
+    "windshield_defrost": 460,
+    "battery_preheat_on": 190, "battery_preheat_off": 190,
+    "start_charging": 193, "stop_charging": 193,
+    "unlock_charger": 192,
+    "set_charge_limit": 340,
+    "send_destination": 180,
+    "steering_wheel_heat_on": 320, "steering_wheel_heat_off": 320,
+    "rearview_mirror_heat_on": 440, "rearview_mirror_heat_off": 440,
+    "hotspot": 140,
+    "fuel_heating_on": 380, "fuel_heating_off": 380,
+    "healthy_charging_on": 480, "healthy_charging_off": 480,
+    "ble_key_restart": 430,
+    "seat_heat": 301,
+    "seat_ventilation": 370,
+    # experimentais
+    "sentry_on": 220, "sentry_off": 220,
+}
+
+# Flags de hardware (VehicleAbility) -> direitos que elas implicam, para quando a
+# nuvem devolve `abilities` em vez de (ou além de) `rights`. Fonte: a tabela
+# ABILITY_TO_RIGHTS de leapmotor_api.mappings.
+ABILITY_TO_RIGHTS: dict[int, tuple[int, ...]] = {
+    1: (110,), 2: (120,), 3: (130,), 4: (150,), 6: (170,), 9: (171,),
+    10: (190,), 11: (161,), 12: (230,), 14: (301,), 15: (320,), 17: (171,),
+    18: (460,), 24: (130,), 25: (160,), 30: (180,), 34: (510,), 35: (340,),
+    36: (230,), 38: (360, 361), 40: (380,), 42: (370,), 43: (370,), 48: (192,),
+    50: (220,), 52: (180,),
+}
+
+
+def _capability_code(item: Any) -> int | None:
+    """Extrai o código numérico de um item de rights/abilities (IntEnum, int,
+    dict com code/value/... ou string começada por dígitos)."""
+    try:
+        return int(item)
+    except (TypeError, ValueError):
+        pass
+    raw = value_of(item)
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        pass
+    for key in ("code", "value", "id", "right", "ability"):
+        candidate = attribute(item, key)
+        try:
+            return int(candidate)
+        except (TypeError, ValueError):
+            continue
+    match = re.match(r"\s*(\d+)", str(raw if raw is not None else item))
+    return int(match.group(1)) if match else None
+
+
+def effective_right_codes(raw_rights: Any, raw_abilities: Any) -> set[int]:
+    """Conjunto de direitos efetivos do veículo: os `rights` declarados mais os
+    direitos implicados pelas `abilities` de hardware."""
+    codes: set[int] = set()
+    for item in (raw_rights or []):
+        code = _capability_code(item)
+        if code is not None:
+            codes.add(code)
+    for item in (raw_abilities or []):
+        code = _capability_code(item)
+        if code is not None:
+            codes.add(code)
+            codes.update(ABILITY_TO_RIGHTS.get(code, ()))
+    return codes
+
+
+def command_permitted_by_vehicle(command: str, right_codes: set[int]) -> bool:
+    """True se o veículo tem o direito exigido pelo comando. Fail-open: sem dados
+    de capacidade (`right_codes` vazio) ou comando sem direito mapeado, não filtra
+    — preserva o comportamento anterior para não sumir comando de quem já funciona."""
+    required = COMMAND_REQUIRED_RIGHT.get(command)
+    if required is None or not right_codes:
+        return True
+    return required in right_codes
 
 
 def emit(payload: dict[str, Any], exit_code: int = 0) -> None:
@@ -2007,13 +2111,19 @@ def serialize_vehicle(
         "carPicture", "carPictureUrl", "carImage", "carImageUrl", "vehicleImage", "vehicleImageUrl",
         "outwardImage", "appearanceImage", "modelImage", "imageUrl",
     )))
+    # Matriz ciente da capacidade do veículo: um comando só é anunciado se a
+    # biblioteca o implementa E o carro possui o direito correspondente. Sem dados
+    # de capacidade, o filtro é fail-open (ver command_permitted_by_vehicle).
+    vehicle_right_codes = effective_right_codes(raw_rights, raw_abilities)
     supported_commands = [
         key for key, method in COMMAND_METHODS.items()
         if callable(getattr(client, method, None))
+        and command_permitted_by_vehicle(key, vehicle_right_codes)
     ]
     experimental_commands = [
         key for key, method in EXPERIMENTAL_COMMAND_METHODS.items()
         if callable(getattr(client, method, None))
+        and command_permitted_by_vehicle(key, vehicle_right_codes)
     ]
 
     result: dict[str, Any] = {
@@ -2825,6 +2935,22 @@ def execute_vehicle_command(
         if value < 50 or value > 100 or value % 5 != 0:
             raise ValueError("Limite de carga inválido.")
         return method(vehicle_id, charge_limit_percent=value)
+    if command in SEAT_COMFORT_COMMANDS:
+        # A biblioteca codifica o par como "posição,nível" (posição 1-6, nível 0-3)
+        # e exige os dois por palavra-chave. Recusar fora de faixa aqui evita
+        # gastar uma ida à nuvem para o carro rejeitar o comando.
+        position_raw = parameters.get("seat_position", parameters.get("position"))
+        level_raw = parameters.get("seat_level", parameters.get("level"))
+        try:
+            position = int(position_raw)
+            level = int(level_raw)
+        except (TypeError, ValueError):
+            raise ValueError("Informe a posição e o nível do assento.") from None
+        if position < 1 or position > 6:
+            raise ValueError("Posição de assento inválida.")
+        if level < 0 or level > 3:
+            raise ValueError("Nível de assento inválido.")
+        return method(vehicle_id, position=position, level=level)
     if command == "send_destination":
         name = str(parameters.get("name") or "Destino")[:100]
         address = str(parameters.get("address") or "")[:240]
@@ -2834,6 +2960,10 @@ def execute_vehicle_command(
             raise ValueError("Coordenadas inválidas.")
         values = {
             "name": name, "title": name, "poi_name": name, "destination_name": name,
+            # A biblioteca 0.3.2 exige address_name (keyword-only e sem valor padrão).
+            # Sem esta chave a introspecção abaixo trata o parâmetro como não
+            # suportado e o envio de destino falha antes de sair do gateway.
+            "address_name": name,
             "address": address, "addr": address,
             "latitude": latitude, "lat": latitude,
             "longitude": longitude, "lon": longitude, "lng": longitude,

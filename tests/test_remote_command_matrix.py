@@ -37,6 +37,14 @@ expected_methods = {
     "steering_wheel_heat_off": "steering_wheel_heat_off",
     "rearview_mirror_heat_on": "rearview_mirror_heat_on",
     "rearview_mirror_heat_off": "rearview_mirror_heat_off",
+    "hotspot": "hotspot",
+    "fuel_heating_on": "fuel_heating_on",
+    "fuel_heating_off": "fuel_heating_off",
+    "healthy_charging_on": "healthy_charging_on",
+    "healthy_charging_off": "healthy_charging_off",
+    "ble_key_restart": "ble_key_restart",
+    "seat_heat": "seat_heat",
+    "seat_ventilation": "seat_ventilation",
 }
 
 failures: list[str] = []
@@ -45,11 +53,23 @@ def check(condition: bool, message: str) -> None:
     if not condition:
         failures.append(message)
 
-check(connector.CONNECTOR_VERSION == "1.12.56", "Versão do Connector divergente")
+check(connector.CONNECTOR_VERSION == "1.12.57", "Versão do Connector divergente")
 check(connector.COMMAND_METHODS == expected_methods, "Matriz COMMAND_METHODS divergente")
-check(len(connector.COMMAND_METHODS) == 25, "A matriz precisa conter 25 comandos")
+check(len(connector.COMMAND_METHODS) == 33, "A matriz precisa conter 33 comandos")
 check(connector.EXPERIMENTAL_COMMAND_METHODS == {"sentry_on": "sentry_mode_on", "sentry_off": "sentry_mode_off"}, "Matriz experimental divergente")
-check(len(connector.ALL_COMMAND_METHODS) == 27, "Matriz total precisa conter 25 estáveis + 2 experimentais")
+check(len(connector.ALL_COMMAND_METHODS) == 35, "Matriz total precisa conter 33 estáveis + 2 experimentais")
+
+# Cada comando (estável e experimental) precisa declarar o direito exigido, para
+# que a matriz possa ser filtrada pela capacidade real do veículo.
+for _cmd in connector.ALL_COMMAND_METHODS:
+    check(_cmd in connector.COMMAND_REQUIRED_RIGHT, f"Comando sem direito mapeado: {_cmd}")
+# Fail-open: sem dados de capacidade, nenhum comando é escondido.
+check(connector.command_permitted_by_vehicle("fuel_heating_on", set()), "Fail-open sem rights deve permitir")
+# Com capacidade declarada, filtra pelo direito correto (380 = fuel heating).
+check(connector.command_permitted_by_vehicle("fuel_heating_on", {380}), "REEV (direito 380) deve expor fuel_heating")
+check(not connector.command_permitted_by_vehicle("fuel_heating_on", {110, 170}), "BEV sem direito 380 não deve expor fuel_heating")
+# Abilities de hardware são expandidas para os direitos que implicam (40 -> 380).
+check(380 in connector.effective_right_codes([], [40]), "Ability 40 deve implicar o direito 380")
 check(connector.CLIMATE_VERIFY_COMMANDS == {"climate_on", "climate_off", "quick_cool", "quick_heat"}, "Conjunto de confirmação climática divergente")
 check(connector.SAFE_STATE_RETRY_COMMANDS == {"climate_on", "climate_off"}, "Retry seguro climático divergente")
 
@@ -63,6 +83,8 @@ pairs = [
     ("climate_on", "climate_off"),
     ("steering_wheel_heat_on", "steering_wheel_heat_off"),
     ("rearview_mirror_heat_on", "rearview_mirror_heat_off"),
+    ("fuel_heating_on", "fuel_heating_off"),
+    ("healthy_charging_on", "healthy_charging_off"),
 ]
 for left, right in pairs:
     check(left in connector.COMMAND_METHODS and right in connector.COMMAND_METHODS, f"Par ausente: {left}/{right}")
