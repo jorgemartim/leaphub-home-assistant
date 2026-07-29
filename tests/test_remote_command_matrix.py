@@ -45,6 +45,12 @@ expected_methods = {
     "ble_key_restart": "ble_key_restart",
     "seat_heat": "seat_heat",
     "seat_ventilation": "seat_ventilation",
+    "sunroof_open": "open_sunroof",
+    "sunroof_close": "close_sunroof",
+    "windows_position": "windows",
+    "set_speed_limit": "set_speed_limit",
+    "music": "music",
+    "video": "video",
 }
 
 failures: list[str] = []
@@ -53,11 +59,18 @@ def check(condition: bool, message: str) -> None:
     if not condition:
         failures.append(message)
 
-check(connector.CONNECTOR_VERSION == "1.12.57", "Versão do Connector divergente")
+check(connector.CONNECTOR_VERSION == "1.12.58", "Versão do Connector divergente")
 check(connector.COMMAND_METHODS == expected_methods, "Matriz COMMAND_METHODS divergente")
-check(len(connector.COMMAND_METHODS) == 33, "A matriz precisa conter 33 comandos")
-check(connector.EXPERIMENTAL_COMMAND_METHODS == {"sentry_on": "sentry_mode_on", "sentry_off": "sentry_mode_off"}, "Matriz experimental divergente")
-check(len(connector.ALL_COMMAND_METHODS) == 35, "Matriz total precisa conter 33 estáveis + 2 experimentais")
+check(len(connector.COMMAND_METHODS) == 39, "A matriz precisa conter 39 comandos")
+check(
+    connector.EXPERIMENTAL_COMMAND_METHODS == {
+        "sentry_on": "sentry_mode_on",
+        "sentry_off": "sentry_mode_off",
+        "prepare_car": "prepare_car",
+    },
+    "Matriz experimental divergente",
+)
+check(len(connector.ALL_COMMAND_METHODS) == 42, "Matriz total precisa conter 39 estáveis + 3 experimentais")
 
 # Cada comando (estável e experimental) precisa declarar o direito exigido, para
 # que a matriz possa ser filtrada pela capacidade real do veículo.

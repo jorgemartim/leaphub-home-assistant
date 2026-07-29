@@ -54,7 +54,7 @@ def configure(gateway):
 
 def test_backlog_from_one_user_does_not_starve_another_user(tmp_path: Path) -> None:
     gateway = load_gateway(tmp_path)
-    assert gateway.GATEWAY_VERSION == "1.12.57"
+    assert gateway.GATEWAY_VERSION == "1.12.58"
     configure(gateway)
     gateway.remember_queue_owner("staging", "CP-A", 101)
     gateway.remember_queue_owner("staging", "CP-B", 202)

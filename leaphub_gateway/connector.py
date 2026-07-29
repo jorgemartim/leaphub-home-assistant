@@ -43,7 +43,7 @@ except ImportError:
         _privacy_spec.loader.exec_module(_privacy_module)
         sanitize_log = _privacy_module.sanitize_log
 
-CONNECTOR_VERSION = "1.12.57"
+CONNECTOR_VERSION = "1.12.58"
 MAX_INPUT_BYTES = 1024 * 1024
 logging.getLogger("leapmotor_api").setLevel(logging.WARNING)
 LOGGER = logging.getLogger("leaphub.connector")
@@ -98,11 +98,29 @@ COMMAND_METHODS: dict[str, str] = {
     # Ver SEAT_COMFORT_COMMANDS e o tratamento em execute_vehicle_command.
     "seat_heat": "seat_heat",
     "seat_ventilation": "seat_ventilation",
+    # Teto solar (direito 160). Não confundir com a cortina do teto
+    # (sunshade_open/close, direito 161), que é outro direito e já está acima.
+    "sunroof_open": "open_sunroof",
+    "sunroof_close": "close_sunroof",
+    # Janela numa posição intermediária, 0 a 100. windows_open/windows_close são
+    # o mesmo comando 230 nos extremos e continuam existindo.
+    "windows_position": "windows",
+    # Limite de velocidade em km/h.
+    "set_speed_limit": "set_speed_limit",
+    # Mídia: `operation` em play/pause/next/previous.
+    "music": "music",
+    "video": "video",
 }
 
 # Comandos que exigem posição e nível de assento. Mantidos em conjunto próprio
 # porque são os primeiros da matriz estável que não são de argumento zero.
+# Posições, conforme a biblioteca: 1=dianteiro esquerdo, 2=passageiro,
+# 3=motorista, 4=dianteiro direito, 5=traseiro esquerdo, 6=traseiro direito.
 SEAT_COMFORT_COMMANDS = frozenset({"seat_heat", "seat_ventilation"})
+
+# Comandos de mídia, que compartilham o mesmo vocabulário de operação.
+MEDIA_COMMANDS = frozenset({"music", "video"})
+MEDIA_OPERATIONS = frozenset({"play", "pause", "next", "previous"})
 
 # Recursos deliberadamente fora da matriz estável. Eles só são aceitos quando
 # o site envia confirmação experimental explícita para um proprietário
@@ -111,8 +129,17 @@ SEAT_COMFORT_COMMANDS = frozenset({"seat_heat", "seat_ventilation"})
 EXPERIMENTAL_COMMAND_METHODS: dict[str, str] = {
     "sentry_on": "sentry_mode_on",
     "sentry_off": "sentry_mode_off",
+    # A nuvem aceita um JSON livre em prepare_car (360) e a forma do pacote do
+    # comando imediato não é documentada — só a do agendamento (361). O envelope
+    # montado aqui é allow-listed e validado, mas segue exigindo confirmação
+    # explícita do proprietário até haver captura de tráfego real.
+    "prepare_car": "prepare_car",
 }
-SENTRY_COMMANDS = frozenset(EXPERIMENTAL_COMMAND_METHODS)
+# Só o Sentinela tem diagnóstico próprio (sonda, evidência e resumo do resultado).
+# Este conjunto era derivado de EXPERIMENTAL_COMMAND_METHODS; deixou de ser quando
+# um segundo experimental entrou, para que prepare_car não passe a ser tratado como
+# sonda do Sentinela nem carregue os campos de diagnóstico dele.
+SENTRY_COMMANDS = frozenset({"sentry_on", "sentry_off"})
 ALL_COMMAND_METHODS: dict[str, str] = {**COMMAND_METHODS, **EXPERIMENTAL_COMMAND_METHODS}
 
 # Direito (VehicleRight) exigido por cada comando. Serve para filtrar a matriz
@@ -140,8 +167,14 @@ COMMAND_REQUIRED_RIGHT: dict[str, int] = {
     "ble_key_restart": 430,
     "seat_heat": 301,
     "seat_ventilation": 370,
+    "sunroof_open": 160, "sunroof_close": 160,
+    "windows_position": 230,
+    "set_speed_limit": 510,
+    "music": 270,
+    "video": 290,
     # experimentais
     "sentry_on": 220, "sentry_off": 220,
+    "prepare_car": 360,
 }
 
 # Flags de hardware (VehicleAbility) -> direitos que elas implicam, para quando a
@@ -2935,6 +2968,33 @@ def execute_vehicle_command(
         if value < 50 or value > 100 or value % 5 != 0:
             raise ValueError("Limite de carga inválido.")
         return method(vehicle_id, charge_limit_percent=value)
+    if command == "windows_position":
+        # 0 = fechada, 100 = totalmente aberta. A biblioteca recebe texto e recusa
+        # fora de 0-100. Um B10 foi observado atuando só em 0/2/5/10 numa escala
+        # 0-10: a nuvem aceita qualquer valor e o carro ignora o que não entende,
+        # então a conversão para a escala nativa é decisão de quem chama.
+        try:
+            position = int(parameters.get("window_position", parameters.get("value")))
+        except (TypeError, ValueError):
+            raise ValueError("Informe a posição da janela.") from None
+        if position < 0 or position > 100:
+            raise ValueError("Posição de janela inválida.")
+        return method(vehicle_id, value=str(position))
+    if command == "set_speed_limit":
+        try:
+            limit = int(parameters.get("speed_limit_kmh", parameters.get("value")))
+        except (TypeError, ValueError):
+            raise ValueError("Informe o limite de velocidade.") from None
+        if limit < 30 or limit > 200:
+            raise ValueError("Limite de velocidade inválido.")
+        return method(vehicle_id, value=str(limit))
+    if command in MEDIA_COMMANDS:
+        operation = str(parameters.get("operation") or "").strip().lower()
+        if operation not in MEDIA_OPERATIONS:
+            raise ValueError("Operação de mídia inválida.")
+        return method(vehicle_id, operation=operation)
+    if command == "prepare_car":
+        return method(vehicle_id, params=prepare_car_parameters(parameters))
     if command in SEAT_COMFORT_COMMANDS:
         # A biblioteca codifica o par como "posição,nível" (posição 1-6, nível 0-3)
         # e exige os dois por palavra-chave. Recusar fora de faixa aqui evita
@@ -3074,6 +3134,72 @@ def climate_profile_from_status(climate: Any) -> str:
     if any(token in text for token in ("fast_heat", "heat", "hot", "aquec")):
         return "heating"
     return "generic"
+
+
+def prepare_car_parameters(parameters: dict[str, Any]) -> dict[str, Any]:
+    """Monta o envelope do prepare_car (360) a partir de parâmetros nomeados.
+
+    A biblioteca serializa este dicionário sem validar nada — o `cmd_content` é
+    "the full JSON payload string". Repassar JSON vindo do site seria entregar à
+    nuvem um pacote que ninguém conferiu, então aqui só entram dimensões
+    conhecidas, e só as que o proprietário pediu explicitamente.
+
+    O vocabulário de `air_condition` é o mesmo que `climate_close_parameters()`
+    já usa em produção no `ac_switch` (circle/mode/operate/position/temperature/
+    windlevel/wshld), confirmado pelos enums da biblioteca. As outras duas
+    dimensões vêm documentadas no agendamento equivalente (361).
+
+    `seat_setting` fica de fora de propósito: a documentação diz apenas
+    "per seat 3=heat, 13=vent, 0=off", sem nomear os campos de cada assento.
+    Aquecimento e ventilação de assento já têm comando próprio e verificado
+    (`seat_heat`/`seat_ventilation`).
+    """
+    payload: dict[str, Any] = {}
+
+    if bool_or_none(parameters.get("climate")) is True:
+        mode = str(parameters.get("climate_mode") or "wind").strip().lower()
+        if mode in {"auto", "generic", "nohotcold"}:
+            mode = "wind"
+        if mode not in {"cold", "hot", "wind"}:
+            raise ValueError("Modo de climatização inválido.")
+        try:
+            temperature = int(parameters.get("temperature", 24))
+        except (TypeError, ValueError):
+            raise ValueError("Temperatura inválida.") from None
+        if temperature < 16 or temperature > 32:
+            raise ValueError("Temperatura fora da faixa permitida.")
+        try:
+            wind_level = int(parameters.get("wind_level", 3))
+        except (TypeError, ValueError):
+            raise ValueError("Nível de ventilação inválido.") from None
+        if wind_level < 1 or wind_level > 7:
+            raise ValueError("Nível de ventilação fora da faixa permitida.")
+        payload["air_condition"] = {
+            "enable": True,
+            "circle": "in",
+            "mode": mode,
+            "operate": "auto",
+            "position": "all",
+            "temperature": str(temperature),
+            "windlevel": str(wind_level),
+            "wshld": "1" if bool_or_none(parameters.get("defrost")) is True else "0",
+        }
+
+    if bool_or_none(parameters.get("steering_wheel_heat")) is True:
+        try:
+            level = int(parameters.get("steering_wheel_level", 1))
+        except (TypeError, ValueError):
+            raise ValueError("Nível do volante inválido.") from None
+        if level < 0 or level > 3:
+            raise ValueError("Nível do volante fora da faixa permitida.")
+        payload["steeringWheelHeatCtrl"] = {"enable": True, "level": level}
+
+    if bool_or_none(parameters.get("mirror_heat")) is True:
+        payload["rearMirrorHeating"] = {"enable": True, "value": 1}
+
+    if payload == {}:
+        raise ValueError("Escolha ao menos um item para preparar o carro.")
+    return payload
 
 
 def climate_close_parameters(profile: str) -> dict[str, str]:
