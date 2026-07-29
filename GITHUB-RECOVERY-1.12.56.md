@@ -1,7 +1,7 @@
-# Recuperação GitHub — Gateway 1.12.55
+# Recuperação GitHub — Gateway 1.12.56
 
-1. Envie somente os arquivos de `CHANGED-FILES-1.12.55.txt`.
-2. Confirme `leaphub_gateway/RELEASE_TARGET` em `1.12.55`.
+1. Envie somente os arquivos de `CHANGED-FILES-1.12.56.txt`.
+2. Confirme `leaphub_gateway/RELEASE_TARGET` em `1.12.56`.
 3. Preserve `leaphub_gateway/config.yaml` em `1.12.53` até a imagem nova estar pública.
 4. Aguarde testes, build, smoke test e verificação anônima do GHCR.
 5. O workflow promove o `config.yaml` somente depois dessas verificações.

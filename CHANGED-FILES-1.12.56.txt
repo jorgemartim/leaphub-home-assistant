@@ -1,8 +1,8 @@
-CHANGED-FILES-1.12.55.txt
-GITHUB-RECOVERY-1.12.55.md
-RELEASE-1.12.55.md
+CHANGED-FILES-1.12.56.txt
+GITHUB-RECOVERY-1.12.56.md
+RELEASE-1.12.56.md
 leaphub_gateway/CHANGELOG.md
-leaphub_gateway/RELEASE-1.12.55.md
+leaphub_gateway/RELEASE-1.12.56.md
 leaphub_gateway/RELEASE_TARGET
 leaphub_gateway/connector.py
 leaphub_gateway/connector_server.py
@@ -12,6 +12,7 @@ leaphub_gateway/privacy.py
 leaphub_gateway/telemetry_engine.py
 tests/test_background_telemetry_1_12_19.py
 tests/test_command_confirmation_delivery_1_12_40.py
+tests/test_command_confirmation_diagnosis_1_12_56.py
 tests/test_command_phase_accounting_1_12_54.py
 tests/test_command_precheck_breakdown_1_12_55.py
 tests/test_command_session_reuse_1_12_39.py

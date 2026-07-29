@@ -54,7 +54,7 @@ except ModuleNotFoundError:
         EVENT_TRANSPORT = _event_transport_module.EVENT_TRANSPORT
 
 LOG = logging.getLogger("leaphub.telemetry")
-ENGINE_VERSION = "1.12.55"  # precheck do comando quebrado em tres e com teto na trava
+ENGINE_VERSION = "1.12.56"  # diagnostico de confirmacao inconclusiva
 
 # Hospedagem compartilhada (Apache/LiteSpeed) fecha a conexão ociosa em poucos
 # segundos. Reaproveitar depois disso escreve num socket já fechado e devolve
@@ -63,7 +63,7 @@ DELIVERY_IDLE_DEFAULT_SECONDS = 5.0
 DELIVERY_IDLE_MIN_SECONDS = 2.0
 DELIVERY_IDLE_MAX_SECONDS = 30.0
 
-# 1.12.55 — teto para o comando esperar a trava global do motor. `with self.lock`
+# 1.12.56 — teto para o comando esperar a trava global do motor. `with self.lock`
 # no caminho do comando era a única aquisição sem limite do arquivo; compare com
 # `self.lock.acquire(timeout=0.15)` e `account_lock.acquire(timeout=...)`. Um
 # comando de campo mediu precheck_motor=135718ms com todas as demais fases
@@ -1298,14 +1298,14 @@ class TelemetryEngine:
         if account_id < 1:
             return connector.handle_command(payload, progress=progress)
 
-        # 1.12.55 — nada entre a entrada do método e a trava de sessão tinha
+        # 1.12.56 — nada entre a entrada do método e a trava de sessão tinha
         # contador. Com session_wait/login/prepare/verification todos em 0 e o
         # dispatch em ~4s, comandos de 94s deixavam 90s sem atribuição nenhuma.
         engine_started = time.monotonic()
         self.assert_account_cloud_allowed(environment, account_id, "command")
         auth_status_ms = int(round((time.monotonic() - engine_started) * 1000))
 
-        # 1.12.55 — `engine_precheck_ms` virou um balde de 135s em campo, e ele
+        # 1.12.56 — `engine_precheck_ms` virou um balde de 135s em campo, e ele
         # cobre três coisas distintas. Sem separar, a próxima investigação vira
         # palpite outra vez. A aquisição também ganha teto: se a trava não sair,
         # o comando falha rápido como transitório (503, `temporary: true`), o
@@ -2723,6 +2723,14 @@ class TelemetryEngine:
             command_context = {}
 
         command_target_seen = False
+        # 1.12.56 — três causas distintas produzem o mesmo "sem confirmação
+        # conclusiva": o veículo-alvo não apareceu, as amostras foram velhas
+        # demais, ou o campo que o matcher consulta não veio. Sem separar,
+        # o diagnóstico vira palpite.
+        command_stale_samples = 0
+        command_evaluated_samples = 0
+        command_field_gaps: list[str] = []
+        command_available_keys: list[str] = []
         if command_mode and command_key:
             for vehicle in vehicles:
                 if command_vehicle_id and str(vehicle.get("remote_id") or "") != command_vehicle_id:
@@ -2730,9 +2738,15 @@ class TelemetryEngine:
                 command_target_seen = True
                 telemetry = vehicle.get("telemetry") if isinstance(vehicle.get("telemetry"), dict) else {}
                 if not self._command_sample_is_fresh(telemetry, float(subscription["command_started_at"] or 0)):
+                    command_stale_samples += 1
                     continue
+                command_evaluated_samples += 1
                 matched, evaluable = self._command_confirmation(command_key, telemetry, command_context)
                 command_evaluable = command_evaluable or evaluable
+                if not evaluable:
+                    # Guarda a última amostra inconclusiva; só nomes de campo.
+                    command_field_gaps = self._command_confirmation_gaps(command_key, telemetry)
+                    command_available_keys = sorted(str(key) for key in telemetry.keys())[:40]
                 if matched:
                     command_confirmed = True
                     break
@@ -2787,6 +2801,17 @@ class TelemetryEngine:
             if command_vehicle_id and not command_target_seen:
                 LOG.warning("Janela rápida de %s não encontrou o veículo-alvo do comando entre os dados retornados; assinatura será reconciliada pelo site.", sid)
             LOG.warning("Janela rápida de %s encerrada após %s leitura(s) sem confirmação conclusiva; telemetria voltou ao modo adaptativo.", sid, next_command_poll)
+            # 1.12.56 — a linha acima diz que falhou; esta diz por quê.
+            LOG.warning(
+                "Confirmação inconclusiva de %s em %s: amostras avaliadas=%s, descartadas por idade=%s, "
+                "campos exigidos sem valor=[%s], chaves presentes na telemetria=[%s].",
+                command_key or "desconhecido",
+                sid,
+                command_evaluated_samples,
+                command_stale_samples,
+                ", ".join(command_field_gaps) or "nenhum",
+                ", ".join(command_available_keys) or "nenhuma",
+            )
         elif previous_state != aggregate_state:
             LOG.info("Telemetria %s mudou de %s para %s; próxima consulta em %ss.", sid, previous_state or "inicial", aggregate_state, int(interval + jitter))
         else:
@@ -3157,6 +3182,63 @@ class TelemetryEngine:
             return parsed.timestamp() >= command_started_at - 2.0
         except (TypeError, ValueError, OverflowError):
             return True
+
+    # 1.12.56 — os campos que `_command_confirmation` consulta, por comando.
+    # Comandos confirmados executam e o dono vê "não foi confirmado dentro da
+    # janela segura": o matcher devolve inconclusivo quando o campo esperado
+    # não vem na telemetria, e não havia como saber qual campo faltou. Um
+    # contrato garante que este mapa cobre todo comando tratado no matcher.
+    COMMAND_CONFIRMATION_FIELDS: dict[str, tuple[str, ...]] = {
+        "lock": ("locked",),
+        "unlock": ("locked",),
+        "climate_on": ("climate_on",),
+        "climate_off": ("climate_on",),
+        "quick_cool": ("climate_on",),
+        "quick_heat": ("climate_on",),
+        "windshield_defrost": ("climate_details.windshield_defrost",),
+        "battery_preheat_on": ("climate_details.battery_preheat",),
+        "battery_preheat_off": ("climate_details.battery_preheat",),
+        "steering_wheel_heat_on": ("seat_comfort.steering_wheel_heating",),
+        "steering_wheel_heat_off": ("seat_comfort.steering_wheel_heating",),
+        "rearview_mirror_heat_on": ("mirrors.left_heating", "mirrors.right_heating"),
+        "rearview_mirror_heat_off": ("mirrors.left_heating", "mirrors.right_heating"),
+        "trunk_open": ("doors.trunk",),
+        "trunk_close": ("doors.trunk",),
+        "sunshade_open": ("sunshade_open",),
+        "sunshade_close": ("sunshade_open",),
+        "windows_open": ("windows",),
+        "windows_close": ("windows",),
+        "sentry_on": ("security.sentry_mode", "sentry_mode"),
+        "sentry_off": ("security.sentry_mode", "sentry_mode"),
+        "start_charging": ("charging_status", "charging_power_kw"),
+        "stop_charging": ("charging_status", "charging_power_kw"),
+        "set_charge_limit": ("charge_limit_percent",),
+    }
+
+    def _command_confirmation_gaps(self, command_key: str, telemetry: dict[str, Any]) -> list[str]:
+        """Classifica cada campo exigido pelo matcher: ausente, nulo ou vazio.
+
+        Só nomes de campo e classificação saem daqui. Nenhum valor de
+        telemetria é registrado — a mesma leitura carrega localização e
+        identificadores do veículo.
+        """
+        command = str(command_key or "").strip().lower()
+        gaps: list[str] = []
+        for path in self.COMMAND_CONFIRMATION_FIELDS.get(command, ()):  # desconhecido -> sem campo exigido
+            node: Any = telemetry
+            missing = False
+            for part in path.split("."):
+                if not isinstance(node, dict) or part not in node:
+                    missing = True
+                    break
+                node = node[part]
+            if missing:
+                gaps.append(path + "=ausente")
+            elif node is None:
+                gaps.append(path + "=nulo")
+            elif isinstance(node, dict) and not node:
+                gaps.append(path + "=vazio")
+        return gaps
 
     def _command_confirmation(
         self,

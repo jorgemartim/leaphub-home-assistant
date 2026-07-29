@@ -1,24 +1,20 @@
-## 1.12.55
+## 1.12.56
 
 Distribuição pré-compilada preservada, com publicação em duas fases.
 
-### O precheck do comando remoto ganhou nome e teto
+### A falha de confirmação passa a dizer por quê
 
-- Um comando medido em campo trouxe `precheck_motor=135718ms` com todas as demais fases somando ~5 s (`dispatch=4199ms`, `handle_command=5219ms`, `arme_confirmacao=1ms`, `nao_atribuido=1ms`). A 1.12.54 nomeou o balde; ele cobre três coisas distintas e não dava para saber qual delas gastava.
-- `engine_precheck_ms` passa a ser quebrado em `auth_status_ms` (a checagem de cooldown da conta), `engine_lock_wait_ms` (a espera pela trava global do motor) e `subscription_read_ms` (a leitura da assinatura). As três somam o precheck e aparecem entre colchetes na linha de log.
-- A aquisição da trava global no caminho do comando era a única sem limite de espera no arquivo — compare com `self.lock.acquire(timeout=0.15)` e `account_lock.acquire(timeout=...)` usados em outros pontos. Agora ela tem teto de 20 s.
-- Estourar o teto vira `ConnectorTemporaryError`, que o servidor já mapeia para HTTP 503 com `temporary: true`. O site trata 503 como falha transitória e mantém o comando na fila. O dispatch acontece bem depois desse ponto, então nenhuma ação física chega ao veículo e nada é repetido: o dono recebe uma resposta em 20 s em vez de olhar a tela por dois minutos.
-- A trava é liberada em `finally`. Perdê-la travaria o motor inteiro de forma permanente.
+- Comandos executam e o dono vê "a ação foi enviada, mas o novo estado não foi confirmado dentro da janela segura". O log dizia apenas "sem confirmação conclusiva", sem separar três causas distintas: veículo-alvo ausente, amostras descartadas por idade, ou campo exigido pelo matcher fora da telemetria.
+- Uma segunda linha passa a registrar amostras avaliadas, amostras descartadas por idade, os campos exigidos sem valor (distinguindo ausente, nulo e vazio) e as chaves realmente presentes na telemetria.
+- O mapa `COMMAND_CONFIRMATION_FIELDS` declara os campos por comando, e um contrato o compara com os comandos tratados em `_command_confirmation` nos dois sentidos, para o diagnóstico não envelhecer em silêncio.
+- Só nomes de chave e contadores são registrados. Nenhum valor de telemetria entra no log.
 
-### Mantido da 1.12.54
+### Mantido da 1.12.55
 
-- `engine_precheck_ms` + `session_wait_ms` + `session_login_ms` + `handle_command_ms` + `confirmation_arm_ms` + não atribuído fecham `remote_execute_ms`.
-- `preparo_sessao`, `dispatch`, `verificacao` e `progresso` vivem dentro de `handle_command_ms` e não entram no cálculo de não atribuído. As três fases novas vivem dentro de `engine_precheck_ms` e seguem a mesma regra.
-- `token_refresh` como primeiro alias da cadeia de renovação de sessão.
-- Entrega com keep-alive ciente da janela do servidor, com repetição imediata em conexão nova e assinatura própria por tentativa.
-- Fila em WAL, conexão SQLite por thread, coleta paralela por conta e entrega em thread dedicada.
+- `engine_precheck_ms` quebrado em `auth_status_ms`, `engine_lock_wait_ms` e `subscription_read_ms`, medido em campo caindo de 135718ms para 1ms.
+- Teto de 20s na aquisição da trava global do motor no caminho do comando, com falha transitória 503 que preserva o comando na fila.
 
 ### Sem alteração
 
-- Não repete comandos físicos, não altera credenciais, OCPP, MQTT, schema, migrations ou dados existentes.
+- Esta versão só acrescenta registro. Não muda o critério de confirmação nem a janela FAST, não repete comandos físicos e não altera credenciais, OCPP, MQTT, schema, migrations ou dados existentes.
 - Distribuição continua pré-compilada via GHCR, com promoção somente após validação pública da imagem.

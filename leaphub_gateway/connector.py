@@ -43,7 +43,7 @@ except ImportError:
         _privacy_spec.loader.exec_module(_privacy_module)
         sanitize_log = _privacy_module.sanitize_log
 
-CONNECTOR_VERSION = "1.12.55"
+CONNECTOR_VERSION = "1.12.56"
 MAX_INPUT_BYTES = 1024 * 1024
 logging.getLogger("leapmotor_api").setLevel(logging.WARNING)
 LOGGER = logging.getLogger("leaphub.connector")
@@ -3131,7 +3131,7 @@ def handle_command(
     def report(stage: str, message: str, extra: dict[str, Any] | None = None) -> None:
         if progress is None:
             return
-        # 1.12.55 — o diário de progresso é chamado várias vezes por comando e
+        # 1.12.56 — o diário de progresso é chamado várias vezes por comando e
         # nunca teve contador. Se ele custar, custa dentro de handle_command.
         report_started = time.monotonic()
         try:

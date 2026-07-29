@@ -65,7 +65,7 @@ except ModuleNotFoundError:
         _event_transport_spec.loader.exec_module(_event_transport_module)
         EVENT_TRANSPORT = _event_transport_module.EVENT_TRANSPORT
 
-VERSION = "1.12.55"
+VERSION = "1.12.56"
 API_VERSION = 2
 CAPABILITY_SCHEMA_VERSION = 1
 MIN_SUPPORTED_CLIENT_API_VERSION = 1
@@ -949,12 +949,12 @@ def run_command_job(
             "session_prepare_ms": int(phase_latency.get("session_prepare_ms") or 0),
             "dispatch_ms": int(phase_latency.get("dispatch_ms") or 0),
             "verification_ms": int(phase_latency.get("verification_ms") or 0),
-            # 1.12.55 - as tres fases que faltavam para fechar remote_execute_ms.
+            # 1.12.56 - as tres fases que faltavam para fechar remote_execute_ms.
             # engine_precheck + session_wait + session_login + handle_command +
             # confirmation_arm cobrem o metodo inteiro; progress_ms e a quebra de
             # handle_command para o diario de progresso.
             "engine_precheck_ms": int(phase_latency.get("engine_precheck_ms") or 0),
-            # 1.12.55 - a quebra de engine_precheck_ms. Um comando de campo
+            # 1.12.56 - a quebra de engine_precheck_ms. Um comando de campo
             # mediu 135718ms nele com todas as demais fases somando ~5s; as
             # tres abaixo dizem qual das partes gastou. Vivem DENTRO de
             # engine_precheck_ms, entao nao entram no calculo de nao atribuido.
@@ -976,7 +976,7 @@ def run_command_job(
             "remote_result_ms": None,
             "remote_result_bundled_with_dispatch": True,
             "post_state_verify_ms": latency["verification_ms"],
-            # 1.12.55 - session_prepare/dispatch/verification/progress vivem
+            # 1.12.56 - session_prepare/dispatch/verification/progress vivem
             # DENTRO de handle_command_ms; somá-los aqui contaria duas vezes.
             "unaccounted_ms": max(0, latency["remote_execute_ms"] - (
                 latency["engine_precheck_ms"] + latency["session_wait_ms"]
