@@ -54,7 +54,7 @@ except ModuleNotFoundError:
         EVENT_TRANSPORT = _event_transport_module.EVENT_TRANSPORT
 
 LOG = logging.getLogger("leaphub.telemetry")
-ENGINE_VERSION = "1.12.53"  # entrega com keep-alive ciente da janela do servidor
+ENGINE_VERSION = "1.12.54"  # fases do comando remoto fecham a soma de remote_execute_ms
 
 # Hospedagem compartilhada (Apache/LiteSpeed) fecha a conexão ociosa em poucos
 # segundos. Reaproveitar depois disso escreve num socket já fechado e devolve
@@ -1290,6 +1290,10 @@ class TelemetryEngine:
         if account_id < 1:
             return connector.handle_command(payload, progress=progress)
 
+        # 1.12.54 — nada entre a entrada do método e a trava de sessão tinha
+        # contador. Com session_wait/login/prepare/verification todos em 0 e o
+        # dispatch em ~4s, comandos de 94s deixavam 90s sem atribuição nenhuma.
+        engine_started = time.monotonic()
         self.assert_account_cloud_allowed(environment, account_id, "command")
         with self.lock, self._db() as db:
             row = db.execute(
@@ -1316,6 +1320,7 @@ class TelemetryEngine:
         # em nenhuma fase, e session_prepare_ms mede apenas o open_client() do
         # conector, que é ~0ms com cliente emprestado.
         session_wait_started = time.monotonic()
+        engine_precheck_ms = int(round((session_wait_started - engine_started) * 1000))
         with self._session_operation_lock(subscription_id):
             session_wait_ms = int(round((time.monotonic() - session_wait_started) * 1000))
             session_login_ms = 0
@@ -1351,20 +1356,34 @@ class TelemetryEngine:
 
             session["last_used_at"] = now_epoch
             try:
-                result = connector.handle_command(
-                    payload,
-                    progress=progress,
-                    borrowed_client=session["client"],
-                    borrowed_vehicles=session.get("vehicles") if isinstance(session.get("vehicles"), list) else None,
-                )
+                handle_started = time.monotonic()
+                try:
+                    result = connector.handle_command(
+                        payload,
+                        progress=progress,
+                        borrowed_client=session["client"],
+                        borrowed_vehicles=session.get("vehicles") if isinstance(session.get("vehicles"), list) else None,
+                    )
+                finally:
+                    handle_command_ms = int(round((time.monotonic() - handle_started) * 1000))
                 session["last_used_at"] = time.time()
                 self.record_account_auth_success(environment, account_id, "command_session")
+                result["session_retained_for_fast_confirmation"] = True
+                arm_started = time.monotonic()
+                try:
+                    self._arm_command_confirmation(subscription_id, payload, result)
+                finally:
+                    confirmation_arm_ms = int(round((time.monotonic() - arm_started) * 1000))
+                # As fases só entram depois do arme: assim `handle_command_ms` e
+                # `confirmation_arm_ms` fecham a soma com remote_execute_ms e o
+                # que sobrar de não atribuído fica realmente sem candidato.
                 phase = result.get("phase_latency_ms")
                 if isinstance(phase, dict):
                     phase["session_wait_ms"] = session_wait_ms
                     phase["session_login_ms"] = session_login_ms
-                result["session_retained_for_fast_confirmation"] = True
-                self._arm_command_confirmation(subscription_id, payload, result)
+                    phase["engine_precheck_ms"] = engine_precheck_ms
+                    phase["handle_command_ms"] = handle_command_ms
+                    phase["confirmation_arm_ms"] = confirmation_arm_ms
                 return result
             except Exception as exc:
                 session["last_used_at"] = time.time()

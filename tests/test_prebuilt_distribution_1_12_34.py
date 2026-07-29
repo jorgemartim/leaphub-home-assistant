@@ -8,7 +8,7 @@ CONFIG = yaml.safe_load((ROOT / 'leaphub_gateway/config.yaml').read_text(encodin
 CHANGELOG = (ROOT / 'leaphub_gateway/CHANGELOG.md').read_text(encoding='utf-8')
 
 checks = {
-    'version': CONFIG.get('version') in {'1.12.48', '1.12.53'},
+    'version': CONFIG.get('version') in {'1.12.48', '1.12.54'},
     'prebuilt_image': CONFIG.get('image') == 'ghcr.io/jorgemartim/leaphub-gateway',
     'amd64_only': CONFIG.get('arch') == ['amd64'],
     'single_build_job': 'Build image first, publish App version last' in BUILD and 'matrix:' not in BUILD,
@@ -18,9 +18,9 @@ checks = {
     'anonymous_check_blocks_promotion': 'continue-on-error: true' not in BUILD and 'Verify anonymous GHCR access before exposing update to Home Assistant' in BUILD and 'Promote App metadata only after image is public' in BUILD,
     'source_label': 'org.opencontainers.image.source=https://github.com/jorgemartim/leaphub-home-assistant' in BUILD,
     'release_summary': 'GITHUB_STEP_SUMMARY' in BUILD,
-    'single_changelog_heading': re.findall(r'^##\s+(.+)$', CHANGELOG, flags=re.MULTILINE) == ['1.12.53'],
+    'single_changelog_heading': re.findall(r'^##\s+(.+)$', CHANGELOG, flags=re.MULTILINE) == ['1.12.54'],
 }
 failed=[name for name, ok in checks.items() if not ok]
 if failed:
     raise SystemExit(f'failed: {failed}')
-print({'ok': True, 'checks': len(checks), 'version': '1.12.53'})
+print({'ok': True, 'checks': len(checks), 'version': '1.12.54'})
