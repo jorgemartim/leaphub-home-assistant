@@ -54,7 +54,7 @@ except ModuleNotFoundError:
         EVENT_TRANSPORT = _event_transport_module.EVENT_TRANSPORT
 
 LOG = logging.getLogger("leaphub.telemetry")
-ENGINE_VERSION = "1.12.60"  # diagnostico de confirmacao inconclusiva
+ENGINE_VERSION = "1.12.61"  # diagnostico de confirmacao inconclusiva
 
 # Hospedagem compartilhada (Apache/LiteSpeed) fecha a conexão ociosa em poucos
 # segundos. Reaproveitar depois disso escreve num socket já fechado e devolve
@@ -3189,8 +3189,52 @@ class TelemetryEngine:
             return False
         return None
 
+    # 1.12.61 — o relógio da nuvem chega ligeiramente adiantado em relação ao do
+    # gateway (medido em ~1 min em 30/07/2026). Uma amostra pouco à frente é
+    # normal e continua servindo; muito à frente não. O teto existe como guarda
+    # contra interpretar o fuso na direção errada: se algum dia o carimbo vier
+    # mesmo em UTC, presumi-lo local jogaria a amostra ~3h no futuro, e é melhor
+    # não confirmar nada do que confirmar com carimbo impossível.
+    COMMAND_SAMPLE_FUTURE_TOLERANCE_SECONDS = 900.0
+
     @staticmethod
-    def _command_sample_lag(telemetry: dict[str, Any], command_started_at: float) -> float | None:
+    def _command_sample_epoch(telemetry: dict[str, Any]) -> float | None:
+        """Epoch da captura da amostra, com o fuso resolvido em um lugar só.
+
+        `captured_at` chega **sem fuso** quando a nuvem informa `collectTime`: a
+        `leapmotor_api` faz `datetime.strptime` (ingênuo, com `noqa: DTZ007`) e o
+        connector serializa com `isoformat()`. Presumir UTC nesse caso desloca o
+        carimbo pelo offset do host.
+
+        Isso foi medido em produção em 30/07/2026, num host em -03:00: três
+        comandos consecutivos relataram a amostra 10739s, 10740s e 10777s antes do
+        envio, com o carro respondendo e a cortina do teto abrindo e fechando de
+        fato. Que era deslocamento fixo e não atraso real ficou provado pelos três
+        valores **não** crescerem com os 2 min de intervalo entre os comandos —
+        atraso real cresceria. O site já lia o mesmo campo como hora local (via
+        `strtotime`) e exibia a idade correta; só esta comparação divergia.
+
+        Por isso, sem fuso = hora local. Frescura e atraso passam a derivar deste
+        único ponto para não poderem discordar entre si.
+        """
+        raw = telemetry.get("captured_at")
+        if not raw:
+            return None
+        try:
+            parsed = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return None
+        if parsed.tzinfo is None:
+            # `astimezone()` num datetime ingênuo assume hora local e anexa o
+            # offset do host, que é o que o carimbo da nuvem representa.
+            parsed = parsed.astimezone()
+        try:
+            return parsed.timestamp()
+        except (OverflowError, OSError, ValueError):
+            return None
+
+    @classmethod
+    def _command_sample_lag(cls, telemetry: dict[str, Any], command_started_at: float) -> float | None:
         """Distância em segundos entre a captura da amostra e o envio do comando.
 
         Positivo = o carro não subiu nada novo depois do comando. É a diferença
@@ -3203,31 +3247,23 @@ class TelemetryEngine:
         """
         if command_started_at <= 0:
             return None
-        raw = telemetry.get("captured_at")
-        if not raw:
+        captured = cls._command_sample_epoch(telemetry)
+        if captured is None:
             return None
-        try:
-            parsed = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
-            if parsed.tzinfo is None:
-                parsed = parsed.replace(tzinfo=timezone.utc)
-            return command_started_at - parsed.timestamp()
-        except (TypeError, ValueError, OverflowError):
-            return None
+        return command_started_at - captured
 
-    @staticmethod
-    def _command_sample_is_fresh(telemetry: dict[str, Any], command_started_at: float) -> bool:
+    @classmethod
+    def _command_sample_is_fresh(cls, telemetry: dict[str, Any], command_started_at: float) -> bool:
         if command_started_at <= 0:
             return True
-        raw = telemetry.get("captured_at")
-        if not raw:
+        lag = cls._command_sample_lag(telemetry, command_started_at)
+        if lag is None:
+            # Sem carimbo comparável a frescura é presumida, como antes: é melhor
+            # avaliar a amostra do que descartar toda confirmação por falta de hora.
             return True
-        try:
-            parsed = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
-            if parsed.tzinfo is None:
-                parsed = parsed.replace(tzinfo=timezone.utc)
-            return parsed.timestamp() >= command_started_at - 2.0
-        except (TypeError, ValueError, OverflowError):
-            return True
+        if lag < -cls.COMMAND_SAMPLE_FUTURE_TOLERANCE_SECONDS:
+            return False
+        return lag <= 2.0
 
     # 1.12.56 — os campos que `_command_confirmation` consulta, por comando.
     # Comandos confirmados executam e o dono vê "não foi confirmado dentro da

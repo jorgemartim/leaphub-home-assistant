@@ -101,13 +101,18 @@ check(
     "_command_sample_is_fresh" in ENGINE,
     "a regra de frescura desapareceu; o atraso perde referência",
 )
+# 1.12.61 — este check afirmava a expressão literal `command_started_at - 2.0`.
+# O refactor que centralizou o parsing do carimbo passou a comparar o atraso já
+# calculado (`lag <= 2.0`) e o literal deixou de existir, quebrando o contrato por
+# forma e não por garantia. O que importa é a margem de 2s continuar existindo e
+# visível, não como ela é escrita.
 check(
-    "command_started_at - 2.0" in ENGINE,
-    "a margem de 2s da frescura mudou sem contrato; é ela que hoje descarta "
-    "100% das amostras e o valor precisa ser visível",
+    "lag <= 2.0" in ENGINE or "command_started_at - 2.0" in ENGINE,
+    "a margem de 2s da frescura desapareceu; ela é o que separa amostra de antes "
+    "e de depois do comando, e o valor precisa ficar visível no código",
 )
 
 if failures:
     raise SystemExit("command sample lag contract failed:\n- " + "\n- ".join(failures))
 
-print({"ok": True, "checks": 12, "version": "1.12.60"})
+print({"ok": True, "checks": 12, "version": "1.12.61"})

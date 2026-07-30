@@ -43,7 +43,7 @@ except ImportError:
         _privacy_spec.loader.exec_module(_privacy_module)
         sanitize_log = _privacy_module.sanitize_log
 
-CONNECTOR_VERSION = "1.12.60"
+CONNECTOR_VERSION = "1.12.61"
 MAX_INPUT_BYTES = 1024 * 1024
 logging.getLogger("leapmotor_api").setLevel(logging.WARNING)
 LOGGER = logging.getLogger("leaphub.connector")
@@ -138,7 +138,7 @@ EXPERIMENTAL_COMMAND_METHODS: dict[str, str] = {
     # fechado até um administrador liberar o recurso para um proprietário
     # específico, do mesmo modo que o Sentinela, e ainda exige a confirmação
     # explícita de quem aciona. O motivo de cada um estar aqui e não na matriz
-    # estável está em RELEASE-1.12.60.md.
+    # estável está em RELEASE-1.12.61.md.
     "autopark": "autopark",
     "piloted_parking": "piloted_parking",
     "on3_on": "on3_on",
@@ -751,10 +751,20 @@ def first_text(*values: Any, max_length: int = 120) -> str | None:
 
 
 def iso_timestamp(value: Any) -> str:
+    """Carimbo ISO **sempre com fuso**, para nenhum consumidor ter de adivinhar.
+
+    1.12.61 — a `leapmotor_api` entrega `collect_time`/`create_time` como
+    datetime ingênuo (`strptime` com `noqa: DTZ007`), e devolver `isoformat()` cru
+    produzia string sem offset. Cada lado então presumia um fuso diferente: o site
+    lia como hora local (`strtotime`) e acertava a idade; o portão de frescura da
+    confirmação presumia UTC e deslocava o carimbo pelo offset do host, medido em
+    ~10800s num host -03:00 — o suficiente para descartar 100% das amostras e
+    nenhum comando ser confirmado. Anexar o fuso local aqui resolve na origem.
+    """
     if isinstance(value, datetime):
-        return value.isoformat()
+        return value.astimezone().isoformat() if value.tzinfo is None else value.isoformat()
     if isinstance(value, date):
-        return datetime.combine(value, datetime.min.time()).isoformat()
+        return datetime.combine(value, datetime.min.time()).astimezone().isoformat()
     return datetime.now().astimezone().isoformat()
 
 
