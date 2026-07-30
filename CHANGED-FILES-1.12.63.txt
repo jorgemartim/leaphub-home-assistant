@@ -1,11 +1,11 @@
 CHANGED-FILES-1.12.61.txt
-CHANGED-FILES-1.12.62.txt
+CHANGED-FILES-1.12.63.txt
 GITHUB-RECOVERY-1.12.61.md
-GITHUB-RECOVERY-1.12.62.md
+GITHUB-RECOVERY-1.12.63.md
 RELEASE-1.12.61.md
-RELEASE-1.12.62.md
+RELEASE-1.12.63.md
 leaphub_gateway/CHANGELOG.md
-leaphub_gateway/RELEASE-1.12.62.md
+leaphub_gateway/RELEASE-1.12.63.md
 leaphub_gateway/RELEASE_TARGET
 leaphub_gateway/connector.py
 leaphub_gateway/connector_server.py
@@ -53,3 +53,4 @@ tests/test_sentry_experimental_1_12_25.py
 tests/test_session_refresh_1_12_53.py
 tests/test_single_ocpp_1_12_17.py
 tests/test_status_delivery_1_12_21.py
+tests/test_sunshade_mapping_1_12_63.py

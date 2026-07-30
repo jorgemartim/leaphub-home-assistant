@@ -43,7 +43,7 @@ except ImportError:
         _privacy_spec.loader.exec_module(_privacy_module)
         sanitize_log = _privacy_module.sanitize_log
 
-CONNECTOR_VERSION = "1.12.62"
+CONNECTOR_VERSION = "1.12.63"
 MAX_INPUT_BYTES = 1024 * 1024
 logging.getLogger("leapmotor_api").setLevel(logging.WARNING)
 LOGGER = logging.getLogger("leaphub.connector")
@@ -138,7 +138,7 @@ EXPERIMENTAL_COMMAND_METHODS: dict[str, str] = {
     # fechado até um administrador liberar o recurso para um proprietário
     # específico, do mesmo modo que o Sentinela, e ainda exige a confirmação
     # explícita de quem aciona. O motivo de cada um estar aqui e não na matriz
-    # estável está em RELEASE-1.12.62.md.
+    # estável está em RELEASE-1.12.63.md.
     "autopark": "autopark",
     "piloted_parking": "piloted_parking",
     "on3_on": "on3_on",
@@ -2314,6 +2314,29 @@ def serialize_vehicle(
 
     roof_opening = first_numeric(attribute(security, "roof_opening"), map_numeric(cloud_scalars, "roofOpening", "sunroofOpening", "roofOpenPercent"))
     sunshade_position = first_numeric(attribute(windows, "sun_shade"), map_numeric(cloud_scalars, "sunShade", "sunshadeOpening", "sunshadePercent"))
+    # 1.12.63 — no C10 e no B10 o vidro do teto é fixo: o único motor é o da
+    # cortina. É o estado dela que a nuvem publica no signal 1724, que a
+    # `leapmotor_api` entrega como `security.roof_opening`. Medido nos dois
+    # sentidos em 30/07/2026, no carro do proprietário: cortina aberta -> 100,
+    # cortina fechada -> 0, enquanto `sun_shade` e `sunshadeOpening` nunca vieram
+    # preenchidos.
+    #
+    # Sem esta troca três coisas ficam erradas de uma vez: a figura do carro
+    # acende o selo do teto solar quando a cortina abre, `sunshade_open` fica
+    # nulo para sempre, e o matcher de `sunshade_open`/`sunshade_close` não tem o
+    # que ler — o comando executa no carro e a tela nunca conclui.
+    #
+    # A troca é condicionada ao modelo de propósito: `rightList` declara o
+    # direito 160 (teto solar) mesmo nesses carros, ou seja, o direito não prova
+    # o mecanismo. Um modelo com teto deslizante de verdade continua no caminho
+    # de cima, e um carro que publique os dois campos também.
+    if (
+        sunshade_position is None
+        and roof_opening is not None
+        and visual_model_family(model) in {"c10", "b10"}
+    ):
+        sunshade_position = roof_opening
+        roof_opening = None
     roof_state = window_open(roof_opening) if roof_opening is not None else first_bool(map_text(cloud_scalars, "sunroofOpen", "roofOpen"))
     sunshade_state = window_open(sunshade_position) if sunshade_position is not None else first_bool(map_text(cloud_scalars, "sunshadeOpen"))
 
