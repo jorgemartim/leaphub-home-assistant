@@ -59,7 +59,7 @@ def check(condition: bool, message: str) -> None:
     if not condition:
         failures.append(message)
 
-check(connector.CONNECTOR_VERSION == "1.12.58", "Versão do Connector divergente")
+check(connector.CONNECTOR_VERSION == "1.12.59", "Versão do Connector divergente")
 check(connector.COMMAND_METHODS == expected_methods, "Matriz COMMAND_METHODS divergente")
 check(len(connector.COMMAND_METHODS) == 39, "A matriz precisa conter 39 comandos")
 check(
@@ -67,10 +67,19 @@ check(
         "sentry_on": "sentry_mode_on",
         "sentry_off": "sentry_mode_off",
         "prepare_car": "prepare_car",
+        "autopark": "autopark",
+        "piloted_parking": "piloted_parking",
+        "on3_on": "on3_on",
+        "on3_off": "on3_off",
+        "seat_adjust": "seat_adjust",
+        "rear_seats": "rear_seats",
+        "fota_download": "fota_download",
+        "fota_install": "fota_install",
+        "fota_schedule": "fota_schedule",
     },
     "Matriz experimental divergente",
 )
-check(len(connector.ALL_COMMAND_METHODS) == 42, "Matriz total precisa conter 39 estáveis + 3 experimentais")
+check(len(connector.ALL_COMMAND_METHODS) == 51, "Matriz total precisa conter 39 estáveis + 12 experimentais")
 
 # Cada comando (estável e experimental) precisa declarar o direito exigido, para
 # que a matriz possa ser filtrada pela capacidade real do veículo.

@@ -80,4 +80,4 @@ with tempfile.TemporaryDirectory(prefix="leaphub-health-") as tmp:
     # A conexão da fila é reaproveitada desde 1.12.51; libere antes do tempdir sair.
     server.TELEMETRY.close_storage()
 
-print({"ok": True, "checks": 9, "version": "1.12.58"})
+print({"ok": True, "checks": 9, "version": "1.12.59"})

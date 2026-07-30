@@ -10,17 +10,26 @@ assert spec is not None and spec.loader is not None
 connector = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(connector)
 
-assert connector.CONNECTOR_VERSION == "1.12.58"
+assert connector.CONNECTOR_VERSION == "1.12.59"
 assert len(connector.COMMAND_METHODS) == 39
 assert connector.EXPERIMENTAL_COMMAND_METHODS == {
     "sentry_on": "sentry_mode_on",
     "sentry_off": "sentry_mode_off",
     "prepare_car": "prepare_car",
+    "autopark": "autopark",
+    "piloted_parking": "piloted_parking",
+    "on3_on": "on3_on",
+    "on3_off": "on3_off",
+    "seat_adjust": "seat_adjust",
+    "rear_seats": "rear_seats",
+    "fota_download": "fota_download",
+    "fota_install": "fota_install",
+    "fota_schedule": "fota_schedule",
 }
 # O Sentinela tem sonda e diagnóstico próprios; nenhum outro experimental os herda.
 assert connector.SENTRY_COMMANDS == {"sentry_on", "sentry_off"}
 assert set(connector.COMMAND_METHODS).isdisjoint(connector.EXPERIMENTAL_COMMAND_METHODS)
-assert len(connector.ALL_COMMAND_METHODS) == 42
+assert len(connector.ALL_COMMAND_METHODS) == 51
 
 source = CONNECTOR_PATH.read_text(encoding="utf-8")
 assert 'experimental_confirmed' in source

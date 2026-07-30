@@ -117,5 +117,5 @@ def test_diagnosis_never_logs_telemetry_values():
 
 
 def test_version_follows_the_release():
-    assert 'ENGINE_VERSION = "1.12.58"' in ENGINE
-    assert 'CONNECTOR_VERSION = "1.12.58"' in (APP / "connector.py").read_text(encoding="utf-8")
+    assert 'ENGINE_VERSION = "1.12.59"' in ENGINE
+    assert 'CONNECTOR_VERSION = "1.12.59"' in (APP / "connector.py").read_text(encoding="utf-8")

@@ -43,7 +43,7 @@ except ImportError:
         _privacy_spec.loader.exec_module(_privacy_module)
         sanitize_log = _privacy_module.sanitize_log
 
-CONNECTOR_VERSION = "1.12.58"
+CONNECTOR_VERSION = "1.12.59"
 MAX_INPUT_BYTES = 1024 * 1024
 logging.getLogger("leapmotor_api").setLevel(logging.WARNING)
 LOGGER = logging.getLogger("leaphub.connector")
@@ -134,7 +134,35 @@ EXPERIMENTAL_COMMAND_METHODS: dict[str, str] = {
     # montado aqui é allow-listed e validado, mas segue exigindo confirmação
     # explícita do proprietário até haver captura de tráfego real.
     "prepare_car": "prepare_car",
+    # 1.12.59 — o restante da superfície da biblioteca. Cada um destes fica
+    # fechado até um administrador liberar o recurso para um proprietário
+    # específico, do mesmo modo que o Sentinela, e ainda exige a confirmação
+    # explícita de quem aciona. O motivo de cada um estar aqui e não na matriz
+    # estável está em RELEASE-1.12.59.md.
+    "autopark": "autopark",
+    "piloted_parking": "piloted_parking",
+    "on3_on": "on3_on",
+    "on3_off": "on3_off",
+    "seat_adjust": "seat_adjust",
+    "rear_seats": "rear_seats",
+    "fota_download": "fota_download",
+    "fota_install": "fota_install",
+    "fota_schedule": "fota_schedule",
 }
+
+# Comandos que podem pôr o carro em movimento sozinho. Além do gate experimental
+# e da liberação por proprietário, exigem um reconhecimento próprio: quem aciona
+# precisa declarar que está junto do carro e com ele à vista. O aplicativo não
+# tem como provar isso — o que ele pode fazer é não deixar acontecer por
+# distração, e registrar que foi declarado.
+VEHICLE_MOTION_COMMANDS = frozenset({"autopark", "piloted_parking"})
+
+# Comandos cuja forma de pacote a biblioteca declara apenas como "the full JSON
+# payload string": não há vocabulário documentado para validar por campo. Em vez
+# de repassar o que vier, o gateway confere a *forma* (objeto raso, chaves com
+# nome plausível, valores escalares, tetos de quantidade e tamanho) e recusa o
+# resto. Ver raw_command_payload().
+RAW_PAYLOAD_COMMANDS = frozenset({"seat_adjust", "piloted_parking"})
 # Só o Sentinela tem diagnóstico próprio (sonda, evidência e resumo do resultado).
 # Este conjunto era derivado de EXPERIMENTAL_COMMAND_METHODS; deixou de ser quando
 # um segundo experimental entrou, para que prepare_car não passe a ser tratado como
@@ -175,6 +203,17 @@ COMMAND_REQUIRED_RIGHT: dict[str, int] = {
     # experimentais
     "sentry_on": 220, "sentry_off": 220,
     "prepare_car": 360,
+    "autopark": 150,
+    "piloted_parking": 350,
+    # ON3 tem código de direito próprio (VehicleRight.ON3 = 410), ao contrário do
+    # que se poderia supor por não ter descrição funcional.
+    "on3_on": 410, "on3_off": 410,
+    "seat_adjust": 280,
+    "rear_seats": 470,
+    "fota_download": 390,
+    "fota_install": 391,
+    # O agendamento tem direito próprio, separado do da instalação.
+    "fota_schedule": 392,
 }
 
 # Flags de hardware (VehicleAbility) -> direitos que elas implicam, para quando a
@@ -2995,6 +3034,30 @@ def execute_vehicle_command(
         return method(vehicle_id, operation=operation)
     if command == "prepare_car":
         return method(vehicle_id, params=prepare_car_parameters(parameters))
+    if command in RAW_PAYLOAD_COMMANDS:
+        return method(vehicle_id, params=raw_command_payload(command, parameters))
+    if command == "rear_seats":
+        # A biblioteca envia como {"seatInfo": <texto>} e não documenta o formato.
+        # Confere-se o que dá: texto curto, sem controle nem separador estranho.
+        seat_info = str(parameters.get("seat_info", parameters.get("seatInfo") or "")).strip()
+        if seat_info == "":
+            raise ValueError("Informe a configuração dos bancos.")
+        if len(seat_info) > 120 or re.search(r"[^A-Za-z0-9_,:;.\-]", seat_info) is not None:
+            raise ValueError("Configuração de bancos inválida.")
+        return method(vehicle_id, seat_info=seat_info)
+    if command in {"fota_download", "fota_install"}:
+        return method(vehicle_id, task_id=fota_task_id(parameters))
+    if command == "fota_schedule":
+        schedule_time = str(parameters.get("schedule_time") or "").strip()
+        # A biblioteca repassa o texto como veio; exigir o formato aqui evita
+        # descobrir o erro só quando o carro recusar a instalação.
+        if re.match(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$", schedule_time) is None:
+            raise ValueError("Informe a data e a hora no formato AAAA-MM-DD HH:MM:SS.")
+        try:
+            datetime.strptime(schedule_time, "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            raise ValueError("Data ou hora inexistente.") from None
+        return method(vehicle_id, task_id=fota_task_id(parameters), schedule_time=schedule_time)
     if command in SEAT_COMFORT_COMMANDS:
         # A biblioteca codifica o par como "posição,nível" (posição 1-6, nível 0-3)
         # e exige os dois por palavra-chave. Recusar fora de faixa aqui evita
@@ -3134,6 +3197,106 @@ def climate_profile_from_status(climate: Any) -> str:
     if any(token in text for token in ("fast_heat", "heat", "hot", "aquec")):
         return "heating"
     return "generic"
+
+
+def fota_task_id(parameters: dict[str, Any]) -> int:
+    """Identificador da tarefa de atualização, vindo da listagem FOTA da nuvem.
+
+    O gateway ainda não expõe essa listagem, então quem aciona precisa informar o
+    número. Conferir aqui evita mandar `task_id=0` para a nuvem e receber de volta
+    uma recusa opaca.
+    """
+    try:
+        task_id = int(parameters.get("task_id", parameters.get("taskId")))
+    except (TypeError, ValueError):
+        raise ValueError("Informe o número da tarefa de atualização.") from None
+    if task_id < 1:
+        raise ValueError("Número de tarefa de atualização inválido.")
+    return task_id
+
+
+RAW_PAYLOAD_MAX_KEYS = 12
+RAW_PAYLOAD_MAX_NESTED_KEYS = 8
+RAW_PAYLOAD_MAX_BYTES = 512
+RAW_PAYLOAD_MAX_TEXT = 120
+RAW_PAYLOAD_KEY_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,39}$")
+
+
+def _raw_payload_scalar(value: Any, key: str) -> Any:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        if value < -1_000_000 or value > 1_000_000:
+            raise ValueError(f"Valor fora da faixa aceita em '{key}'.")
+        return value
+    if isinstance(value, float):
+        if value != value or value in (float("inf"), float("-inf")):
+            raise ValueError(f"Valor numérico inválido em '{key}'.")
+        return value
+    if isinstance(value, str):
+        if len(value) > RAW_PAYLOAD_MAX_TEXT:
+            raise ValueError(f"Texto longo demais em '{key}'.")
+        return value
+    raise ValueError(f"Tipo não aceito em '{key}'.")
+
+
+def raw_command_payload(command: str, parameters: dict[str, Any]) -> dict[str, Any]:
+    """Confere a *forma* de um pacote cujo vocabulário não é documentado.
+
+    `seat_adjust` (280) e `piloted_parking` (350) são declarados na biblioteca
+    apenas como "the full JSON payload string" — não existe lista de campos para
+    validar por significado. Repassar o que o site mandar seria entregar à nuvem
+    um pacote que ninguém conferiu, então o que se confere é o que dá para
+    conferir sem inventar semântica: precisa ser um objeto, com no máximo
+    RAW_PAYLOAD_MAX_KEYS chaves de nome plausível, valores escalares (ou um único
+    nível de objeto), e tamanho total limitado.
+
+    Isto **não** valida se o comando faz sentido para o carro — só garante que o
+    gateway não vira um túnel para conteúdo arbitrário. É a razão de estes dois
+    comandos exigirem liberação por proprietário e confirmação explícita.
+    """
+    raw = parameters.get("payload", parameters.get("params"))
+    if isinstance(raw, str):
+        text = raw.strip()
+        if text == "":
+            raise ValueError("Informe os dados do comando.")
+        try:
+            raw = json.loads(text)
+        except (ValueError, TypeError):
+            raise ValueError("Os dados do comando não são um JSON válido.") from None
+    if not isinstance(raw, dict):
+        raise ValueError("Os dados do comando precisam ser um objeto.")
+    if raw == {}:
+        raise ValueError("Informe os dados do comando.")
+    if len(raw) > RAW_PAYLOAD_MAX_KEYS:
+        raise ValueError("Os dados do comando têm campos demais.")
+
+    payload: dict[str, Any] = {}
+    for key, value in raw.items():
+        name = str(key)
+        if RAW_PAYLOAD_KEY_PATTERN.match(name) is None:
+            raise ValueError(f"Nome de campo não aceito: '{name[:40]}'.")
+        if isinstance(value, dict):
+            if len(value) > RAW_PAYLOAD_MAX_NESTED_KEYS:
+                raise ValueError(f"O campo '{name}' tem subcampos demais.")
+            nested: dict[str, Any] = {}
+            for nested_key, nested_value in value.items():
+                nested_name = str(nested_key)
+                if RAW_PAYLOAD_KEY_PATTERN.match(nested_name) is None:
+                    raise ValueError(f"Nome de subcampo não aceito: '{nested_name[:40]}'.")
+                if isinstance(nested_value, (dict, list, tuple)):
+                    raise ValueError(f"O campo '{name}.{nested_name}' aninha demais.")
+                nested[nested_name] = _raw_payload_scalar(nested_value, f"{name}.{nested_name}")
+            payload[name] = nested
+            continue
+        if isinstance(value, (list, tuple)):
+            raise ValueError(f"Lista não é aceita em '{name}'.")
+        payload[name] = _raw_payload_scalar(value, name)
+
+    encoded = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+    if len(encoded.encode("utf-8")) > RAW_PAYLOAD_MAX_BYTES:
+        raise ValueError("Os dados do comando são grandes demais.")
+    return payload
 
 
 def prepare_car_parameters(parameters: dict[str, Any]) -> dict[str, Any]:
@@ -3412,6 +3575,18 @@ def handle_command(
         confirmed = str(parameters.get("experimental_confirmed") or "").strip().lower()
         if confirmed not in {"1", "true", "on", "yes"}:
             raise ValueError("O comando experimental exige confirmação explícita do proprietário.")
+    if command in VEHICLE_MOTION_COMMANDS:
+        # Segundo trava, próprio dos comandos que movem o carro. A liberação do
+        # administrador e a confirmação experimental dizem que o recurso está
+        # aberto para este proprietário; esta diz que, agora, ele está junto do
+        # carro e com ele à vista. Nenhum aplicativo consegue verificar isso — o
+        # que dá para fazer é exigir que seja declarado, para que um toque
+        # distraído não ponha o carro em movimento.
+        acknowledged = str(parameters.get("motion_acknowledged") or "").strip().lower()
+        if acknowledged not in {"1", "true", "on", "yes"}:
+            raise ValueError(
+                "Este comando movimenta o veículo. Confirme que você está junto dele e com ele à vista."
+            )
     operation_password = require_text(credentials, "operation_password", "o PIN do veículo", 20)
     wake_on_sleep = bool(payload.get("wake_before", True))
     verify_after = bool(payload.get("verify_after", True))
