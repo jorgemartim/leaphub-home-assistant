@@ -43,7 +43,7 @@ except ImportError:
         _privacy_spec.loader.exec_module(_privacy_module)
         sanitize_log = _privacy_module.sanitize_log
 
-CONNECTOR_VERSION = "1.12.59"
+CONNECTOR_VERSION = "1.12.60"
 MAX_INPUT_BYTES = 1024 * 1024
 logging.getLogger("leapmotor_api").setLevel(logging.WARNING)
 LOGGER = logging.getLogger("leaphub.connector")
@@ -138,7 +138,7 @@ EXPERIMENTAL_COMMAND_METHODS: dict[str, str] = {
     # fechado até um administrador liberar o recurso para um proprietário
     # específico, do mesmo modo que o Sentinela, e ainda exige a confirmação
     # explícita de quem aciona. O motivo de cada um estar aqui e não na matriz
-    # estável está em RELEASE-1.12.59.md.
+    # estável está em RELEASE-1.12.60.md.
     "autopark": "autopark",
     "piloted_parking": "piloted_parking",
     "on3_on": "on3_on",

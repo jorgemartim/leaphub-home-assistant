@@ -211,4 +211,4 @@ def test_delivery_signs_every_attempt():
     source = (Path(__file__).resolve().parents[1] / "leaphub_gateway" / "telemetry_engine.py").read_text(encoding="utf-8")
     assert "def sign_headers() -> dict[str, str]:" in source
     assert "payload = self._post_delivery(url, headers, body, sign=sign_headers)" in source
-    assert 'ENGINE_VERSION = "1.12.59"' in source
+    assert 'ENGINE_VERSION = "1.12.60"' in source
