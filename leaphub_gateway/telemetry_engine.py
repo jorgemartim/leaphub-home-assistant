@@ -2731,13 +2731,28 @@ class TelemetryEngine:
         command_evaluated_samples = 0
         command_field_gaps: list[str] = []
         command_available_keys: list[str] = []
+        # 1.12.60 — atraso da amostra mais recente em relação ao envio do comando.
+        # É o sinal que separa duas coisas que o log antigo confundia: o carro
+        # recebeu e não obedeceu, ou o carro não subiu nada novo desde o envio.
+        command_sample_lag: float | None = None
         if command_mode and command_key:
+            command_started = float(subscription["command_started_at"] or 0)
             for vehicle in vehicles:
                 if command_vehicle_id and str(vehicle.get("remote_id") or "") != command_vehicle_id:
                     continue
                 command_target_seen = True
                 telemetry = vehicle.get("telemetry") if isinstance(vehicle.get("telemetry"), dict) else {}
-                if not self._command_sample_is_fresh(telemetry, float(subscription["command_started_at"] or 0)):
+                # As chaves observadas passaram a ser registradas para qualquer
+                # amostra, não só para a que sobrevive ao teste de frescura.
+                # Antes, amostra velha caía no `continue` abaixo sem tocar esta
+                # lista, e o log saía "chaves=[nenhuma]" — que se lê como "a
+                # telemetria veio vazia" quando o caso era só atraso.
+                if telemetry:
+                    command_available_keys = sorted(str(key) for key in telemetry.keys())[:40]
+                sample_lag = self._command_sample_lag(telemetry, command_started)
+                if sample_lag is not None and (command_sample_lag is None or sample_lag < command_sample_lag):
+                    command_sample_lag = sample_lag
+                if not self._command_sample_is_fresh(telemetry, command_started):
                     command_stale_samples += 1
                     continue
                 command_evaluated_samples += 1
@@ -2802,13 +2817,19 @@ class TelemetryEngine:
                 LOG.warning("Janela rápida de %s não encontrou o veículo-alvo do comando entre os dados retornados; assinatura será reconciliada pelo site.", sid)
             LOG.warning("Janela rápida de %s encerrada após %s leitura(s) sem confirmação conclusiva; telemetria voltou ao modo adaptativo.", sid, next_command_poll)
             # 1.12.56 — a linha acima diz que falhou; esta diz por quê.
+            # 1.12.60 — ganhou o atraso da amostra: com "descartadas por idade"
+            # sozinho não se sabia se o carro estava 3 segundos ou 3 horas atrás
+            # do comando, e é essa distância que diz se ele sequer acordou.
             LOG.warning(
                 "Confirmação inconclusiva de %s em %s: amostras avaliadas=%s, descartadas por idade=%s, "
-                "campos exigidos sem valor=[%s], chaves presentes na telemetria=[%s].",
+                "amostra mais recente %s, campos exigidos sem valor=[%s], chaves presentes na telemetria=[%s].",
                 command_key or "desconhecido",
                 sid,
                 command_evaluated_samples,
                 command_stale_samples,
+                "sem carimbo de hora" if command_sample_lag is None
+                else ("%.0fs antes do comando" % command_sample_lag if command_sample_lag > 0
+                      else "%.0fs depois do comando" % abs(command_sample_lag)),
                 ", ".join(command_field_gaps) or "nenhum",
                 ", ".join(command_available_keys) or "nenhuma",
             )
@@ -3167,6 +3188,31 @@ class TelemetryEngine:
         if normalized in {"0", "false", "no", "off", "closed", "close", "inactive", "stopped", "idle", "not_charging"}:
             return False
         return None
+
+    @staticmethod
+    def _command_sample_lag(telemetry: dict[str, Any], command_started_at: float) -> float | None:
+        """Distância em segundos entre a captura da amostra e o envio do comando.
+
+        Positivo = o carro não subiu nada novo depois do comando. É a diferença
+        entre "o carro recebeu e não obedeceu" e "o carro não reportou", que o
+        contador de amostras descartadas sozinho não conseguia expressar.
+
+        `None` quando não há como comparar: sem carimbo de hora na amostra ou
+        sem hora de envio registrada. Nesses casos a frescura é presumida (ver
+        `_command_sample_is_fresh`), então não há atraso a relatar.
+        """
+        if command_started_at <= 0:
+            return None
+        raw = telemetry.get("captured_at")
+        if not raw:
+            return None
+        try:
+            parsed = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return command_started_at - parsed.timestamp()
+        except (TypeError, ValueError, OverflowError):
+            return None
 
     @staticmethod
     def _command_sample_is_fresh(telemetry: dict[str, Any], command_started_at: float) -> bool:
