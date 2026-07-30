@@ -93,10 +93,17 @@ def test_unknown_command_reports_nothing_instead_of_raising():
 
 
 def test_three_causes_are_counted_separately():
-    for counter in ("command_stale_samples", "command_evaluated_samples", "command_field_gaps"):
+    # 1.12.62 — os contadores perderam o prefixo `command_` ao saírem do corpo do
+    # ciclo para `_evaluate_confirmation()`, que julga uma espera por vez. A
+    # garantia é a mesma: as três causas de "sem confirmação conclusiva" seguem
+    # contadas em separado, senão o diagnóstico volta a ser palpite.
+    for counter in ("stale_samples", "evaluated_samples", "field_gaps"):
         assert f"{counter} = " in ENGINE, counter
-    assert "command_stale_samples += 1" in ENGINE
-    assert "command_evaluated_samples += 1" in ENGINE
+    assert "stale_samples += 1" in ENGINE
+    assert "evaluated_samples += 1" in ENGINE
+    # E continuam saindo juntos no mesmo veredito, um por comando pendente.
+    for chave in ('"stale_samples":', '"evaluated_samples":', '"field_gaps":'):
+        assert chave in ENGINE, chave
 
 
 def test_diagnosis_is_logged_when_the_window_is_exhausted():
@@ -117,5 +124,5 @@ def test_diagnosis_never_logs_telemetry_values():
 
 
 def test_version_follows_the_release():
-    assert 'ENGINE_VERSION = "1.12.61"' in ENGINE
-    assert 'CONNECTOR_VERSION = "1.12.61"' in (APP / "connector.py").read_text(encoding="utf-8")
+    assert 'ENGINE_VERSION = "1.12.62"' in ENGINE
+    assert 'CONNECTOR_VERSION = "1.12.62"' in (APP / "connector.py").read_text(encoding="utf-8")

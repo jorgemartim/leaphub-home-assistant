@@ -54,7 +54,7 @@ except ModuleNotFoundError:
         EVENT_TRANSPORT = _event_transport_module.EVENT_TRANSPORT
 
 LOG = logging.getLogger("leaphub.telemetry")
-ENGINE_VERSION = "1.12.61"  # diagnostico de confirmacao inconclusiva
+ENGINE_VERSION = "1.12.62"  # diagnostico de confirmacao inconclusiva
 
 # Hospedagem compartilhada (Apache/LiteSpeed) fecha a conexão ociosa em poucos
 # segundos. Reaproveitar depois disso escreve num socket já fechado e devolve
@@ -144,6 +144,13 @@ class TelemetryYieldForManual(RuntimeError):
 class TelemetryEngine:
     """Adaptive polling and encrypted persistent delivery queue."""
 
+    # 1.12.62 — piso e teto do orçamento de leituras da janela de confirmação.
+    # Ficam aqui para que o `gateway_manager` e os contratos leiam o número de
+    # uma fonte só: quando o piso subiu de 5 para 8, o valor estava repetido em
+    # três lugares e um contrato reprovava por carimbar o antigo.
+    COMMAND_MAX_POLLS_FLOOR = 8
+    COMMAND_MAX_POLLS_CEILING = 12
+
     def __init__(
         self,
         options: dict[str, Any],
@@ -217,10 +224,20 @@ class TelemetryEngine:
         # mantém o último estado confirmado enquanto aguarda, portanto não há
         # motivo para consultar a nuvem a cada três segundos.
         self.command_seconds = self._bounded("telemetry_command_seconds", 12, 10, 60)
-        # Cinco amostras cobrem o atraso normal entre a aceitação da nuvem e a
-        # telemetria física do veículo. Instalações atualizadas que ainda tenham
-        # o valor legado 3 recebem o novo mínimo automaticamente.
-        self.command_max_polls = self._bounded("telemetry_command_max_polls", 5, 5, 8)
+        # 1.12.62 — este número deixou de ser o critério de encerramento e passou
+        # a ser teto de segurança: quem fecha a espera é o prazo da janela
+        # (`command_until`, até 180s). Com cinco leituras a cadência abaixo
+        # esgotava a janela em ~112s, e um carro que acabara de acordar era
+        # declarado inconclusivo com quase um minuto ainda disponível — foi o que
+        # aconteceu em campo com o `unlock` cuja amostra chegou a +89s. O piso
+        # cobre os 180s inteiros com a cadência abaixo; instalações com o valor
+        # legado menor são elevadas a ele automaticamente.
+        self.command_max_polls = self._bounded(
+            "telemetry_command_max_polls",
+            self.COMMAND_MAX_POLLS_FLOOR,
+            self.COMMAND_MAX_POLLS_FLOOR,
+            self.COMMAND_MAX_POLLS_CEILING,
+        )
         self.command_cadence = (self.command_seconds, 20, 35, 45, 60, 90, 120, 120)
         self.charging_seconds = self._bounded("telemetry_charging_seconds", 25, 15, 600)
         self.parked_seconds = self._bounded("telemetry_parked_seconds", 90, 60, 3600)
@@ -740,6 +757,33 @@ class TelemetryEngine:
                     db.execute("ALTER TABLE events ADD COLUMN event_kind TEXT NOT NULL DEFAULT 'change'")
                 db.executescript(
                     """
+                    -- 1.12.62 — uma linha por comando aguardando veredito.
+                    -- Antes a janela de confirmação morava em colunas únicas da
+                    -- assinatura: o segundo comando sobrescrevia o contexto do
+                    -- primeiro, que nunca recebia veredito nenhum. Aqui cada
+                    -- request_id espera o seu próprio, e uma amostra de
+                    -- telemetria é avaliada contra todos os pendentes.
+                    CREATE TABLE IF NOT EXISTS command_confirmations (
+                        confirmation_id TEXT PRIMARY KEY,
+                        subscription_id TEXT NOT NULL,
+                        request_id TEXT NOT NULL,
+                        command_key TEXT NOT NULL,
+                        command_vehicle_id TEXT NULL,
+                        context_json TEXT NOT NULL,
+                        started_at REAL NOT NULL,
+                        expires_at REAL NOT NULL,
+                        poll_count INTEGER NOT NULL DEFAULT 0,
+                        evaluated_samples INTEGER NOT NULL DEFAULT 0,
+                        stale_samples INTEGER NOT NULL DEFAULT 0,
+                        status TEXT NOT NULL DEFAULT 'pending',
+                        resolution TEXT NULL,
+                        resolved_at REAL NOT NULL DEFAULT 0,
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL,
+                        FOREIGN KEY(subscription_id) REFERENCES subscriptions(subscription_id) ON DELETE CASCADE
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_command_confirmations_pending
+                        ON command_confirmations(subscription_id, status, expires_at);
                     CREATE TABLE IF NOT EXISTS vehicle_state_cache (
                         subscription_id TEXT NOT NULL,
                         remote_id TEXT NOT NULL,
@@ -1843,6 +1887,311 @@ class TelemetryEngine:
             "session_preserved": self._has_session(subscription_id),
         }
 
+    # ------------------------------------------------------------------
+    # 1.12.62 — confirmações pendentes, uma por comando
+    #
+    # A janela de confirmação era uma só por assinatura, guardada em colunas
+    # da própria linha (`command_key`, `command_context_json`, ...). Dois
+    # comandos seguidos com chaves diferentes disputavam esse espaço: o
+    # segundo sobrescrevia o contexto do primeiro, e o primeiro nunca recebia
+    # veredito — nem confirmado, nem inconclusivo. Foi o que aconteceu em
+    # campo em 30/07/2026 com `sunshade_open` seguido de `unlock`.
+    #
+    # As colunas antigas continuam preenchidas com a espera mais recente,
+    # porque o painel e o diagnóstico as leem; a fonte da verdade passa a ser
+    # a tabela.
+    # ------------------------------------------------------------------
+    CONFIRMATION_RETENTION_SECONDS = 3600
+
+    @staticmethod
+    def _confirmation_id(subscription_id: str, command_key: str, vehicle_id: str, request_id: str) -> str:
+        base = str(request_id or "").strip()
+        if not base:
+            # Sem request_id resta o par comando+veículo para distinguir duas
+            # esperas — o mesmo critério que a versão anterior usava.
+            base = "auto:{}:{}".format(command_key, vehicle_id)
+        return "{}|{}".format(subscription_id, base)
+
+    def _match_pending_confirmation(
+        self,
+        db: sqlite3.Connection,
+        subscription_id: str,
+        command_key: str,
+        vehicle_id: str,
+        request_id: str,
+        now_epoch: float,
+    ) -> sqlite3.Row | None:
+        """Espera ativa que este boost deve estender em vez de duplicar.
+
+        O site repete o boost como sinal de recuperação. Reaproveitar a espera
+        preserva as amostras já contadas; criar outra reiniciaria a contagem a
+        cada repetição e a confirmação nunca terminaria.
+        """
+        rows = db.execute(
+            "SELECT * FROM command_confirmations WHERE subscription_id=? AND status='pending' AND expires_at>? "
+            "ORDER BY started_at DESC",
+            (subscription_id, now_epoch),
+        ).fetchall()
+        for row in rows:
+            if str(row["command_key"] or "") != command_key:
+                continue
+            if str(row["command_vehicle_id"] or "") != vehicle_id:
+                continue
+            existing_request = str(row["request_id"] or "")
+            # Boost sem request_id adota a espera existente; com request_id
+            # diferente, é outro comando e merece a sua própria espera.
+            if request_id and request_id != existing_request:
+                continue
+            return row
+        return None
+
+    def _register_confirmation(
+        self,
+        db: sqlite3.Connection,
+        subscription_id: str,
+        command_key: str,
+        vehicle_id: str,
+        request_id: str,
+        context_json: str,
+        seconds: int,
+        now_epoch: float,
+        now_iso: str,
+    ) -> tuple[str, bool]:
+        existing = self._match_pending_confirmation(
+            db, subscription_id, command_key, vehicle_id, request_id, now_epoch
+        )
+        if existing is not None:
+            db.execute(
+                "UPDATE command_confirmations SET expires_at=MAX(expires_at,?),context_json=?,updated_at=? "
+                "WHERE confirmation_id=?",
+                (now_epoch + seconds, context_json, now_iso, str(existing["confirmation_id"])),
+            )
+            return str(existing["confirmation_id"]), True
+        confirmation_id = self._confirmation_id(subscription_id, command_key, vehicle_id, request_id)
+        db.execute(
+            "INSERT OR REPLACE INTO command_confirmations "
+            "(confirmation_id,subscription_id,request_id,command_key,command_vehicle_id,context_json,"
+            "started_at,expires_at,poll_count,evaluated_samples,stale_samples,status,resolution,resolved_at,"
+            "created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,0,0,0,'pending',NULL,0,?,?)",
+            (
+                confirmation_id,
+                subscription_id,
+                request_id,
+                command_key,
+                vehicle_id or None,
+                context_json,
+                now_epoch,
+                now_epoch + seconds,
+                now_iso,
+                now_iso,
+            ),
+        )
+        return confirmation_id, False
+
+    @staticmethod
+    def _pending_confirmations(
+        db: sqlite3.Connection, subscription_id: str
+    ) -> list[sqlite3.Row]:
+        return list(
+            db.execute(
+                "SELECT * FROM command_confirmations WHERE subscription_id=? AND status='pending' "
+                "ORDER BY started_at ASC",
+                (subscription_id,),
+            ).fetchall()
+        )
+
+    # Folga antes de declarar vencida uma espera que ninguém mais visitou. Só
+    # existe para não competir com um ciclo em andamento na mesma assinatura.
+    CONFIRMATION_EXPIRY_GRACE_SECONDS = 60
+
+    def _prune_confirmations(self, db: sqlite3.Connection, now_epoch: float) -> int:
+        """Fecha esperas abandonadas e recolhe as já resolvidas.
+
+        Caminhos como `release_interactive` e `_mark_auth_required` zeram as
+        colunas de comando da assinatura; sem esta varredura a linha pendente
+        correspondente sobreviveria a todos os ciclos seguintes, e um comando
+        antigo continuaria consumindo leituras de um veredito que ninguém mais
+        espera.
+        """
+        expired = db.execute(
+            "UPDATE command_confirmations SET status='expired',resolution='window_abandoned',resolved_at=?,updated_at=? "
+            "WHERE status='pending' AND expires_at>0 AND expires_at<?",
+            (now_epoch, utc_iso(), now_epoch - self.CONFIRMATION_EXPIRY_GRACE_SECONDS),
+        ).rowcount
+        db.execute(
+            "DELETE FROM command_confirmations WHERE status<>'pending' AND resolved_at>0 AND resolved_at<?",
+            (now_epoch - self.CONFIRMATION_RETENTION_SECONDS,),
+        )
+        return max(0, int(expired or 0))
+
+    def _adopt_legacy_confirmation(
+        self, db: sqlite3.Connection, subscription: sqlite3.Row, now_epoch: float
+    ) -> None:
+        """Adota a janela que a versão anterior guardava na linha da assinatura.
+
+        Um comando em voo no instante da atualização do Gateway não tem linha na
+        tabela nova. Sem isto ele ficaria sem veredito justamente na versão que
+        existe para acabar com veredito perdido.
+        """
+        sid = str(subscription["subscription_id"] or "")
+        command_key = str(subscription["command_key"] or "").strip()
+        if not sid or not command_key:
+            return
+        if float(subscription["command_until"] or 0) <= now_epoch:
+            return
+        existing = db.execute(
+            "SELECT 1 FROM command_confirmations WHERE subscription_id=? AND status='pending' LIMIT 1",
+            (sid,),
+        ).fetchone()
+        if existing is not None:
+            return
+        context_json = str(subscription["command_context_json"] or "{}")
+        try:
+            parsed = json.loads(context_json)
+            request_id = str(parsed.get("request_id") or "") if isinstance(parsed, dict) else ""
+        except (TypeError, ValueError, json.JSONDecodeError):
+            request_id = ""
+        vehicle_id = str(subscription["command_vehicle_id"] or "")
+        started_at = float(subscription["command_started_at"] or 0) or now_epoch
+        now_iso = utc_iso()
+        db.execute(
+            "INSERT OR IGNORE INTO command_confirmations "
+            "(confirmation_id,subscription_id,request_id,command_key,command_vehicle_id,context_json,"
+            "started_at,expires_at,poll_count,evaluated_samples,stale_samples,status,resolution,resolved_at,"
+            "created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,0,0,'pending',NULL,0,?,?)",
+            (
+                self._confirmation_id(sid, command_key, vehicle_id, request_id),
+                sid,
+                request_id,
+                command_key,
+                vehicle_id or None,
+                context_json,
+                started_at,
+                float(subscription["command_until"] or 0),
+                int(subscription["command_poll_count"] or 0),
+                now_iso,
+                now_iso,
+            ),
+        )
+        LOG.info(
+            "Confirmação de %s em %s foi adotada da versão anterior do Gateway; a janela continua de onde parou.",
+            command_key,
+            sid,
+        )
+
+    def _evaluate_confirmation(
+        self, entry: sqlite3.Row, vehicles: list[dict[str, Any]], now_epoch: float
+    ) -> dict[str, Any]:
+        """Confronta esta leitura com uma espera. Não toca no banco."""
+        command_key = str(entry["command_key"] or "")
+        command_vehicle_id = str(entry["command_vehicle_id"] or "")
+        started_at = float(entry["started_at"] or 0)
+        expires_at = float(entry["expires_at"] or 0)
+        try:
+            parsed = json.loads(str(entry["context_json"] or "{}"))
+            context = parsed if isinstance(parsed, dict) else {}
+        except (TypeError, ValueError, json.JSONDecodeError):
+            context = {}
+
+        confirmed = False
+        evaluable = False
+        target_seen = False
+        # 1.12.56 — três causas distintas produzem o mesmo "sem confirmação
+        # conclusiva": o veículo-alvo não apareceu, as amostras foram velhas
+        # demais, ou o campo que o matcher consulta não veio.
+        stale_samples = 0
+        evaluated_samples = 0
+        field_gaps: list[str] = []
+        available_keys: list[str] = []
+        # 1.12.60 — atraso da amostra em relação ao envio do comando. Separa
+        # "o carro recebeu e não obedeceu" de "o carro não subiu nada novo".
+        sample_lag: float | None = None
+        for vehicle in vehicles:
+            if command_vehicle_id and str(vehicle.get("remote_id") or "") != command_vehicle_id:
+                continue
+            target_seen = True
+            telemetry = vehicle.get("telemetry") if isinstance(vehicle.get("telemetry"), dict) else {}
+            # As chaves observadas são registradas para qualquer amostra, não só
+            # para a que sobrevive ao teste de frescura: senão o log sai
+            # "chaves=[nenhuma]", que se lê como telemetria vazia quando o caso
+            # era só atraso.
+            if telemetry:
+                available_keys = sorted(str(key) for key in telemetry.keys())[:40]
+            lag = self._command_sample_lag(telemetry, started_at)
+            if lag is not None and (sample_lag is None or lag < sample_lag):
+                sample_lag = lag
+            if not self._command_sample_is_fresh(telemetry, started_at):
+                stale_samples += 1
+                continue
+            evaluated_samples += 1
+            matched, sample_evaluable = self._command_confirmation(command_key, telemetry, context)
+            evaluable = evaluable or sample_evaluable
+            if not sample_evaluable:
+                # Guarda a última amostra inconclusiva; só nomes de campo.
+                field_gaps = self._command_confirmation_gaps(command_key, telemetry)
+                available_keys = sorted(str(key) for key in telemetry.keys())[:40]
+            if matched:
+                confirmed = True
+                break
+
+        poll_count = int(entry["poll_count"] or 0) + 1
+        elapsed = max(0.0, now_epoch - started_at) if started_at > 0 else 0.0
+        # 1.12.62 — quem encerra a espera é o PRAZO da janela; a contagem de
+        # leituras é só teto de segurança contra cadência curta demais. Com o
+        # critério antigo, cinco leituras esgotavam a janela em ~110s e um carro
+        # que acabara de acordar era declarado inconclusivo com quase um minuto
+        # de janela ainda disponível.
+        reason = ""
+        if not confirmed:
+            if expires_at > 0 and now_epoch >= expires_at:
+                reason = "window_deadline"
+            elif poll_count >= self.command_max_polls:
+                reason = "poll_budget"
+        return {
+            "confirmation_id": str(entry["confirmation_id"] or ""),
+            "command_key": command_key,
+            "command_vehicle_id": command_vehicle_id,
+            "request_id": str(entry["request_id"] or ""),
+            "confirmed": confirmed,
+            "evaluable": evaluable,
+            "exhausted": bool(reason),
+            "reason": reason,
+            "target_seen": target_seen,
+            "evaluated_samples": evaluated_samples,
+            "stale_samples": stale_samples,
+            "field_gaps": field_gaps,
+            "available_keys": available_keys,
+            "sample_lag": sample_lag,
+            "poll_count": poll_count,
+            "elapsed": elapsed,
+        }
+
+    @staticmethod
+    def _persist_confirmation(
+        db: sqlite3.Connection, item: dict[str, Any], now_epoch: float, now_iso: str
+    ) -> None:
+        if item["confirmed"]:
+            status, resolution = "confirmed", "telemetry_match"
+        elif item["exhausted"]:
+            status, resolution = "exhausted", str(item["reason"] or "exhausted")
+        else:
+            status, resolution = "pending", None
+        db.execute(
+            "UPDATE command_confirmations SET poll_count=?,evaluated_samples=evaluated_samples+?,"
+            "stale_samples=stale_samples+?,status=?,resolution=?,resolved_at=?,updated_at=? "
+            "WHERE confirmation_id=?",
+            (
+                int(item["poll_count"]),
+                int(item["evaluated_samples"]),
+                int(item["stale_samples"]),
+                status,
+                resolution,
+                now_epoch if status != "pending" else 0.0,
+                now_iso,
+                str(item["confirmation_id"]),
+            ),
+        )
+
     def boost(
         self,
         subscription_id: str,
@@ -1902,25 +2251,23 @@ class TelemetryEngine:
             next_run = current_next if protected_wait else (min(current_next, requested_next) if current_next > now_epoch else requested_next)
             interactive_until = now_epoch + seconds if profile == "interactive" else 0.0
             command_until = now_epoch + seconds if profile == "command" else 0.0
-            existing_context: dict[str, Any] = {}
-            try:
-                parsed_context = json.loads(str(row["command_context_json"] or "{}"))
-                if isinstance(parsed_context, dict):
-                    existing_context = parsed_context
-            except (TypeError, ValueError, json.JSONDecodeError):
-                existing_context = {}
             requested_request_id = str(safe_context.get("request_id") or "")
-            existing_request_id = str(existing_context.get("request_id") or "")
-            same_command_window = (
-                profile == "command"
-                and float(row["command_until"] or 0) > now_epoch
-                and str(row["command_key"] or "") == command_key
-                and str(row["command_vehicle_id"] or "") == command_vehicle_id
-                and (
-                    requested_request_id == existing_request_id
-                    or (not requested_request_id and bool(existing_request_id))
+            same_command_window = False
+            pending_confirmations = 0
+            if profile == "command":
+                self._prune_confirmations(db, now_epoch)
+                _confirmation_id, same_command_window = self._register_confirmation(
+                    db,
+                    subscription_id,
+                    command_key,
+                    command_vehicle_id,
+                    requested_request_id,
+                    command_context_json,
+                    seconds,
+                    now_epoch,
+                    now_iso,
                 )
-            )
+                pending_confirmations = len(self._pending_confirmations(db, subscription_id))
             if protected_wait:
                 if profile == "command" and not same_command_window:
                     cursor = db.execute(
@@ -1970,9 +2317,12 @@ class TelemetryEngine:
                         ),
                     )
                 else:
+                    # `command_until` cresce, nunca encolhe: outra confirmação
+                    # ainda pendente pode ter uma janela mais longa que esta, e
+                    # encurtá-la calaria o veredito dela.
                     cursor = db.execute(
                         "UPDATE subscriptions SET status='waiting', next_run_at=?, active_until=MAX(active_until, ?), "
-                        "interactive_until=MAX(interactive_until, ?), command_until=?, command_key=?, command_vehicle_id=?, "
+                        "interactive_until=MAX(interactive_until, ?), command_until=MAX(command_until, ?), command_key=?, command_vehicle_id=?, "
                         "command_context_json=?, command_poll_count=0, command_started_at=?, "
                         "last_presence_at=?, last_error=NULL, updated_at=? WHERE subscription_id=? AND enabled=1",
                         (
@@ -2014,6 +2364,9 @@ class TelemetryEngine:
             "adaptive_polling": profile == "command",
             "poll_schedule_seconds": list(self.command_cadence) if profile == "command" else [self.interactive_seconds],
             "max_command_polls": self.command_max_polls if profile == "command" else None,
+            # Quantos comandos esperam veredito nesta assinatura, contando este.
+            # Mais de um deixou de significar que o anterior foi esquecido.
+            "pending_confirmations": pending_confirmations if profile == "command" else 0,
         }
 
     def storage_status(self) -> dict[str, Any]:
@@ -2112,6 +2465,19 @@ class TelemetryEngine:
                 recent_states = [dict(row) for row in db.execute(
                     "SELECT subscription_id, remote_id, sequence, skipped_unchanged, last_source_at, updated_at FROM vehicle_state_cache ORDER BY updated_at DESC LIMIT 20"
                 ).fetchall()]
+                # 1.12.62 — quantos comandos esperam veredito, um por linha. Com
+                # a janela única anterior o painel não tinha como mostrar que um
+                # segundo comando havia substituído o primeiro.
+                pending_confirmations = [dict(row) for row in db.execute(
+                    "SELECT confirmation_id, subscription_id, request_id, command_key, command_vehicle_id, "
+                    "started_at, expires_at, poll_count, evaluated_samples, stale_samples "
+                    "FROM command_confirmations WHERE status='pending' ORDER BY started_at ASC LIMIT 20"
+                ).fetchall()]
+                recent_confirmations = [dict(row) for row in db.execute(
+                    "SELECT confirmation_id, subscription_id, command_key, status, resolution, poll_count, "
+                    "evaluated_samples, stale_samples, resolved_at FROM command_confirmations "
+                    "WHERE status<>'pending' ORDER BY resolved_at DESC LIMIT 10"
+                ).fetchall()]
         except (OSError, sqlite3.Error) as exc:
             self._record_storage_failure(exc)
             return {
@@ -2154,6 +2520,23 @@ class TelemetryEngine:
             "deduplicated_events": int(dedupe["skipped"] or 0),
             "tracked_vehicles": int(dedupe["vehicles"] or 0),
             "last_state_update": dedupe["last_state_update"],
+            "pending_confirmations": len(pending_confirmations),
+            "pending_confirmation_details": [
+                {
+                    "confirmation_id": str(item.get("confirmation_id") or ""),
+                    "subscription_id": str(item.get("subscription_id") or ""),
+                    "request_id": str(item.get("request_id") or ""),
+                    "command_key": str(item.get("command_key") or ""),
+                    "command_vehicle_id": str(item.get("command_vehicle_id") or ""),
+                    "poll_count": int(item.get("poll_count") or 0),
+                    "evaluated_samples": int(item.get("evaluated_samples") or 0),
+                    "stale_samples": int(item.get("stale_samples") or 0),
+                    "waiting_for_seconds": max(0, int(now_epoch - float(item.get("started_at") or now_epoch))),
+                    "window_left_seconds": max(0, int(float(item.get("expires_at") or 0) - now_epoch)),
+                }
+                for item in pending_confirmations
+            ],
+            "recent_confirmations": recent_confirmations,
             "profiles": {
                 "driving_seconds": self.active_seconds,
                 "interactive_seconds": self.interactive_seconds,
@@ -2426,8 +2809,22 @@ class TelemetryEngine:
         except (ValueError, TypeError, json.JSONDecodeError):
             vehicle_ids = set()
         command_target_vehicle = str(subscription["command_vehicle_id"] or "").strip()
-        if command_mode and command_target_vehicle:
-            vehicle_ids = {command_target_vehicle}
+        if command_mode:
+            # 1.12.62 — a leitura tem de cobrir o alvo de TODAS as esperas.
+            # Restringir ao veículo do último comando cegava as demais: a
+            # confirmação de um comando anterior, em outro carro da mesma conta,
+            # nunca receberia amostra para avaliar.
+            with self.lock, self._db() as db:
+                pending_targets = [
+                    str(row["command_vehicle_id"] or "").strip()
+                    for row in self._pending_confirmations(db, sid)
+                ]
+            if command_target_vehicle:
+                pending_targets.append(command_target_vehicle)
+            # Espera sem alvo definido vale para qualquer veículo: nesse caso não
+            # há o que restringir.
+            if pending_targets and all(pending_targets):
+                vehicle_ids = set(pending_targets)
 
         operation_payload = {
             "account_id": int(subscription["account_id"] or 0),
@@ -2711,64 +3108,36 @@ class TelemetryEngine:
 
         previous_state = str(subscription["last_state"] or "")
         current_command_poll = int(subscription["command_poll_count"] or 0)
-        command_confirmed = False
-        command_evaluable = False
-        command_key = str(subscription["command_key"] or "")
-        command_vehicle_id = str(subscription["command_vehicle_id"] or "")
-        command_context: dict[str, Any] = {}
-        try:
-            parsed_context = json.loads(str(subscription["command_context_json"] or "{}"))
-            command_context = parsed_context if isinstance(parsed_context, dict) else {}
-        except (TypeError, ValueError, json.JSONDecodeError):
-            command_context = {}
+        # 1.12.62 — esta leitura é oferecida a TODOS os comandos que aguardam
+        # veredito, e não só ao último. Antes existia uma janela por assinatura:
+        # o segundo comando apagava o contexto do primeiro, que ficava sem
+        # confirmação e sem recusa. Cada espera tem hora de partida, orçamento e
+        # contagem próprios.
+        cycle_epoch = time.time()
+        outcomes: list[dict[str, Any]] = []
+        if command_mode:
+            with self.lock, self._db() as db:
+                self._adopt_legacy_confirmation(db, subscription, cycle_epoch)
+                pending_rows = self._pending_confirmations(db, sid)
+            for entry in pending_rows:
+                outcomes.append(self._evaluate_confirmation(entry, vehicles, cycle_epoch))
 
-        command_target_seen = False
-        # 1.12.56 — três causas distintas produzem o mesmo "sem confirmação
-        # conclusiva": o veículo-alvo não apareceu, as amostras foram velhas
-        # demais, ou o campo que o matcher consulta não veio. Sem separar,
-        # o diagnóstico vira palpite.
-        command_stale_samples = 0
-        command_evaluated_samples = 0
-        command_field_gaps: list[str] = []
-        command_available_keys: list[str] = []
-        # 1.12.60 — atraso da amostra mais recente em relação ao envio do comando.
-        # É o sinal que separa duas coisas que o log antigo confundia: o carro
-        # recebeu e não obedeceu, ou o carro não subiu nada novo desde o envio.
-        command_sample_lag: float | None = None
-        if command_mode and command_key:
-            command_started = float(subscription["command_started_at"] or 0)
-            for vehicle in vehicles:
-                if command_vehicle_id and str(vehicle.get("remote_id") or "") != command_vehicle_id:
-                    continue
-                command_target_seen = True
-                telemetry = vehicle.get("telemetry") if isinstance(vehicle.get("telemetry"), dict) else {}
-                # As chaves observadas passaram a ser registradas para qualquer
-                # amostra, não só para a que sobrevive ao teste de frescura.
-                # Antes, amostra velha caía no `continue` abaixo sem tocar esta
-                # lista, e o log saía "chaves=[nenhuma]" — que se lê como "a
-                # telemetria veio vazia" quando o caso era só atraso.
-                if telemetry:
-                    command_available_keys = sorted(str(key) for key in telemetry.keys())[:40]
-                sample_lag = self._command_sample_lag(telemetry, command_started)
-                if sample_lag is not None and (command_sample_lag is None or sample_lag < command_sample_lag):
-                    command_sample_lag = sample_lag
-                if not self._command_sample_is_fresh(telemetry, command_started):
-                    command_stale_samples += 1
-                    continue
-                command_evaluated_samples += 1
-                matched, evaluable = self._command_confirmation(command_key, telemetry, command_context)
-                command_evaluable = command_evaluable or evaluable
-                if not evaluable:
-                    # Guarda a última amostra inconclusiva; só nomes de campo.
-                    command_field_gaps = self._command_confirmation_gaps(command_key, telemetry)
-                    command_available_keys = sorted(str(key) for key in telemetry.keys())[:40]
-                if matched:
-                    command_confirmed = True
-                    break
-
-        next_command_poll = current_command_poll + 1 if command_mode else 0
-        command_budget_exhausted = command_mode and next_command_poll >= self.command_max_polls
-        effective_command_mode = command_mode and not command_confirmed and not command_budget_exhausted
+        confirmed_outcomes = [item for item in outcomes if item["confirmed"]]
+        exhausted_outcomes = [item for item in outcomes if not item["confirmed"] and item["exhausted"]]
+        remaining_outcomes = [item for item in outcomes if not item["confirmed"] and not item["exhausted"]]
+        command_confirmed = bool(confirmed_outcomes)
+        command_budget_exhausted = bool(exhausted_outcomes)
+        # A janela rápida vale enquanto alguém ainda espera. Um comando recém
+        # enviado não é encurtado porque outro, mais antigo, acabou de fechar.
+        effective_command_mode = command_mode and bool(remaining_outcomes)
+        if remaining_outcomes:
+            # A cadência acompanha a espera mais nova: ela ainda merece leituras
+            # curtas mesmo que outra, mais velha, já esteja no fim do orçamento.
+            next_command_poll = min(int(item["poll_count"]) for item in remaining_outcomes)
+        elif outcomes:
+            next_command_poll = max(int(item["poll_count"]) for item in outcomes)
+        else:
+            next_command_poll = current_command_poll + 1 if command_mode else 0
         interval, observed_state, parked_streak = self._adaptive_interval(
             states,
             int(subscription["parked_streak"] or 0),
@@ -2798,8 +3167,36 @@ class TelemetryEngine:
         now = utc_iso()
         next_run = time.time() + interval + jitter
         clear_expired_command = not command_mode and float(subscription["command_until"] or 0) > 0
-        clear_command = (command_mode and (command_confirmed or command_budget_exhausted)) or clear_expired_command
+        # As colunas antigas só são zeradas quando ninguém mais espera veredito.
+        clear_command = (command_mode and not remaining_outcomes) or clear_expired_command
         with self.lock, self._db() as db:
+            for item in outcomes:
+                self._persist_confirmation(db, item, cycle_epoch, now)
+            abandoned = self._prune_confirmations(db, cycle_epoch)
+            if clear_expired_command:
+                # A janela venceu sem nova leitura: quem sobrou não recebe mais
+                # amostra nenhuma e precisa ser encerrado explicitamente, senão
+                # a linha fica pendente para sempre. Só as vencidas: um comando
+                # que chegou durante esta coleta tem prazo no futuro e não pode
+                # ser encerrado por uma decisão tomada antes de ele existir.
+                db.execute(
+                    "UPDATE command_confirmations SET status='expired',resolution='window_expired',resolved_at=?,updated_at=? "
+                    "WHERE subscription_id=? AND status='pending' AND expires_at<=?",
+                    (cycle_epoch, now, sid, cycle_epoch),
+                )
+            # A decisão de limpar veio do retrato da assinatura lido antes da
+            # chamada à nuvem, que leva segundos. Um comando enviado nesse
+            # intervalo já tem espera viva no banco — e zerar as colunas aqui
+            # tiraria a assinatura do modo comando, deixando essa espera órfã
+            # até ser recolhida por abandono. É o mesmo veredito perdido que
+            # esta versão existe para acabar.
+            live = db.execute(
+                "SELECT COUNT(*) AS total FROM command_confirmations "
+                "WHERE subscription_id=? AND status='pending' AND expires_at>?",
+                (sid, cycle_epoch),
+            ).fetchone()
+            if int(live["total"] or 0) > 0:
+                clear_command = False
             if clear_command:
                 db.execute(
                     "UPDATE subscriptions SET status='active', next_run_at=?, last_run_at=?, last_success_at=?, last_error=NULL, last_state=?, parked_streak=?, candidate_state=?, candidate_count=?, sleep_streak=?, consecutive_failures=0, cooldown_until=0, cooldown_reason=NULL, command_until=0, command_key=NULL, command_vehicle_id=NULL, command_context_json=NULL, command_poll_count=0, command_started_at=0, updated_at=? WHERE subscription_id=?",
@@ -2810,12 +3207,36 @@ class TelemetryEngine:
                     "UPDATE subscriptions SET status='active', next_run_at=?, last_run_at=?, last_success_at=?, last_error=NULL, last_state=?, parked_streak=?, candidate_state=?, candidate_count=?, sleep_streak=?, consecutive_failures=0, cooldown_until=0, cooldown_reason=NULL, command_poll_count=?, updated_at=? WHERE subscription_id=?",
                     (next_run, now, now, aggregate_state, parked_streak, candidate_state or None, candidate_count, sleep_streak, next_command_poll, now, sid),
                 )
-        if command_confirmed:
-            LOG.info("Comando %s confirmado pela telemetria de %s após %s leitura(s); janela rápida encerrada.", command_key, sid, next_command_poll)
-        elif command_budget_exhausted:
-            if command_vehicle_id and not command_target_seen:
-                LOG.warning("Janela rápida de %s não encontrou o veículo-alvo do comando entre os dados retornados; assinatura será reconciliada pelo site.", sid)
-            LOG.warning("Janela rápida de %s encerrada após %s leitura(s) sem confirmação conclusiva; telemetria voltou ao modo adaptativo.", sid, next_command_poll)
+        if abandoned:
+            LOG.info(
+                "%s confirmação(ões) sem janela ativa foram encerradas por prazo durante o ciclo de %s.",
+                abandoned,
+                sid,
+            )
+        for item in confirmed_outcomes:
+            LOG.info(
+                "Comando %s (%s) confirmado pela telemetria de %s após %s leitura(s); %s comando(s) ainda aguardam.",
+                item["command_key"],
+                item["request_id"] or "sem request_id",
+                sid,
+                item["poll_count"],
+                len(remaining_outcomes),
+            )
+        for item in exhausted_outcomes:
+            if item["command_vehicle_id"] and not item["target_seen"]:
+                LOG.warning(
+                    "Janela rápida de %s não encontrou o veículo-alvo de %s entre os dados retornados; assinatura será reconciliada pelo site.",
+                    sid,
+                    item["command_key"],
+                )
+            LOG.warning(
+                "Janela rápida de %s encerrada para %s após %s leitura(s) e %ss sem confirmação conclusiva (%s).",
+                sid,
+                item["command_key"],
+                item["poll_count"],
+                int(item["elapsed"]),
+                "orçamento de leituras esgotado" if item["reason"] == "poll_budget" else "prazo da janela vencido",
+            )
             # 1.12.56 — a linha acima diz que falhou; esta diz por quê.
             # 1.12.60 — ganhou o atraso da amostra: com "descartadas por idade"
             # sozinho não se sabia se o carro estava 3 segundos ou 3 horas atrás
@@ -2823,16 +3244,19 @@ class TelemetryEngine:
             LOG.warning(
                 "Confirmação inconclusiva de %s em %s: amostras avaliadas=%s, descartadas por idade=%s, "
                 "amostra mais recente %s, campos exigidos sem valor=[%s], chaves presentes na telemetria=[%s].",
-                command_key or "desconhecido",
+                item["command_key"] or "desconhecido",
                 sid,
-                command_evaluated_samples,
-                command_stale_samples,
-                "sem carimbo de hora" if command_sample_lag is None
-                else ("%.0fs antes do comando" % command_sample_lag if command_sample_lag > 0
-                      else "%.0fs depois do comando" % abs(command_sample_lag)),
-                ", ".join(command_field_gaps) or "nenhum",
-                ", ".join(command_available_keys) or "nenhuma",
+                item["evaluated_samples"],
+                item["stale_samples"],
+                "sem carimbo de hora" if item["sample_lag"] is None
+                else ("%.0fs antes do comando" % item["sample_lag"] if item["sample_lag"] > 0
+                      else "%.0fs depois do comando" % abs(item["sample_lag"])),
+                ", ".join(item["field_gaps"]) or "nenhum",
+                ", ".join(item["available_keys"]) or "nenhuma",
             )
+        if command_confirmed or command_budget_exhausted:
+            # As linhas por comando acima já contam o ciclo.
+            pass
         elif previous_state != aggregate_state:
             LOG.info("Telemetria %s mudou de %s para %s; próxima consulta em %ss.", sid, previous_state or "inicial", aggregate_state, int(interval + jitter))
         else:

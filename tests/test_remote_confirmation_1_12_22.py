@@ -42,7 +42,12 @@ with tempfile.TemporaryDirectory(prefix="leaphub-confirmation-") as tmp:
         {"staging": "s" * 32, "production": "p" * 32},
         threading.BoundedSemaphore(2),
     )
-    assert engine.command_max_polls == 5
+    # 1.12.62 — a garantia deste contrato nunca foi o número, e sim que uma
+    # instalação com o valor legado menor é elevada ao piso vigente. O piso subiu
+    # de 5 para 8 quando a janela passou a fechar por prazo; ler da fonte evita
+    # que o contrato reprove por carimbar a constante antiga.
+    assert engine.command_max_polls == telemetry.TelemetryEngine.COMMAND_MAX_POLLS_FLOOR
+    assert engine.command_max_polls > 3
     assert list(engine.command_cadence[:5]) == [12, 20, 35, 45, 60]
     assert engine._adaptive_interval(["parked"], 0, command_mode=True, command_poll_count=1)[0] == 12
     assert engine._adaptive_interval(["parked"], 0, command_mode=True, command_poll_count=5)[0] == 60
@@ -51,9 +56,14 @@ with tempfile.TemporaryDirectory(prefix="leaphub-confirmation-") as tmp:
         engine._instance_lock_handle.close()
 
 checks = {
-    "version": ('version: "1.12.48"' in config_source or 'version: "1.12.61"' in config_source)
-        and 'VERSION = "1.12.61"' in server_source,
-    "manager_migrates_legacy_limit": 'max(5, min(8' in manager_source,
+    "version": ('version: "1.12.48"' in config_source or 'version: "1.12.62"' in config_source)
+        and 'VERSION = "1.12.62"' in server_source,
+    # O manager normaliza a opção antes de o motor vê-la: se os dois discordarem,
+    # o piso do motor nunca chega a valer. Derivado da mesma fonte, de propósito.
+    "manager_migrates_legacy_limit": "max({}, min({}".format(
+        telemetry.TelemetryEngine.COMMAND_MAX_POLLS_FLOOR,
+        telemetry.TelemetryEngine.COMMAND_MAX_POLLS_CEILING,
+    ) in manager_source,
     "private_posts_close": "def do_POST(self) -> None:\n        # As chamadas assinadas" in server_source
         and "self.close_connection = True" in server_source,
     "close_header_uses_handler_state": 'close_connection or bool(getattr(self, "close_connection", False))' in server_source,
@@ -64,4 +74,4 @@ failed = [name for name, ok in checks.items() if not ok]
 if failed:
     raise SystemExit("remote confirmation 1.12.24 failed:\n- " + "\n- ".join(failed))
 
-print({"ok": True, "checks": len(checks) + 4, "version": "1.12.61"})
+print({"ok": True, "checks": len(checks) + 4, "version": "1.12.62"})

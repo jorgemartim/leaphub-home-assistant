@@ -46,7 +46,10 @@ check(
     "_command_sample_lag() desapareceu; sem ele o log não informa o atraso da amostra",
 )
 check(
-    "command_sample_lag" in ENGINE,
+    # 1.12.62 — a variável perdeu o prefixo `command_`. Afirmar a chamada, e não
+    # o nome, evita que o contrato passe por acidente: `command_sample_lag`
+    # continuaria casando com o nome do próprio método.
+    "self._command_sample_lag(telemetry, started_at)" in ENGINE and "sample_lag" in ENGINE,
     "a variável do atraso não é mais calculada no laço da confirmação",
 )
 check(
@@ -57,10 +60,15 @@ check(
 # --------------------------- 2) as chaves saem de fora do ramo `not evaluable`
 # O defeito original: a captura das chaves estava depois do `continue` da
 # frescura. Aqui se afirma a ordem — chaves antes do descarte por idade.
-loop = ENGINE[ENGINE.find("if command_mode and command_key:"):]
-loop = loop[: loop.find("next_command_poll = ")]
-pos_keys = loop.find("command_available_keys = sorted(")
-pos_stale = loop.find("command_stale_samples += 1")
+#
+# 1.12.62 — o laço saiu do corpo do ciclo e virou `_evaluate_confirmation()`,
+# uma avaliação por comando pendente; os contadores perderam o prefixo
+# `command_`. A garantia é a mesma e continua verificável: o que importa é a
+# ordem dentro do laço, não onde ele mora.
+loop = ENGINE[ENGINE.find("def _evaluate_confirmation("):]
+loop = loop[: loop.find("poll_count = int(entry")]
+pos_keys = loop.find("available_keys = sorted(")
+pos_stale = loop.find("stale_samples += 1")
 check(pos_keys != -1, "a captura das chaves observadas saiu do laço da confirmação")
 check(pos_stale != -1, "o contador de amostras descartadas por idade saiu do laço")
 check(
@@ -115,4 +123,4 @@ check(
 if failures:
     raise SystemExit("command sample lag contract failed:\n- " + "\n- ".join(failures))
 
-print({"ok": True, "checks": 12, "version": "1.12.61"})
+print({"ok": True, "checks": 12, "version": "1.12.62"})

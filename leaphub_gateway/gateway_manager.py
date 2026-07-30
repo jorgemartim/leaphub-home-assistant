@@ -24,7 +24,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-VERSION = "1.12.61"
+VERSION = "1.12.62"
 OPTIONS_PATH = Path(os.getenv("LEAPHUB_OPTIONS_PATH", "/data/options.json"))
 RUNTIME = Path(os.getenv("LEAPHUB_RUNTIME_DIR", "/data/runtime"))
 LOG_DIR = Path(os.getenv("LEAPHUB_LOG_DIR", "/data/logs"))
@@ -384,7 +384,10 @@ def write_connector_options() -> Path:
         "telemetry_active_seconds": int(OPTIONS.get("telemetry_active_seconds") or 30),
         "telemetry_interactive_seconds": int(OPTIONS.get("telemetry_interactive_seconds") or 20),
         "telemetry_command_seconds": max(10, min(60, int(OPTIONS.get("telemetry_command_seconds") or 12))),
-        "telemetry_command_max_polls": max(5, min(8, int(OPTIONS.get("telemetry_command_max_polls") or 5))),
+        # 1.12.62 — o piso subiu porque a janela passou a fechar por prazo, e
+        # cinco leituras terminavam em ~112s dos 180s disponíveis. Os limites
+        # espelham COMMAND_MAX_POLLS_FLOOR/CEILING do motor de telemetria.
+        "telemetry_command_max_polls": max(8, min(12, int(OPTIONS.get("telemetry_command_max_polls") or 8))),
         "telemetry_charging_seconds": int(OPTIONS.get("telemetry_charging_seconds") or 30),
         "telemetry_parked_seconds": int(OPTIONS.get("telemetry_parked_seconds") or 300),
         "telemetry_sleep_seconds": int(OPTIONS.get("telemetry_sleep_seconds") or 900),
