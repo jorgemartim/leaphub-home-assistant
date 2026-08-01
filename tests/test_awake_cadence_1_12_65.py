@@ -18,19 +18,42 @@ contagem. O que não muda continua barato: parado de verdade ainda dorme.
 from __future__ import annotations
 
 import importlib.util
+import sys
 from pathlib import Path
 from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SPEC = importlib.util.spec_from_file_location(
-    "awake_cadence_test", ROOT / "leaphub_gateway" / "telemetry_engine.py"
-)
-assert SPEC is not None and SPEC.loader is not None
-MODULE = importlib.util.module_from_spec(SPEC)
-SPEC.loader.exec_module(MODULE)
+APP = ROOT / "leaphub_gateway"
 
-ENGINE = MODULE.TelemetryEngine
+
+def load_module(name: str, path: Path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    assert spec is not None and spec.loader is not None, f"não carregou {path.name}"
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def load_engine_class():
+    """Carrega a classe do motor.
+
+    `telemetry_engine.py` faz `import leaphub_connector`, que no add-on
+    instalado é o `connector.py` copiado para site-packages. Registrar o arquivo
+    sob esse nome antes resolve o import — mesmo caminho de
+    `test_command_sample_timezone_1_12_61.py`.
+    """
+    if "leaphub_connector" not in sys.modules:
+        load_module("leaphub_connector", APP / "connector.py")
+    module = load_module("leaphub_awake_engine", APP / "telemetry_engine.py")
+    for value in vars(module).values():
+        if hasattr(value, "activity_fingerprint") and hasattr(value, "_adaptive_interval"):
+            return value
+    raise AssertionError("classe do motor não encontrada em telemetry_engine.py")
+
+
+ENGINE = load_engine_class()
 impressao = ENGINE.activity_fingerprint
 recomeca = ENGINE.parked_streak_after_activity
 
