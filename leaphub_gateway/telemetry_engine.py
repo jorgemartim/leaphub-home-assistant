@@ -3572,9 +3572,9 @@ class TelemetryEngine:
         """Mexer no carro prova que ele está acordado: a contagem recomeça.
 
         Sem isto, `_adaptive_interval` rebaixa parado para `sleep_seconds` na
-        sexta leitura — nove minutos de relógio, sem nunca perguntar ao carro.
-        Foi o defeito relatado em 01/08/2026: o porta-malas aberto com o carro
-        na garagem havia mais de nove minutos esperava a próxima leitura lenta.
+        sexta leitura — sete minutos e meio de relógio, sem nunca perguntar ao
+        carro. Foi o defeito relatado em 01/08/2026: o porta-malas aberto com o
+        carro parado havia mais tempo que isso esperava a leitura lenta.
         """
         return 0 if activity_changed else max(0, int(previous_streak or 0))
 

@@ -13,9 +13,9 @@ A 1.12.64 tinha consertado o desenho — ele deixou de ficar atrás da telemetri
 O que sobrou é anterior a isso: **a telemetria em si não chegava**.
 
 A causa está em `_adaptive_interval()`. Parado devolve `parked_seconds` (90s)
-apenas nas seis primeiras leituras; da sexta em diante devolve `sleep_seconds`
-(600s). Seis vezes noventa são nove minutos — ou seja, o critério de "dormindo"
-era o **relógio**, e nunca o carro. Um veículo na garagem há mais de nove
+apenas nas cinco primeiras leituras; da sexta em diante devolve `sleep_seconds`
+(600s). Cinco vezes noventa são sete minutos e meio — ou seja, o critério de "dormindo"
+era o **relógio**, e nunca o carro. Um veículo na garagem há mais de sete
 minutos já estava na cadência de sono, e o porta-malas aberto depois disso
 esperava a próxima leitura lenta para aparecer.
 
@@ -35,8 +35,8 @@ oscilam com o veículo dormindo e **ficam de fora da assinatura** de propósito:
 incluí-las faria a impressão digital mudar a cada leitura e a cadência rápida
 valer para sempre, que é o oposto do pedido. Há teste dedicado para isso.
 
-Depois de uma atividade, o carro tem no máximo seis leituras rápidas (nove
-minutos) antes de voltar a dormir, exatamente como antes.
+Depois de uma atividade, o carro tem no máximo cinco leituras rápidas (sete
+minutos e meio) antes de voltar a dormir, exatamente como antes.
 
 ### Sem efeito colateral
 

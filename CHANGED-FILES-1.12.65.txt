@@ -1,1 +1,5 @@
+RELEASE-1.12.65.md
+leaphub_gateway/CHANGELOG.md
+leaphub_gateway/RELEASE-1.12.65.md
+leaphub_gateway/telemetry_engine.py
 tests/test_awake_cadence_1_12_65.py

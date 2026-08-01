@@ -5,10 +5,10 @@ aberto porém ali não mostra"*. Medido no site no mesmo minuto: `captured_at`
 travado 12 minutos atrás, `trunk_open: false`.
 
 A causa está em `_adaptive_interval`: parado devolve `parked_seconds` (90s) só
-nas seis primeiras leituras e depois rebaixa para `sleep_seconds` (600s). Seis
-vezes noventa são nove minutos — o critério de "dormindo" era o **relógio**,
-nunca o carro. Um veículo na garagem há mais de nove minutos já estava na
-cadência de sono quando o dono abriu o porta-malas.
+nas cinco primeiras leituras e depois rebaixa para `sleep_seconds` (600s).
+Cinco vezes noventa são sete minutos e meio — o critério de "dormindo" era o
+**relógio**, nunca o carro. Um veículo na garagem há mais de sete minutos já
+estava na cadência de sono quando o dono abriu o porta-malas.
 
 Aqui a atividade observada passa a decidir. Mexer no carro — porta, porta-malas,
 capô, vidro, cortina ou trava — prova que ele está acordado e recomeça a
@@ -93,10 +93,15 @@ def _telemetria(**mudancas: Any) -> dict[str, Any]:
 
 
 def test_o_defeito_relatado_o_relogio_rebaixava_carro_acordado() -> None:
-    """Na sexta leitura parada a cadência caía para 600s sem consultar o carro."""
-    assert _intervalo(5)[0] == 90, "antes do limiar a leitura ainda é rápida"
-    lento, estado, _ = _intervalo(6)
-    assert lento == 600 and estado == "sleep", "o rebaixamento por relógio existe"
+    """Na sexta leitura parada a cadência cai para 600s sem consultar o carro.
+
+    A contagem recebida é a ANTERIOR: `_adaptive_interval` soma 1 antes de
+    comparar. Com 4 acumuladas a leitura em curso é a quinta e ainda é rápida;
+    com 5, a sexta já é lenta. Cinco leituras de 90s são sete minutos e meio.
+    """
+    assert _intervalo(4)[0] == 90, "a quinta leitura ainda é rápida"
+    lento, estado, _ = _intervalo(5)
+    assert lento == 600 and estado == "sleep", "a sexta já cai para a cadência de sono"
 
 
 def test_atividade_devolve_a_cadencia_rapida() -> None:
