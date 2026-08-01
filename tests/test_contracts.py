@@ -7,7 +7,7 @@ CONFIG = (ROOT / "leaphub_gateway" / "config.yaml").read_text(encoding="utf-8")
 checks = {
     # config.yaml so e promovido depois da validacao: o alvo e a versao ainda
     # publicada precisam passar, senao o proprio gate reprova o candidato.
-    "version": 'VERSION = "1.12.66"' in SERVER and ('version: \"1.12.65\"' in CONFIG or 'version: \"1.12.66\"' in CONFIG),
+    "version": 'VERSION = "1.12.67"' in SERVER and ('version: \"1.12.66\"' in CONFIG or 'version: \"1.12.67\"' in CONFIG),
     "api_contract": "API_VERSION = 2" in SERVER and 'X-LeapHub-API-Version' in SERVER,
     "trace": 'X-Request-ID' in SERVER and 'trace_id' in SERVER,
     "compatibility": 'incompatible_api' in SERVER,

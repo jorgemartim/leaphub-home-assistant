@@ -91,8 +91,13 @@ def test_vidro_aberto_nao_desenha_o_vidro_fechado() -> None:
     assert "carpic_leftfront_window_close.png" not in stack
 
 
-def test_porta_fechada_nao_desenha_camada_de_porta() -> None:
-    """O pacote não tem `*_close` de porta: o corpo já vem fechado."""
+def test_porta_fechada_nao_desenha_camada_de_porta_aberta() -> None:
+    """Nenhuma camada de porta ABERTA com o carro todo fechado.
+
+    A camada de porta FECHADA, ao contrário, é obrigatória — ver
+    `test_carro_todo_fechado_desenha_as_quatro_portas`. O pacote da página de
+    admin não a tem; o que o gateway baixa da nuvem, tem.
+    """
     stack = pilha()
     for nome in stack:
         assert "front_open" not in nome and "behind_open" not in nome, nome
@@ -160,3 +165,74 @@ def test_a_ordem_da_biblioteca_seria_reprovada_por_este_contrato() -> None:
     ) < ordem_da_biblioteca.index("carpic_leftfront_open.png")
     assert not tampa_atras, "a ordem da biblioteca punha a tampa na frente do corpo"
     assert not vidro_atras, "a ordem da biblioteca punha o vidro sobre a porta aberta"
+
+
+# ------------------------------------------------------------------ 1.12.67
+# A 1.12.66 foi ao ar sem estes: ela removia as camadas `*_close` de porta, que
+# EXISTEM no pacote que o gateway baixa da nuvem, e o carro saiu sem as
+# laterais. O modelo de pacote foi lido no da página de admin, que é outro.
+# Nenhuma camada pode SUMIR em relação ao que a biblioteca desenharia.
+
+
+def _biblioteca(**estado) -> list[str]:
+    """A lista que `leapmotor_api._build_layer_list()` produziria."""
+    from leapmotor_api.image import _build_layer_list
+    from types import SimpleNamespace
+
+    status = SimpleNamespace(
+        doors=SimpleNamespace(
+            rbcm_right_rear_door_status=estado.get("right_rear_door_open", False),
+            rbcm_driver_door_status=estado.get("right_front_door_open", False),
+            lbcm_left_rear_door_status=estado.get("left_rear_door_open", False),
+            lbcm_driver_door_status=estado.get("left_front_door_open", False),
+            bbcm_back_door_status=estado.get("trunk_open", False),
+        ),
+        windows=SimpleNamespace(
+            left_front_window_percent=0 if estado.get("left_front_window_closed", True) else 50,
+            left_rear_window_percent=0 if estado.get("left_rear_window_closed", True) else 50,
+        ),
+        is_plugged=False,
+        is_charging=False,
+    )
+    return _build_layer_list(status)
+
+
+ESTADOS = [
+    {},
+    {"trunk_open": True},
+    {"left_front_door_open": True},
+    {"left_rear_door_open": True},
+    {"right_front_door_open": True},
+    {"right_rear_door_open": True},
+    {"trunk_open": True, "left_front_door_open": True},
+    {"left_front_door_open": True, "left_front_window_closed": False},
+]
+
+
+def test_nenhuma_camada_da_biblioteca_pode_sumir() -> None:
+    """O defeito da 1.12.67: o carro saiu sem as laterais."""
+    for estado in ESTADOS:
+        nossa = set(pilha(**estado))
+        deles = set(_biblioteca(**estado))
+        faltando = deles - nossa
+        assert not faltando, f"estado {estado} perderia {sorted(faltando)}"
+
+
+def test_carro_todo_fechado_desenha_as_quatro_portas() -> None:
+    """Controle direto e legível do mesmo defeito."""
+    stack = pilha()
+    for nome in (
+        "carpic_leftfront_close.png",
+        "carpic_leftbehind_close.png",
+        "carpic_rightfront_close.png",
+        "carpic_rightbehind_close.png",
+    ):
+        assert nome in stack, f"{nome} sumiu: o carro sai sem lateral"
+
+
+def test_a_porta_nunca_aparece_aberta_e_fechada_ao_mesmo_tempo() -> None:
+    for estado in ESTADOS:
+        stack = pilha(**estado)
+        for lado in ("leftfront", "leftbehind", "rightfront", "rightbehind"):
+            juntas = f"carpic_{lado}_open.png" in stack and f"carpic_{lado}_close.png" in stack
+            assert not juntas, f"{lado} apareceu aberta e fechada em {estado}"

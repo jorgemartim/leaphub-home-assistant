@@ -130,4 +130,4 @@ def test_engine_contract_marks_fast_confirmation_retention() -> None:
     source = (APP / "telemetry_engine.py").read_text(encoding="utf-8")
     assert "session_retained_for_fast_confirmation" in source
     assert "cliente autenticado pelo comando" in source
-    assert 'ENGINE_VERSION = "1.12.66"' in source
+    assert 'ENGINE_VERSION = "1.12.67"' in source

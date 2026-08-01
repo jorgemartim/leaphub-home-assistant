@@ -86,5 +86,5 @@ def test_new_phases_reach_the_log_line():
 
 
 def test_version_follows_the_release():
-    assert 'ENGINE_VERSION = "1.12.66"' in ENGINE
-    assert 'CONNECTOR_VERSION = "1.12.66"' in CONNECTOR
+    assert 'ENGINE_VERSION = "1.12.67"' in ENGINE
+    assert 'CONNECTOR_VERSION = "1.12.67"' in CONNECTOR

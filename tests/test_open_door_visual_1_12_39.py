@@ -118,9 +118,9 @@ def test_a_tampa_aberta_nunca_sai_por_cima_do_corpo() -> None:
 def test_porta_fechada_preserva_os_bytes() -> None:
     """Garantia original da 1.12.39: sem porta aberta, nada é reprocessado."""
     package = _LayerPackage()
-    esperado = package._export(
-        package._composite_layers(["carpic_body.png", "carpic_leftfront_window_close.png", "carpic_tailgate_close.png"])
-    )
+    # A lista esperada vem da própria função: fixá-la à mão faz o contrato
+    # reprovar por cosmética a cada camada nova, sem defeito nenhum.
+    esperado = package._export(package._composite_layers(MODULE.official_layer_stack()))
     obtido, restaurados = MODULE._compose_official_frame(package, _status())
     assert restaurados == 0
     assert obtido == esperado

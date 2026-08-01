@@ -56,8 +56,8 @@ with tempfile.TemporaryDirectory(prefix="leaphub-confirmation-") as tmp:
         engine._instance_lock_handle.close()
 
 checks = {
-    "version": ('version: "1.12.48"' in config_source or 'version: "1.12.66"' in config_source)
-        and 'VERSION = "1.12.66"' in server_source,
+    "version": ('version: "1.12.48"' in config_source or 'version: "1.12.67"' in config_source)
+        and 'VERSION = "1.12.67"' in server_source,
     # O manager normaliza a opção antes de o motor vê-la: se os dois discordarem,
     # o piso do motor nunca chega a valer. Derivado da mesma fonte, de propósito.
     "manager_migrates_legacy_limit": "max({}, min({}".format(
@@ -74,4 +74,4 @@ failed = [name for name, ok in checks.items() if not ok]
 if failed:
     raise SystemExit("remote confirmation 1.12.24 failed:\n- " + "\n- ".join(failed))
 
-print({"ok": True, "checks": len(checks) + 4, "version": "1.12.66"})
+print({"ok": True, "checks": len(checks) + 4, "version": "1.12.67"})

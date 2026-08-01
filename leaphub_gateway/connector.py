@@ -43,7 +43,7 @@ except ImportError:
         _privacy_spec.loader.exec_module(_privacy_module)
         sanitize_log = _privacy_module.sanitize_log
 
-CONNECTOR_VERSION = "1.12.66"
+CONNECTOR_VERSION = "1.12.67"
 MAX_INPUT_BYTES = 1024 * 1024
 logging.getLogger("leapmotor_api").setLevel(logging.WARNING)
 LOGGER = logging.getLogger("leaphub.connector")
@@ -1576,25 +1576,49 @@ def official_layer_stack(
     hoje a implementa.
     """
     stack: list[str] = []
+
+    # Lado direito (longe), abaixo do corpo. As camadas de porta FECHADA existem
+    # no pacote que o gateway baixa da nuvem — omiti-las na 1.12.66 fez o carro
+    # sair sem as laterais. Pacotes que não as tenham simplesmente as ignoram:
+    # `_composite_layers` pula camada ausente.
+    stack.append(
+        "carpic_rightbehind_open.png" if right_rear_door_open else "carpic_rightbehind_close.png"
+    )
+    stack.append(
+        "carpic_rightfront_open.png" if right_front_door_open else "carpic_rightfront_close.png"
+    )
+
+    # CORREÇÃO 1 — a tampa aberta vem ANTES do corpo (prefixo 01 contra 02).
     if trunk_open:
-        stack.append("carpic_tailgate_open.png")  # 01 — atrás do corpo
-    stack.append("carpic_body.png")  # 02
-    if left_rear_window_closed:
-        stack.append("carpic_leftbehind_window_close.png")  # 03
-    if left_front_window_closed:
-        stack.append("carpic_leftfront_window_close.png")  # 04
+        stack.append("carpic_tailgate_open.png")
+    stack.append("carpic_body.png")
     if not trunk_open:
-        stack.append("carpic_tailgate_close.png")  # 05
+        stack.append("carpic_tailgate_close.png")
+    stack.append("carpic_hood_close.png")
     if hood_open:
-        stack.append("carpic_hood_open.png")  # 06 — existe no pacote
+        stack.append("carpic_hood_open.png")
+
+    # Lado esquerdo (perto), acima do corpo.
+    # CORREÇÃO 2 — o vidro fechado só pode vir DEPOIS da porta quando a porta
+    # está fechada. Com a porta aberta ele fica atrás dela; senão o caixilho é
+    # carimbado sobre a porta aberta, que é o defeito recortado pelo dono.
     if left_rear_door_open:
-        stack.append("carpic_leftbehind_open.png")  # 07
+        if left_rear_window_closed:
+            stack.append("carpic_leftbehind_window_close.png")
+        stack.append("carpic_leftbehind_open.png")
+    else:
+        stack.append("carpic_leftbehind_close.png")
+        if left_rear_window_closed:
+            stack.append("carpic_leftbehind_window_close.png")
+
     if left_front_door_open:
-        stack.append("carpic_leftfront_open.png")  # 08 — cobre o vidro 04
-    if right_rear_door_open:
-        stack.append("carpic_rightbehind_open.png")  # 09
-    if right_front_door_open:
-        stack.append("carpic_rightfront_open.png")  # 10
+        if left_front_window_closed:
+            stack.append("carpic_leftfront_window_close.png")
+        stack.append("carpic_leftfront_open.png")
+    else:
+        stack.append("carpic_leftfront_close.png")
+        if left_front_window_closed:
+            stack.append("carpic_leftfront_window_close.png")
     # Camadas de carga são 13+ no pacote: sempre depois das portas.
     if charging:
         frame = charge_frame if charge_frame is not None and 2 <= charge_frame <= 15 else 2
