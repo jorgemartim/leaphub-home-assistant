@@ -6,13 +6,13 @@ ROOT = Path(__file__).resolve().parents[1]
 APP = ROOT / "leaphub_gateway"
 
 config = yaml.safe_load((APP / "config.yaml").read_text(encoding="utf-8"))
-assert config["version"] in {"1.12.48", "1.12.63"}
+assert config["version"] in {"1.12.48", "1.12.64"}
 assert config["image"] == "ghcr.io/jorgemartim/leaphub-gateway"
 assert config["arch"] == ["amd64"]
 
 changelog = (APP / "CHANGELOG.md").read_text(encoding="utf-8")
 headings = re.findall(r"^##\s+(.+)$", changelog, flags=re.MULTILINE)
-assert headings == ["1.12.63"], headings
+assert headings == ["1.12.64"], headings
 assert "pré-compilada" in changelog
 
 workflow = (ROOT / ".github/workflows/build.yml").read_text(encoding="utf-8")
@@ -36,8 +36,8 @@ for marker in (
     assert marker in workflow, marker
 
 # The Home Assistant release surface is current-only; historical markdown files may remain as source archive.
-assert (ROOT / "RELEASE-1.12.63.md").is_file()
-assert (APP / "RELEASE-1.12.63.md").is_file()
+assert (ROOT / "RELEASE-1.12.64.md").is_file()
+assert (APP / "RELEASE-1.12.64.md").is_file()
 
 # Heavy dependencies remain in a stable Docker layer before application code.
 dockerfile = (APP / "Dockerfile").read_text(encoding="utf-8")

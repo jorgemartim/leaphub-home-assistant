@@ -7,9 +7,9 @@ TARGET = (ROOT / "leaphub_gateway" / "RELEASE_TARGET").read_text(encoding="utf-8
 
 
 def test_staged_release_metadata():
-    assert any(v in CONFIG for v in ('version: \"1.12.48\"', 'version: \"1.12.63\"'))
-    assert TARGET == "1.12.63"
-    assert 'VERSION = "1.12.63"' in MANAGER
+    assert any(v in CONFIG for v in ('version: \"1.12.48\"', 'version: \"1.12.64\"'))
+    assert TARGET == "1.12.64"
+    assert 'VERSION = "1.12.64"' in MANAGER
 
 
 def test_tunnel_starts_after_local_origin_gate():
