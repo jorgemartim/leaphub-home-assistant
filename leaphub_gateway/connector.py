@@ -43,7 +43,7 @@ except ImportError:
         _privacy_spec.loader.exec_module(_privacy_module)
         sanitize_log = _privacy_module.sanitize_log
 
-CONNECTOR_VERSION = "1.12.65"
+CONNECTOR_VERSION = "1.12.66"
 MAX_INPUT_BYTES = 1024 * 1024
 logging.getLogger("leapmotor_api").setLevel(logging.WARNING)
 LOGGER = logging.getLogger("leaphub.connector")
@@ -1522,81 +1522,145 @@ def _edge_alpha_ratio(image: Any) -> float:
     return sum(1 for value in samples if value > 12) / len(samples)
 
 
+# 1.12.66 — a ordem de empilhamento vem dos PREFIXOS NUMÉRICOS do pacote
+# oficial, lidos em 01/08/2026 na biblioteca do C10:
+#
+#   01 tailgate_open   02 body                 03 leftbehind_window_close
+#   04 leftfront_window_close                  05 tailgate_close
+#   06 hood_open       07 leftbehind_open      08 leftfront_open
+#   09 rightbehind_open                        10 rightfront_open
+#
+# `leapmotor_api._build_layer_list()` inverte a ordem em dois pontos, e é daí
+# que vinham os dois defeitos relatados pelo proprietário:
+#
+#   - `tailgate_open` DEPOIS do corpo → a tampa sobrepõe o carro;
+#   - `*_window_close` DEPOIS das portas → o vidro e o caixilho da porta
+#     fechada são carimbados sobre a porta aberta.
+#
+# Reproduzido lado a lado com as camadas reais e confirmado pelo proprietário.
+# A biblioteca também pede cinco camadas `*_close` de porta e capô que NÃO
+# existem neste pacote (só o corpo e sobreposições do que abre); elas eram
+# ignoradas em silêncio por `_composite_layers`.
+OFFICIAL_LAYER_ORDER: tuple[str, ...] = (
+    "carpic_tailgate_open.png",
+    "carpic_body.png",
+    "carpic_leftbehind_window_close.png",
+    "carpic_leftfront_window_close.png",
+    "carpic_tailgate_close.png",
+    "carpic_hood_open.png",
+    "carpic_leftbehind_open.png",
+    "carpic_leftfront_open.png",
+    "carpic_rightbehind_open.png",
+    "carpic_rightfront_open.png",
+)
+
+
+def official_layer_stack(
+    *,
+    trunk_open: bool = False,
+    hood_open: bool = False,
+    left_front_door_open: bool = False,
+    left_rear_door_open: bool = False,
+    right_front_door_open: bool = False,
+    right_rear_door_open: bool = False,
+    left_front_window_closed: bool = True,
+    left_rear_window_closed: bool = True,
+    charging: bool = False,
+    plugged: bool = False,
+    charge_frame: int | None = None,
+) -> list[str]:
+    """Monta a pilha de camadas na ordem do pacote oficial.
+
+    Função pura: recebe só estados booleanos e devolve nomes de arquivo. É ela
+    que o contrato exercita, porque a garantia é a ORDEM — não a expressão que
+    hoje a implementa.
+    """
+    stack: list[str] = []
+    if trunk_open:
+        stack.append("carpic_tailgate_open.png")  # 01 — atrás do corpo
+    stack.append("carpic_body.png")  # 02
+    if left_rear_window_closed:
+        stack.append("carpic_leftbehind_window_close.png")  # 03
+    if left_front_window_closed:
+        stack.append("carpic_leftfront_window_close.png")  # 04
+    if not trunk_open:
+        stack.append("carpic_tailgate_close.png")  # 05
+    if hood_open:
+        stack.append("carpic_hood_open.png")  # 06 — existe no pacote
+    if left_rear_door_open:
+        stack.append("carpic_leftbehind_open.png")  # 07
+    if left_front_door_open:
+        stack.append("carpic_leftfront_open.png")  # 08 — cobre o vidro 04
+    if right_rear_door_open:
+        stack.append("carpic_rightbehind_open.png")  # 09
+    if right_front_door_open:
+        stack.append("carpic_rightfront_open.png")  # 10
+    # Camadas de carga são 13+ no pacote: sempre depois das portas.
+    if charging:
+        frame = charge_frame if charge_frame is not None and 2 <= charge_frame <= 15 else 2
+        stack.append("carpic_charge_open.png")
+        stack.append(f"carpic_charge{frame}.png")
+    elif plugged:
+        stack.append("carpic_charge_open.png")
+        stack.append("carpic_charge1.png")
+    return stack
+
+
+def _layer_stack_from_status(visual_status: Any, charge_frame: int | None = None) -> list[str]:
+    """Traduz o `VehicleStatus` da biblioteca para a pilha oficial."""
+    doors = getattr(visual_status, "doors", None)
+    windows = getattr(visual_status, "windows", None)
+    battery = getattr(visual_status, "battery", None)
+
+    def flag(source: Any, name: str) -> bool:
+        return bool(getattr(source, name, False))
+
+    def window_closed(name: str) -> bool:
+        # Vidro ausente conta como fechado, que é o que o pacote desenha.
+        return (getattr(windows, name, 0) or 0) == 0
+
+    return official_layer_stack(
+        trunk_open=flag(doors, "bbcm_back_door_status"),
+        hood_open=flag(visual_status, "hood_open"),
+        left_front_door_open=flag(doors, "lbcm_driver_door_status"),
+        left_rear_door_open=flag(doors, "lbcm_left_rear_door_status"),
+        right_front_door_open=flag(doors, "rbcm_driver_door_status"),
+        right_rear_door_open=flag(doors, "rbcm_right_rear_door_status"),
+        left_front_window_closed=window_closed("left_front_window_percent"),
+        left_rear_window_closed=window_closed("left_rear_window_percent"),
+        charging=flag(battery, "is_charging") or flag(visual_status, "is_charging"),
+        plugged=flag(visual_status, "is_plugged"),
+        charge_frame=charge_frame,
+    )
+
+
 def _compose_official_frame(
     package: Any,
     visual_status: Any,
     charge_frame: int | None = None,
 ) -> tuple[bytes, int]:
-    """Compose one frame and remove the reflection embedded in an open door.
+    """Compõe um quadro na ordem oficial de camadas.
 
-    The official package already contains the front-left glass inside the
-    `carpic_leftfront_open` layer. Omitting the separate closed-window layer is
-    therefore insufficient. We rebuild only the adaptive glass polygon from an
-    otherwise identical composition with that door closed; the door panel,
-    mirror, shadows and complete official canvas remain untouched.
+    Antes da 1.12.66 esta função delegava a ordem a `package.compose()` e depois
+    tentava remendar o artefato do vidro repintando um polígono de frações
+    fixas. O remendo saiu: com o vidro empilhado atrás da porta, como manda o
+    prefixo oficial, não há artefato para apagar.
     """
-    compose_options: dict[str, Any] = {"format": "PNG"}
-    if charge_frame is not None:
-        compose_options["charge_frame"] = charge_frame
-    raw = package.compose(visual_status, **compose_options)
-    doors = getattr(visual_status, "doors", None)
-    if not bool(getattr(doors, "lbcm_driver_door_status", False)):
-        return raw, 0
-
     try:
-        from PIL import Image, ImageChops, ImageDraw
-
-        base_status = copy.deepcopy(visual_status)
-        setattr(base_status.doors, "lbcm_driver_door_status", False)
-        base_raw = package.compose(base_status, **compose_options)
-        opened = Image.open(io.BytesIO(raw)).convert("RGBA")
-        base = Image.open(io.BytesIO(base_raw)).convert("RGBA")
-        if opened.size != base.size:
-            return raw, 0
-
-        delta = ImageChops.difference(opened, base)
-        bbox = delta.getbbox()
-        if bbox is None:
-            return raw, 0
-        left, top, right, bottom = bbox
-        width = right - left
-        height = bottom - top
-        if width < 24 or height < 24:
-            return raw, 0
-
-        # The package uses the same aligned canvas for all model layers. Derive
-        # the glass polygon from the actual open-door delta instead of absolute
-        # vehicle/image coordinates so the correction follows different sizes.
-        polygon = [
-            (left + round(width * 0.05), top + round(height * 0.48)),
-            (left + round(width * 0.35), top + round(height * 0.03)),
-            (right - max(1, round(width * 0.02)), top),
-            (right - max(1, round(width * 0.01)), top + round(height * 0.48)),
-        ]
-        region_mask = Image.new("L", opened.size, 0)
-        ImageDraw.Draw(region_mask).polygon(polygon, fill=255)
-
-        channels = delta.split()
-        changed = channels[0]
-        for channel in channels[1:]:
-            changed = ImageChops.lighter(changed, channel)
-        changed = changed.point(lambda value: 255 if value > 6 else 0)
-        restore_mask = ImageChops.multiply(region_mask, changed)
-        restored_pixels = sum(restore_mask.histogram()[1:])
-        if restored_pixels < 8:
-            return raw, 0
-
-        cleaned = Image.composite(base, opened, restore_mask)
-        buffer = io.BytesIO()
-        cleaned.save(buffer, format="PNG", optimize=True)
-        return buffer.getvalue(), restored_pixels
+        stack = _layer_stack_from_status(visual_status, charge_frame)
+        canvas = package._composite_layers(stack)
+        return package._export(canvas, "PNG"), 0
     except Exception as exc:
         connector_log(
             logging.WARNING,
-            "Correção visual da porta aberta não pôde ser aplicada (%s); composição oficial preservada.",
+            "Composição oficial por camadas falhou (%s); usando a composição da biblioteca.",
             type(exc).__name__,
         )
-        return raw, 0
+
+    compose_options: dict[str, Any] = {"format": "PNG"}
+    if charge_frame is not None:
+        compose_options["charge_frame"] = charge_frame
+    return package.compose(visual_status, **compose_options), 0
 
 
 def _encode_official_composite(raw_image: bytes, media_type: str = "image/png") -> tuple[bytes, dict[str, Any]]:

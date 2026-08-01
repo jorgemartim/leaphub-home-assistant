@@ -116,5 +116,5 @@ def test_log_line_placeholders_match_its_arguments():
 
 
 def test_version_follows_the_release():
-    assert 'ENGINE_VERSION = "1.12.65"' in ENGINE
-    assert 'CONNECTOR_VERSION = "1.12.65"' in CONNECTOR
+    assert 'ENGINE_VERSION = "1.12.66"' in ENGINE
+    assert 'CONNECTOR_VERSION = "1.12.66"' in CONNECTOR
