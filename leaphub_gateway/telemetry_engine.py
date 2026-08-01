@@ -54,7 +54,7 @@ except ModuleNotFoundError:
         EVENT_TRANSPORT = _event_transport_module.EVENT_TRANSPORT
 
 LOG = logging.getLogger("leaphub.telemetry")
-ENGINE_VERSION = "1.12.64"  # diagnostico de confirmacao inconclusiva
+ENGINE_VERSION = "1.12.65"  # cadencia por carro acordado, nao por relogio
 
 # Hospedagem compartilhada (Apache/LiteSpeed) fecha a conexão ociosa em poucos
 # segundos. Reaproveitar depois disso escreve num socket já fechado e devolve
@@ -3081,6 +3081,7 @@ class TelemetryEngine:
             return
 
         states: list[str] = []
+        activity_parts: list[str] = []
         queued_events = 0
         skipped_events = 0
         for vehicle in vehicles:
@@ -3088,6 +3089,7 @@ class TelemetryEngine:
             source_at = str(telemetry.get("captured_at") or utc_iso())
             state = self._state_of(telemetry)
             states.append(state)
+            activity_parts.append(self.activity_fingerprint(telemetry))
             # Durante a confirmação de comando, até um snapshot semanticamente
             # idêntico precisa chegar ao site. Ex.: `unlock` solicitado quando o
             # carro já estava destravado. Suprimir essa amostra deixava a
@@ -3138,9 +3140,18 @@ class TelemetryEngine:
             next_command_poll = max(int(item["poll_count"]) for item in outcomes)
         else:
             next_command_poll = current_command_poll + 1 if command_mode else 0
+        # 1.12.65 — a contagem para "dormindo" mede tempo parado, não sono. Se
+        # as aberturas ou a tranca mudaram desde a leitura anterior, alguém
+        # mexeu no carro agora: ele está acordado e volta à cadência rápida.
+        activity_signature = "||".join(activity_parts)
+        previous_activity = self._ACTIVITY_REGISTRY.get(sid)
+        activity_changed = previous_activity is not None and previous_activity != activity_signature
+        self._ACTIVITY_REGISTRY[sid] = activity_signature
         interval, observed_state, parked_streak = self._adaptive_interval(
             states,
-            int(subscription["parked_streak"] or 0),
+            self.parked_streak_after_activity(
+                int(subscription["parked_streak"] or 0), activity_changed
+            ),
             interactive=interactive,
             command_mode=effective_command_mode,
             command_poll_count=next_command_poll,
@@ -3154,7 +3165,9 @@ class TelemetryEngine:
         if aggregate_state != observed_state and not effective_command_mode:
             interval, _, parked_streak = self._adaptive_interval(
                 [aggregate_state],
-                int(subscription["parked_streak"] or 0),
+                self.parked_streak_after_activity(
+                    int(subscription["parked_streak"] or 0), activity_changed
+                ),
                 interactive=interactive,
             )
         previous_sleep_streak = int(subscription["sleep_streak"] or 0)
@@ -3536,6 +3549,34 @@ class TelemetryEngine:
         ):
             return "parked"
         return "sleep"
+
+    # 1.12.65 — quem já teve atividade observada, por assinatura. Em memória de
+    # propósito: reiniciar o App custa um ciclo rápido a mais, nunca um lento.
+    _ACTIVITY_REGISTRY: dict[str, str] = {}
+
+    @staticmethod
+    def activity_fingerprint(telemetry: dict[str, Any]) -> str:
+        """O que muda quando alguém mexe no carro: aberturas e tranca.
+
+        Bateria, autonomia e temperatura oscilam com o carro dormindo e não
+        provam nada. Porta, porta-malas, capô, vidros, cortina e trava, sim.
+        """
+        doors = telemetry.get("doors") if isinstance(telemetry.get("doors"), dict) else {}
+        parts = [f"{name}={doors.get(name)!r}" for name in sorted(doors)]
+        for key in ("locked", "windows", "sunshade_open", "hood_open", "plugged"):
+            parts.append(f"{key}={telemetry.get(key)!r}")
+        return "|".join(parts)
+
+    @staticmethod
+    def parked_streak_after_activity(previous_streak: int, activity_changed: bool) -> int:
+        """Mexer no carro prova que ele está acordado: a contagem recomeça.
+
+        Sem isto, `_adaptive_interval` rebaixa parado para `sleep_seconds` na
+        sexta leitura — nove minutos de relógio, sem nunca perguntar ao carro.
+        Foi o defeito relatado em 01/08/2026: o porta-malas aberto com o carro
+        na garagem havia mais de nove minutos esperava a próxima leitura lenta.
+        """
+        return 0 if activity_changed else max(0, int(previous_streak or 0))
 
     @staticmethod
     def _confirm_state_transition(
