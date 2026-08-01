@@ -1392,6 +1392,36 @@ _IMAGE_LAST_HASH: dict[str, str] = {}
 _IMAGE_PACKAGE_CACHE: dict[str, tuple[float, Any, str, Path]] = {}
 _IMAGE_RENDER_CACHE: dict[str, tuple[float, bytes, str, dict[str, Any]]] = {}
 _IMAGE_DEBUG_LAST_HASH: dict[str, str] = {}
+# 1.12.40 — última assinatura visual cujos BYTES já foram entregues ao site.
+# `_IMAGE_LAST_HASH` guarda o hash da imagem; este guarda o ESTADO que ela
+# retrata, que é o que decide se o desenho ainda descreve o veículo.
+_IMAGE_LAST_SIGNATURE: dict[str, str] = {}
+
+
+def should_defer_official_image(
+    *,
+    include_secondary_network: bool,
+    manual_waiting: bool,
+    signature_changed: bool,
+) -> bool:
+    """Decide se a imagem oficial pode ficar para a próxima leitura.
+
+    Três regras, em ordem de precedência:
+
+    1. Comando manual aguardando SEMPRE adia — é a garantia da 1.12.28: o
+       pacote de imagem não pode segurar a conta na frente de um comando.
+    2. Assinatura visual mudou: não adia. A composição anterior deixou de
+       descrever o veículo, então ela e o estado passam a discordar na tela.
+       Foi o defeito relatado em 01/08/2026 — porta aberta e fechada certas nos
+       selos, e o desenho parado até alguém mandar um comando.
+    3. Fora isso, o perfil FAST adia, como antes.
+    """
+    if manual_waiting:
+        return True
+    if signature_changed:
+        return False
+    return not include_secondary_network
+
 
 _OFFICIAL_RENDER_COMPONENTS = {
     "front-left-open",
@@ -2708,10 +2738,35 @@ def serialize_vehicle(
     # 1.12.28 — o status do veículo é a parte essencial da telemetria.
     # Metadados/pacote de imagem são secundários e não podem manter a conta
     # ocupada quando um comando manual já está aguardando.
+    # 1.12.40 — quando a assinatura visual MUDA, o desenho deixa de ser
+    # secundário.
+    #
+    # Relato do proprietário em 01/08/2026: "a imagem não atualiza em tempo
+    # real, tenho que enviar um comando para ela atualizar". O estado chegava na
+    # hora — o site mostrava `doors_open: 2` e os marcadores certos — e só o
+    # desenho ficava para trás: a leitura FAST adia a imagem SEMPRE, e os bytes
+    # só saem com `force_visual_bytes`, que hoje é exclusivo do `sync`.
+    #
+    # Quando a assinatura muda (`unlocked--trunk-open` para
+    # `unlocked--front-left-open--rear-left-open`), a composição anterior deixou
+    # de descrever o veículo. Aí ela não é mais um extra: é a única coisa errada
+    # na tela.
+    #
+    # O comando manual continua com prioridade absoluta — `manual_waiting` segue
+    # adiando, que é a garantia da 1.12.28. O custo é uma composição por MUDANÇA
+    # de estado, não por leitura, e `_official_render_cache_key()` já evita
+    # recompor estado repetido.
+    visual_key = remote_id or vin
     try:
-        defer_secondary_network = (not include_secondary_network) or bool(manual_should_yield and manual_should_yield())
+        manual_waiting = bool(manual_should_yield and manual_should_yield())
     except Exception:
-        defer_secondary_network = not include_secondary_network
+        manual_waiting = False
+    signature_changed = bool(visual_signature) and _IMAGE_LAST_SIGNATURE.get(visual_key) != visual_signature
+    defer_secondary_network = should_defer_official_image(
+        include_secondary_network=include_secondary_network,
+        manual_waiting=manual_waiting,
+        signature_changed=signature_changed,
+    )
     if defer_secondary_network:
         connector_log(logging.DEBUG, "Telemetria adiou imagem oficial pelo perfil FAST ou para liberar a conta a um comando manual.")
         official_image = None
@@ -2727,11 +2782,18 @@ def serialize_vehicle(
             visual_components,
             charging_evidence_data,
             captured_at,
-            force_visual_bytes=force_visual_bytes,
+            # Assinatura nova exige os BYTES: só metadados fariam o site manter
+            # o desenho antigo, que é exatamente o defeito relatado.
+            force_visual_bytes=force_visual_bytes or signature_changed,
             force_debug_package=force_debug_package,
             force_package_refresh=force_package_refresh,
             manual_should_yield=manual_should_yield,
         )
+        if official_image is not None and visual_signature:
+            _IMAGE_LAST_SIGNATURE[visual_key] = visual_signature
+            if len(_IMAGE_LAST_SIGNATURE) > 64:
+                for stale_key in list(_IMAGE_LAST_SIGNATURE)[:-64]:
+                    _IMAGE_LAST_SIGNATURE.pop(stale_key, None)
     if official_image is not None:
         # visual_image sem data_base64 funciona como heartbeat de metadados; o
         # site mantém o último arquivo oficial persistido.
