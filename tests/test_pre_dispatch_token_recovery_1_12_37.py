@@ -13,9 +13,9 @@ checks = {
     "recovered_session_is_retained": '"session_retained_for_fast_confirmation"' in TELEMETRY
         and 'recovered["session_reused"] = True' in TELEMETRY,
     "pre_dispatch_recovery_log": "recriando uma única vez antes da ação" in TELEMETRY,
-    "version": any(v in (ROOT / "leaphub_gateway" / "config.yaml").read_text(encoding="utf-8") for v in ('version: "1.12.48"', 'version: "1.12.67"')),
+    "version": any(v in (ROOT / "leaphub_gateway" / "config.yaml").read_text(encoding="utf-8") for v in ('version: "1.12.48"', 'version: "1.12.68"')),
 }
 failed = [name for name, ok in checks.items() if not ok]
 if failed:
     raise SystemExit("pre-dispatch token recovery contract failed: " + ", ".join(failed))
-print({"ok": True, "checks": len(checks), "version": "1.12.67"})
+print({"ok": True, "checks": len(checks), "version": "1.12.68"})

@@ -43,7 +43,7 @@ except ImportError:
         _privacy_spec.loader.exec_module(_privacy_module)
         sanitize_log = _privacy_module.sanitize_log
 
-CONNECTOR_VERSION = "1.12.67"
+CONNECTOR_VERSION = "1.12.68"
 MAX_INPUT_BYTES = 1024 * 1024
 logging.getLogger("leapmotor_api").setLevel(logging.WARNING)
 LOGGER = logging.getLogger("leaphub.connector")
@@ -1592,8 +1592,11 @@ def official_layer_stack(
     if trunk_open:
         stack.append("carpic_tailgate_open.png")
     stack.append("carpic_body.png")
-    if not trunk_open:
-        stack.append("carpic_tailgate_close.png")
+    # `carpic_tailgate_close.png` NÃO entra. O corpo do pacote que o gateway usa
+    # já traz a tampa fechada, e desenhá-la de novo a sobrepõe ao carro — foi o
+    # que o dono viu na 1.12.67, com o porta-malas FECHADO. A camada existe no
+    # pacote da página de admin com prefixo 05 e eu a deduzi dali; a biblioteca
+    # nunca a acrescenta, e nisso ela está certa. Mover só o que está provado.
     stack.append("carpic_hood_close.png")
     if hood_open:
         stack.append("carpic_hood_open.png")

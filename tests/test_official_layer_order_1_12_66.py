@@ -79,11 +79,28 @@ def test_o_mesmo_vale_para_a_porta_traseira() -> None:
 # --------------------------------------------------------- controles negativos
 
 
-def test_tampa_fechada_usa_a_camada_de_fechada() -> None:
-    """Controle negativo: sem porta-malas aberto a camada 01 não pode entrar."""
+def test_tampa_fechada_nao_desenha_camada_de_tampa() -> None:
+    """1.12.68: o corpo já traz a tampa fechada; redesenhá-la a sobrepõe.
+
+    Na 1.12.67 eu acrescentava `carpic_tailgate_close.png`, deduzida do prefixo
+    05 do pacote da página de admin. No pacote que o gateway usa isso desenhava
+    a tampa duas vezes, e o dono viu a sobreposição com o porta-malas FECHADO.
+    """
     stack = pilha(trunk_open=False)
     assert "carpic_tailgate_open.png" not in stack
-    assert "carpic_tailgate_close.png" in stack
+    assert "carpic_tailgate_close.png" not in stack
+
+
+def test_nenhuma_camada_extra_alem_do_capo() -> None:
+    """O simétrico do contrato de ausência: também não se pode ACRESCENTAR.
+
+    Foi o que quebrou duas vezes seguidas — camadas deduzidas do pacote errado.
+    A única adição legítima é `carpic_hood_open`, que a biblioteca nunca pede.
+    """
+    permitido = {"carpic_hood_open.png"}
+    for estado in ESTADOS:
+        extras = set(pilha(**estado)) - set(_biblioteca(**estado)) - permitido
+        assert not extras, f"estado {estado} acrescentaria {sorted(extras)}"
 
 
 def test_vidro_aberto_nao_desenha_o_vidro_fechado() -> None:
@@ -167,7 +184,7 @@ def test_a_ordem_da_biblioteca_seria_reprovada_por_este_contrato() -> None:
     assert not vidro_atras, "a ordem da biblioteca punha o vidro sobre a porta aberta"
 
 
-# ------------------------------------------------------------------ 1.12.67
+# ------------------------------------------------------------------ 1.12.68
 # A 1.12.66 foi ao ar sem estes: ela removia as camadas `*_close` de porta, que
 # EXISTEM no pacote que o gateway baixa da nuvem, e o carro saiu sem as
 # laterais. O modelo de pacote foi lido no da página de admin, que é outro.
@@ -210,7 +227,7 @@ ESTADOS = [
 
 
 def test_nenhuma_camada_da_biblioteca_pode_sumir() -> None:
-    """O defeito da 1.12.67: o carro saiu sem as laterais."""
+    """O defeito da 1.12.68: o carro saiu sem as laterais."""
     for estado in ESTADOS:
         nossa = set(pilha(**estado))
         deles = set(_biblioteca(**estado))
