@@ -9,7 +9,7 @@ APP = ROOT / "leaphub_gateway"
 def test_release_target_is_runtime_version_and_config_may_be_staged():
     target = (APP / "RELEASE_TARGET").read_text(encoding="utf-8").strip()
     config = yaml.safe_load((APP / "config.yaml").read_text(encoding="utf-8"))
-    assert target == "1.12.68"
+    assert target == "1.12.69"
     assert config["version"] in {"1.12.48", target}
 
 

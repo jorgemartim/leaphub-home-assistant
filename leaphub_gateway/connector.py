@@ -43,7 +43,7 @@ except ImportError:
         _privacy_spec.loader.exec_module(_privacy_module)
         sanitize_log = _privacy_module.sanitize_log
 
-CONNECTOR_VERSION = "1.12.68"
+CONNECTOR_VERSION = "1.12.69"
 MAX_INPUT_BYTES = 1024 * 1024
 logging.getLogger("leapmotor_api").setLevel(logging.WARNING)
 LOGGER = logging.getLogger("leaphub.connector")
@@ -70,6 +70,13 @@ COMMAND_METHODS: dict[str, str] = {
     "windows_close": "close_windows",
     "sunshade_open": "open_sunshade",
     "sunshade_close": "close_sunshade",
+    # 1.12.69 — cortina numa posição intermediária, no mesmo cmd 161 e direito
+    # 161 dos dois acima. A ESCALA NÃO É A MESMA DAS JANELAS: a biblioteca
+    # documenta a cortina em 0-10 (`SunshadeValue.OPEN = "10"`), enquanto a
+    # telemetria do C10/B10 publica a abertura dela em 0-100. O gateway recebe
+    # 0-100 — que é o que o site mostra e o que o dono lê na tela — e converte.
+    # Ver o tratamento em execute_vehicle_command.
+    "sunshade_position": "control_sunshade",
     "climate_on": "ac_on",
     "climate_off": "ac_off",
     "quick_cool": "quick_cool",
@@ -178,7 +185,7 @@ COMMAND_REQUIRED_RIGHT: dict[str, int] = {
     "find_car": 120,
     "trunk_open": 130, "trunk_close": 130,
     "windows_open": 230, "windows_close": 230,
-    "sunshade_open": 161, "sunshade_close": 161,
+    "sunshade_open": 161, "sunshade_close": 161, "sunshade_position": 161,
     "climate_on": 170, "climate_off": 170,
     "quick_cool": 171, "quick_heat": 171,
     "windshield_defrost": 460,
@@ -3205,6 +3212,32 @@ def execute_vehicle_command(
         if position < 0 or position > 100:
             raise ValueError("Posição de janela inválida.")
         return method(vehicle_id, value=str(position))
+    if command == "sunshade_position":
+        # A cortina é o único comando desta matriz em que a escala de LEITURA e a
+        # de ESCRITA não coincidem, e é por isso que a conversão vive aqui e não
+        # em quem chama:
+        #   - leitura: `sunshade_percent` sai daqui em 0-100, porque no C10/B10 a
+        #     nuvem publica a abertura da cortina em `security.roof_opening`,
+        #     percentual medido em campo em 30/07/2026 (aberta=100, fechada=0);
+        #   - escrita: `SunshadeValue` documenta 0-10, com OPEN="10" e CLOSE="0",
+        #     ou seja 11 degraus de 10%.
+        # Receber 0-100 e converter mantém uma escala só na conversa com o site e
+        # com o dono — que vê "CORT. 45%" na figura e pediria 45, não 4,5. Mandar
+        # 45 no comando seria mandar um valor fora da faixa que a biblioteca
+        # declara, e o carro ignora o que não entende sem reclamar.
+        try:
+            percent = int(parameters.get("sunshade_position", parameters.get("value")))
+        except (TypeError, ValueError):
+            raise ValueError("Informe a posição da cortina.") from None
+        if percent < 0 or percent > 100:
+            raise ValueError("Posição de cortina inválida.")
+        # Arredondamento ao degrau mais próximo, meio para CIMA: 45% vira 5
+        # (50%). `round()` do Python é meio para o PAR — `round(4.5)` dá 4 e
+        # `round(5.5)` dá 6 —, o que faria a cortina descer num pedido e subir
+        # no outro sem regra visível para quem pediu. O valor que o carro recebe
+        # é sempre um dos 11 que ele declara aceitar.
+        native = (percent + 5) // 10
+        return method(vehicle_id, value=str(native))
     if command == "set_speed_limit":
         try:
             limit = int(parameters.get("speed_limit_kmh", parameters.get("value")))

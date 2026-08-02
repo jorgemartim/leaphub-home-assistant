@@ -21,6 +21,10 @@ expected_methods = {
     "windows_close": "close_windows",
     "sunshade_open": "open_sunshade",
     "sunshade_close": "close_sunshade",
+    # 1.12.69 — mesmo cmd 161 dos dois acima, numa posição intermediária.
+    # `control_sunshade` é o método que aceita `value`; `open_sunshade` também o
+    # aceita, mas mandar o extremo com valor confundiria os dois papéis.
+    "sunshade_position": "control_sunshade",
     "climate_on": "ac_on",
     "climate_off": "ac_off",
     "quick_cool": "quick_cool",
@@ -59,9 +63,9 @@ def check(condition: bool, message: str) -> None:
     if not condition:
         failures.append(message)
 
-check(connector.CONNECTOR_VERSION == "1.12.68", "Versão do Connector divergente")
+check(connector.CONNECTOR_VERSION == "1.12.69", "Versão do Connector divergente")
 check(connector.COMMAND_METHODS == expected_methods, "Matriz COMMAND_METHODS divergente")
-check(len(connector.COMMAND_METHODS) == 39, "A matriz precisa conter 39 comandos")
+check(len(connector.COMMAND_METHODS) == 40, "A matriz precisa conter 40 comandos")
 check(
     connector.EXPERIMENTAL_COMMAND_METHODS == {
         "sentry_on": "sentry_mode_on",
@@ -79,7 +83,7 @@ check(
     },
     "Matriz experimental divergente",
 )
-check(len(connector.ALL_COMMAND_METHODS) == 51, "Matriz total precisa conter 39 estáveis + 12 experimentais")
+check(len(connector.ALL_COMMAND_METHODS) == 52, "Matriz total precisa conter 40 estáveis + 12 experimentais")
 
 # Cada comando (estável e experimental) precisa declarar o direito exigido, para
 # que a matriz possa ser filtrada pela capacidade real do veículo.

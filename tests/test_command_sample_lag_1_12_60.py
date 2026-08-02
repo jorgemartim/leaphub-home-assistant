@@ -123,4 +123,4 @@ check(
 if failures:
     raise SystemExit("command sample lag contract failed:\n- " + "\n- ".join(failures))
 
-print({"ok": True, "checks": 12, "version": "1.12.68"})
+print({"ok": True, "checks": 12, "version": "1.12.69"})
