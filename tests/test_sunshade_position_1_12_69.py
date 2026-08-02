@@ -141,7 +141,7 @@ confere(
 )
 
 if falhas:
-    print({"ok": False, "falhas": falhas, "version": "1.12.70"})
+    print({"ok": False, "falhas": falhas, "version": "1.12.71"})
     raise SystemExit(1)
 
-print({"ok": True, "checks": checks, "version": "1.12.70"})
+print({"ok": True, "checks": checks, "version": "1.12.71"})
