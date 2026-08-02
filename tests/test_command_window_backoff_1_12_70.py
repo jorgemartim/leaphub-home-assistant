@@ -439,7 +439,15 @@ def test_a_genuinely_inflight_command_is_still_adopted() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_shared_session_client_has_room_for_the_slowest_dispatch() -> None:
+def test_dispatch_borrows_a_longer_timeout_and_gives_it_back() -> None:
+    """O despacho ganha os segundos; a telemetria não paga por eles.
+
+    1.12.71 — a 1.12.70 elevava o tempo limite do CLIENTE, e o mesmo cliente faz
+    a leitura de telemetria, que segura a trava da conta durante a chamada.
+    Alongar a leitura alonga a espera de quem manda o comando seguinte (a causa 4
+    dos logs de 02/08/2026: 36s esperando uma trava do poller). A biblioteca lê
+    `self.timeout` na hora da chamada, então o empréstimo é possível.
+    """
     with Harness() as h:
         engine = h.engine
         piso = telemetry.TelemetryEngine.COMMAND_DISPATCH_TIMEOUT_FLOOR_SECONDS
@@ -447,20 +455,58 @@ def test_shared_session_client_has_room_for_the_slowest_dispatch() -> None:
         # 12,686s medidos no despacho mais lento observado (`sunshade_position`,
         # 02/08/2026). O piso tem de dar folga real, não empatar.
         assert piso >= 20, f"o piso de {piso}s deixa o despacho medido a menos de 8s do limite"
-
-        # O piso não pode passar do teto que o create_client aceita.
+        # E não pode passar do teto que o create_client aceita.
         assert piso <= 45
 
-        # E não pode ENCURTAR o que o operador configurou: é piso, não valor.
-        engine.request_timeout_seconds = 30
-        assert max(engine.request_timeout_seconds, piso) == 30
+        class Cliente:
+            def __init__(self, timeout: int) -> None:
+                self.timeout = timeout
+
+        # Configurado abaixo do piso: o despacho recebe o piso e devolve o valor
+        # da telemetria, inclusive quando o despacho levanta.
+        cliente = Cliente(15)
+        with engine._dispatch_timeout(cliente):
+            durante = cliente.timeout
+        assert durante == piso, f"o despacho correu com {durante}s, não com o piso de {piso}s"
+        assert cliente.timeout == 15, "o tempo limite da telemetria não foi devolvido"
+
+        cliente = Cliente(15)
+        try:
+            with engine._dispatch_timeout(cliente):
+                raise RuntimeError("a nuvem recusou")
+        except RuntimeError:
+            pass
+        assert cliente.timeout == 15, (
+            "despacho que levanta deixou o cliente alongado, e a leitura seguinte "
+            "seguraria a trava da conta por mais tempo"
+        )
+
+        # Quem configurou MAIS continua com o que configurou: é piso, não valor.
+        cliente = Cliente(30)
+        with engine._dispatch_timeout(cliente):
+            assert cliente.timeout == 30
+        assert cliente.timeout == 30
+
+        # Biblioteca sem o atributo não quebra o despacho.
+        class SemTimeout:
+            pass
+
+        mudo = SemTimeout()
+        with engine._dispatch_timeout(mudo):
+            pass
+        assert not hasattr(mudo, "timeout")
 
     fonte = (APP / "telemetry_engine.py").read_text(encoding="utf-8")
     criacao = fonte[fonte.index("def _create_persistent_session_locked"):]
     criacao = criacao[: criacao.index("client.login()")]
-    assert "COMMAND_DISPATCH_TIMEOUT_FLOOR_SECONDS" in criacao, (
-        "a sessão persistente voltou a nascer com o tempo limite da telemetria, "
-        "e é ela que despacha os comandos"
+    assert "COMMAND_DISPATCH_TIMEOUT_FLOOR_SECONDS" not in criacao, (
+        "o piso voltou a ser gravado no cliente; a leitura de telemetria passa a "
+        "segurar a trava da conta por mais tempo"
+    )
+    despacho = fonte[fonte.index("def execute_command"):]
+    despacho = despacho[: despacho.index("def _dispatch_timeout")]
+    assert "_dispatch_timeout(" in despacho, (
+        "o despacho voltou a correr com o tempo limite da telemetria"
     )
 
 

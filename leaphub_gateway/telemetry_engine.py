@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import http.client
 import hmac
@@ -54,7 +55,7 @@ except ModuleNotFoundError:
         EVENT_TRANSPORT = _event_transport_module.EVENT_TRANSPORT
 
 LOG = logging.getLogger("leaphub.telemetry")
-ENGINE_VERSION = "1.12.70"  # tampa fechada nao e redesenhada
+ENGINE_VERSION = "1.12.71"  # tampa fechada nao e redesenhada
 
 # Hospedagem compartilhada (Apache/LiteSpeed) fecha a conexão ociosa em poucos
 # segundos. Reaproveitar depois disso escreve num socket já fechado e devolve
@@ -176,6 +177,10 @@ class TelemetryEngine:
     # 02/08/2026) passava a 2,3s do limite. O piso vale para instalações
     # existentes, que guardam o valor antigo em `telemetry_request_timeout_seconds`
     # e nunca releriam um novo padrão do config.yaml.
+    #
+    # 1.12.71 — e é emprestado SÓ ao despacho (`_dispatch_timeout`), não gravado
+    # no cliente. Quem segura a trava da conta durante a chamada é a leitura de
+    # telemetria; alongá-la alonga a espera do comando seguinte.
     COMMAND_DISPATCH_TIMEOUT_FLOOR_SECONDS = 25
 
     def __init__(
@@ -1272,15 +1277,12 @@ class TelemetryEngine:
                 credentials,
                 temp_dir,
                 None,
-                # 1.12.70 — este cliente é emprestado ao despacho de comando
-                # (`execute_command` passa `borrowed_client=session["client"]`),
-                # e o despacho é a operação mais lenta da nuvem. O tempo limite
-                # é do cliente, não da chamada, então o valor tem de servir ao
-                # consumidor mais exigente dos dois.
-                request_timeout_seconds=max(
-                    self.request_timeout_seconds,
-                    self.COMMAND_DISPATCH_TIMEOUT_FLOOR_SECONDS,
-                ),
+                # 1.12.71 — o cliente nasce com o tempo limite da TELEMETRIA, que
+                # é quem segura a trava da conta durante a chamada. Os segundos
+                # a mais de que o despacho precisa são emprestados só a ele, em
+                # `_dispatch_timeout`. A 1.12.70 elevava o cliente inteiro, e
+                # isso alongava a espera de quem manda o comando seguinte.
+                request_timeout_seconds=self.request_timeout_seconds,
             )
             if manual_should_yield is not None and manual_should_yield():
                 raise TelemetryYieldForManual("Operação manual recebeu prioridade antes do login automático.")
@@ -1465,12 +1467,13 @@ class TelemetryEngine:
             try:
                 handle_started = time.monotonic()
                 try:
-                    result = connector.handle_command(
-                        payload,
-                        progress=progress,
-                        borrowed_client=session["client"],
-                        borrowed_vehicles=session.get("vehicles") if isinstance(session.get("vehicles"), list) else None,
-                    )
+                    with self._dispatch_timeout(session["client"]):
+                        result = connector.handle_command(
+                            payload,
+                            progress=progress,
+                            borrowed_client=session["client"],
+                            borrowed_vehicles=session.get("vehicles") if isinstance(session.get("vehicles"), list) else None,
+                        )
                 finally:
                     handle_command_ms = int(round((time.monotonic() - handle_started) * 1000))
                 session["last_used_at"] = time.time()
@@ -1548,6 +1551,50 @@ class TelemetryEngine:
                 if connector.is_authentication_error(exc):
                     self._close_session_locked(subscription_id)
                 raise
+
+    @contextlib.contextmanager
+    def _dispatch_timeout(self, client: Any):
+        """Empresta ao despacho um tempo limite maior, e devolve o da telemetria.
+
+        1.12.71 — a 1.12.70 resolveu isto elevando o tempo limite do cliente
+        inteiro, e isso tinha um custo escondido: o MESMO cliente é usado pela
+        leitura de telemetria, que segura a trava da conta durante a chamada.
+        Alongar a leitura alonga a espera de quem manda o comando seguinte — a
+        causa 4 dos logs de 02/08/2026, em que um comando esperou 36s por uma
+        trava do poller.
+
+        A biblioteca lê `self.timeout` **na hora da chamada** (`client.py`, os
+        quatro pontos de `timeout=self.timeout`), não na construção. Então dá
+        para dar os segundos a mais só ao despacho: quem precisa deles é o
+        despacho, e quem paga por eles seria a telemetria.
+
+        Seguro contra concorrência porque todo este trecho roda dentro de
+        `_session_operation_lock(subscription_id)`, e cada assinatura tem o seu
+        cliente. Se a biblioteca instalada não expuser `timeout`, não faz nada:
+        o despacho continua com o que houver, como antes.
+        """
+        previous = getattr(client, "timeout", None)
+        raised = False
+        if isinstance(previous, (int, float)) and not isinstance(previous, bool):
+            target = max(int(previous), self.COMMAND_DISPATCH_TIMEOUT_FLOOR_SECONDS)
+            # O mesmo teto que `connector.create_client` aplica: emprestar mais
+            # que isso deixaria o comando pendurado além do que a fila do
+            # servidor tolera.
+            target = min(target, 45)
+            if target > previous:
+                try:
+                    client.timeout = target
+                    raised = True
+                except Exception:  # noqa: BLE001
+                    raised = False
+        try:
+            yield
+        finally:
+            if raised:
+                try:
+                    client.timeout = previous
+                except Exception:  # noqa: BLE001
+                    pass
 
     def _arm_command_confirmation(
         self,
