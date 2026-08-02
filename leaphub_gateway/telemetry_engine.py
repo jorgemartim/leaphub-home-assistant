@@ -54,7 +54,7 @@ except ModuleNotFoundError:
         EVENT_TRANSPORT = _event_transport_module.EVENT_TRANSPORT
 
 LOG = logging.getLogger("leaphub.telemetry")
-ENGINE_VERSION = "1.12.69"  # tampa fechada nao e redesenhada
+ENGINE_VERSION = "1.12.70"  # tampa fechada nao e redesenhada
 
 # Hospedagem compartilhada (Apache/LiteSpeed) fecha a conexão ociosa em poucos
 # segundos. Reaproveitar depois disso escreve num socket já fechado e devolve
@@ -150,6 +150,33 @@ class TelemetryEngine:
     # três lugares e um contrato reprovava por carimbar o antigo.
     COMMAND_MAX_POLLS_FLOOR = 8
     COMMAND_MAX_POLLS_CEILING = 12
+
+    # 1.12.70 — backoff próprio da janela de confirmação.
+    #
+    # A falha temporária escolhia o backoff por `fast_mode`, que é
+    # `interactive or command_mode`: presença na tela e espera de comando
+    # entravam no mesmo balde. Um `Read timed out` durante a confirmação
+    # mandava a próxima leitura para 45s (site aberto) ou 120s (site fechado),
+    # dentro de uma janela que dura 180s e cuja cadência começa em 12s. Uma
+    # única falha consumia a janela inteira.
+    #
+    # Medido em campo em 02/08/2026: `trunk_close` despachado às 14:03:36 e
+    # aceito pela nuvem às 14:03:38; `Read timed out` às 14:04:10 com "nova
+    # leitura em 45s"; o comando nunca apareceu confirmado.
+    COMMAND_TRANSIENT_BACKOFF = (8, 15, 25, 40, 60, 90)
+
+    # Folga mínima entre a leitura reagendada e o fim da janela. Uma leitura que
+    # chega depois do prazo não confirma nada: `_evaluate_confirmation` encerra
+    # a espera por `window_deadline` antes de olhar a amostra.
+    COMMAND_WINDOW_MIN_MARGIN_SECONDS = 3
+
+    # 1.12.70 — o cliente Leapmotor da sessão persistente é o mesmo que despacha
+    # os comandos, e o despacho é bem mais lento que a leitura de status. Com o
+    # padrão de 15s da telemetria, `sunshade_position` (12,686s medidos em
+    # 02/08/2026) passava a 2,3s do limite. O piso vale para instalações
+    # existentes, que guardam o valor antigo em `telemetry_request_timeout_seconds`
+    # e nunca releriam um novo padrão do config.yaml.
+    COMMAND_DISPATCH_TIMEOUT_FLOOR_SECONDS = 25
 
     def __init__(
         self,
@@ -1245,7 +1272,15 @@ class TelemetryEngine:
                 credentials,
                 temp_dir,
                 None,
-                request_timeout_seconds=self.request_timeout_seconds,
+                # 1.12.70 — este cliente é emprestado ao despacho de comando
+                # (`execute_command` passa `borrowed_client=session["client"]`),
+                # e o despacho é a operação mais lenta da nuvem. O tempo limite
+                # é do cliente, não da chamada, então o valor tem de servir ao
+                # consumidor mais exigente dos dois.
+                request_timeout_seconds=max(
+                    self.request_timeout_seconds,
+                    self.COMMAND_DISPATCH_TIMEOUT_FLOOR_SECONDS,
+                ),
             )
             if manual_should_yield is not None and manual_should_yield():
                 raise TelemetryYieldForManual("Operação manual recebeu prioridade antes do login automático.")
@@ -1926,24 +1961,39 @@ class TelemetryEngine:
         O site repete o boost como sinal de recuperação. Reaproveitar a espera
         preserva as amostras já contadas; criar outra reiniciaria a contagem a
         cada repetição e a confirmação nunca terminaria.
+
+        1.12.70 — o casamento passou a ser simétrico. Antes, um boost SEM
+        request_id adotava a espera existente, mas um boost COM request_id
+        nunca adotava uma espera sem id: criava a sua própria, e o mesmo comando
+        físico ficava com DUAS esperas pendentes. A gêmea sem id confirma
+        sozinha (o estado dela já está satisfeito quando ela nasce) e escreve no
+        log "confirmado ... 1 comando(s) ainda aguardam", que se lê como se o
+        comando recém-enviado tivesse sido o confirmado. Foi o que apareceu duas
+        vezes em campo em 02/08/2026, às 13:43:23 e às 14:03:43.
         """
         rows = db.execute(
             "SELECT * FROM command_confirmations WHERE subscription_id=? AND status='pending' AND expires_at>? "
             "ORDER BY started_at DESC",
             (subscription_id, now_epoch),
         ).fetchall()
+        anonymous: sqlite3.Row | None = None
         for row in rows:
             if str(row["command_key"] or "") != command_key:
                 continue
             if str(row["command_vehicle_id"] or "") != vehicle_id:
                 continue
             existing_request = str(row["request_id"] or "")
-            # Boost sem request_id adota a espera existente; com request_id
-            # diferente, é outro comando e merece a sua própria espera.
-            if request_id and request_id != existing_request:
-                continue
-            return row
-        return None
+            # Boost sem request_id adota a espera existente; id igual é o mesmo
+            # comando repetido pelo site como recuperação.
+            if not request_id or request_id == existing_request:
+                return row
+            # Espera sem id nenhum, e agora chegou um id para a mesma dupla
+            # comando+veículo: é o MESMO comando, armado por quem ainda não
+            # conhecia o id. Adotar, e batizar. Uma espera com id DIFERENTE
+            # continua sendo outro comando e merece a sua própria.
+            if not existing_request and anonymous is None:
+                anonymous = row
+        return anonymous
 
     def _register_confirmation(
         self,
@@ -1961,12 +2011,23 @@ class TelemetryEngine:
             db, subscription_id, command_key, vehicle_id, request_id, now_epoch
         )
         if existing is not None:
-            db.execute(
-                "UPDATE command_confirmations SET expires_at=MAX(expires_at,?),context_json=?,updated_at=? "
-                "WHERE confirmation_id=?",
-                (now_epoch + seconds, context_json, now_iso, str(existing["confirmation_id"])),
-            )
-            return str(existing["confirmation_id"]), True
+            adopted = str(existing["confirmation_id"])
+            # O `confirmation_id` é chave primária e não muda; o que muda é a
+            # identidade gravada na linha. Batizar a espera anônima é o que
+            # impede a próxima repetição do boost de criar a gêmea de novo.
+            if request_id and not str(existing["request_id"] or ""):
+                db.execute(
+                    "UPDATE command_confirmations SET request_id=?,expires_at=MAX(expires_at,?),"
+                    "context_json=?,updated_at=? WHERE confirmation_id=?",
+                    (request_id, now_epoch + seconds, context_json, now_iso, adopted),
+                )
+            else:
+                db.execute(
+                    "UPDATE command_confirmations SET expires_at=MAX(expires_at,?),context_json=?,updated_at=? "
+                    "WHERE confirmation_id=?",
+                    (now_epoch + seconds, context_json, now_iso, adopted),
+                )
+            return adopted, True
         confirmation_id = self._confirmation_id(subscription_id, command_key, vehicle_id, request_id)
         db.execute(
             "INSERT OR REPLACE INTO command_confirmations "
@@ -2053,6 +2114,19 @@ class TelemetryEngine:
             request_id = ""
         vehicle_id = str(subscription["command_vehicle_id"] or "")
         started_at = float(subscription["command_started_at"] or 0) or now_epoch
+        # 1.12.70 — as colunas da assinatura sobrevivem ao veredito quando outra
+        # espera ainda estava pendente no ciclo que as leu. Sem esta guarda, o
+        # ciclo seguinte relia as mesmas colunas e RESSUSCITAVA um comando já
+        # confirmado como uma espera nova, sem id — a entrada fantasma que
+        # confirma na primeira leitura, porque o estado dela já foi atingido, e
+        # rouba a leitura do comando que acabou de ser despachado.
+        resolved = db.execute(
+            "SELECT 1 FROM command_confirmations WHERE subscription_id=? AND command_key=? "
+            "AND status<>'pending' AND resolved_at>=? LIMIT 1",
+            (sid, command_key, started_at),
+        ).fetchone()
+        if resolved is not None:
+            return
         now_iso = utc_iso()
         db.execute(
             "INSERT OR IGNORE INTO command_confirmations "
@@ -3044,7 +3118,11 @@ class TelemetryEngine:
                     schedule = (30, 60, 180, 600, 1800, 3600) if command_mode else (120, 300, 900, 1800, 3600, 10800)
                     delay = schedule[min(max(1, failures) - 1, len(schedule) - 1)]
                 else:
-                    delay = self._transient_backoff(failures, fast_mode)
+                    delay = self._transient_backoff(failures, fast_mode, command_mode=command_mode)
+                if command_mode:
+                    delay = self._within_command_window(
+                        delay, float(subscription["command_until"] or 0), time.time()
+                    )
                 self._reschedule(sid, delay, "recovering", message, failed=True)
                 if failures >= 3:
                     LOG.warning("Sessão Leapmotor de %s será refeita após %ss por falhas temporárias repetidas: %s", sid, delay, message)
@@ -3052,6 +3130,10 @@ class TelemetryEngine:
                     LOG.warning("Falha temporária em %s; sessão preservada e nova leitura em %ss: %s", sid, delay, message)
             else:
                 delay = self._failure_backoff(failures)
+                if command_mode:
+                    delay = self._within_command_window(
+                        delay, float(subscription["command_until"] or 0), time.time()
+                    )
                 self._reschedule(sid, delay, "error", message, failed=True)
             return
         finally:
@@ -3077,7 +3159,12 @@ class TelemetryEngine:
             vehicles = [item for item in vehicles if str(item.get("remote_id") or "") in vehicle_ids]
         if not vehicles:
             self._close_session(sid)
-            self._reschedule(sid, self._failure_backoff(int(subscription["consecutive_failures"] or 0) + 1), "error", "Nenhum veículo autorizado foi retornado.", failed=True)
+            empty_delay = self._failure_backoff(int(subscription["consecutive_failures"] or 0) + 1)
+            if command_mode:
+                empty_delay = self._within_command_window(
+                    empty_delay, float(subscription["command_until"] or 0), time.time()
+                )
+            self._reschedule(sid, empty_delay, "error", "Nenhum veículo autorizado foi retornado.", failed=True)
             return
 
         states: list[str] = []
@@ -3227,12 +3314,17 @@ class TelemetryEngine:
                 sid,
             )
         for item in confirmed_outcomes:
+            # 1.12.70 — o tempo até confirmar entra na linha. Era o número que a
+            # análise de campo tinha de reconstruir somando carimbos de hora de
+            # linhas diferentes, e é ele que diz se a janela está funcionando.
             LOG.info(
-                "Comando %s (%s) confirmado pela telemetria de %s após %s leitura(s); %s comando(s) ainda aguardam.",
+                "Comando %s (%s) confirmado pela telemetria de %s após %s leitura(s) e %ss; "
+                "%s comando(s) ainda aguardam.",
                 item["command_key"],
                 item["request_id"] or "sem request_id",
                 sid,
                 item["poll_count"],
+                int(item["elapsed"]),
                 len(remaining_outcomes),
             )
         for item in exhausted_outcomes:
@@ -3516,9 +3608,28 @@ class TelemetryEngine:
             )
 
     @staticmethod
-    def _transient_backoff(failures: int, interactive: bool) -> int:
-        schedule = (45, 90, 180, 300, 900, 1800) if interactive else (120, 300, 900, 1800, 3600, 10800)
+    def _transient_backoff(failures: int, interactive: bool, command_mode: bool = False) -> int:
+        # A espera de comando tem prazo curto e cadência própria; ela não pode
+        # herdar o backoff de quem só está olhando a tela.
+        if command_mode:
+            schedule = TelemetryEngine.COMMAND_TRANSIENT_BACKOFF
+        else:
+            schedule = (45, 90, 180, 300, 900, 1800) if interactive else (120, 300, 900, 1800, 3600, 10800)
         return schedule[min(max(1, int(failures)), len(schedule)) - 1]
+
+    def _within_command_window(self, delay: int, command_until: float, now_epoch: float) -> int:
+        """Encurta um reagendamento que cairia depois do fim da janela.
+
+        Sem isto, qualquer atraso escolhido por outro motivo (falha temporária,
+        conta ocupada, backoff de erro) desperdiça o que resta da janela: a
+        leitura seguinte chega quando a espera já foi encerrada por prazo. O
+        piso de 2s existe para não transformar o encurtamento em laço apertado
+        contra a nuvem.
+        """
+        remaining = float(command_until or 0) - float(now_epoch)
+        if remaining <= 0:
+            return int(delay)
+        return max(2, min(int(delay), int(remaining) - self.COMMAND_WINDOW_MIN_MARGIN_SECONDS))
 
     @staticmethod
     def _failure_backoff(failures: int) -> int:

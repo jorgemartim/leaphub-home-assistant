@@ -43,7 +43,7 @@ except ImportError:
         _privacy_spec.loader.exec_module(_privacy_module)
         sanitize_log = _privacy_module.sanitize_log
 
-CONNECTOR_VERSION = "1.12.69"
+CONNECTOR_VERSION = "1.12.70"
 MAX_INPUT_BYTES = 1024 * 1024
 logging.getLogger("leapmotor_api").setLevel(logging.WARNING)
 LOGGER = logging.getLogger("leaphub.connector")
@@ -3104,6 +3104,22 @@ def try_wake_vehicle(client: Any, vehicle_id: str) -> dict[str, Any]:
     Different releases of leapmotor-api used different method names. Reflection
     keeps the connector compatible and never treats absence of a wake method as
     a failure because many command endpoints wake the car themselves.
+
+    MEDIDO em 02/08/2026 contra leapmotor-api 0.3.2, a versão fixada em
+    requirements.txt: NENHUM dos nomes abaixo existe no cliente. A biblioteca
+    expõe exatamente uma leitura de estado (`vehicle/v1/status/get`, que devolve
+    o último instantâneo que o carro subiu) e nenhuma operação de despertar ou
+    de forçar atualização. Portanto:
+
+      * esta função devolve `attempted: False` em toda instalação atual, e o
+        único chamador trata isso como "não dá para acordar", que é a verdade;
+      * "forçar refresh/wakeUp antes de amostrar a confirmação" NÃO é
+        implementável com esta biblioteca — seria código inerte. Quem acorda o
+        carro é o próprio comando, e a lentidão medida na confirmação vinha do
+        backoff da janela, corrigido na 1.12.70 no telemetry_engine.
+
+    Se uma versão futura da biblioteca ganhar a primitiva, ela passa a ser
+    encontrada aqui sem mudança nenhuma.
     """
     for method_name in (
         "wake_vehicle", "wake_up_vehicle", "wakeup_vehicle",
