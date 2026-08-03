@@ -43,7 +43,7 @@ except ImportError:
         _privacy_spec.loader.exec_module(_privacy_module)
         sanitize_log = _privacy_module.sanitize_log
 
-CONNECTOR_VERSION = "1.12.71"
+CONNECTOR_VERSION = "1.12.72"
 MAX_INPUT_BYTES = 1024 * 1024
 logging.getLogger("leapmotor_api").setLevel(logging.WARNING)
 LOGGER = logging.getLogger("leaphub.connector")
@@ -2957,6 +2957,131 @@ def create_client(credentials: dict[str, Any], temp_dir: Path, operation_passwor
     )
 
 
+# ----------------------------------------------------------------------------
+# 1.12.72 — leitura de DIAGNÓSTICO do histórico da nuvem.
+#
+# Por que existe: a telemetria ao vivo só enxerga o que o carro subiu, e o carro
+# para de subir enquanto roda. Medido em 31/07/2026 numa viagem de 94 km: das
+# 112 leituras, 72 eram a MESMA — o Gateway perguntou 72 vezes durante 71
+# minutos e a nuvem devolveu sempre o mesmo instantâneo, enquanto 60 km eram
+# percorridos. O trecho de rodovia simplesmente não existe na telemetria.
+#
+# A `leapmotor-api` expõe quatro leituras de HISTÓRICO que este conector nunca
+# chamou, e uma delas é `/carownerservice/oversea/drivingRecord/v1/mileage/
+# energy/detail` — o registro de condução do próprio carro, que não depende da
+# nossa cadência.
+#
+# Esta função NÃO consome nada. Ela chama, mede a FORMA da resposta e devolve o
+# esqueleto (chaves, tipos, tamanhos, uma amostra recortada). É deliberado: a
+# decisão do wakeUp na 1.12.70 quase virou código inerte por ser escrita antes
+# de alguém olhar o que a biblioteca oferecia. Primeiro se mede, depois se
+# escreve o consumidor.
+# ----------------------------------------------------------------------------
+DRIVING_RECORD_METHODS = (
+    "get_mileage_energy_detail",
+    "get_consumption_last_week_breakdown",
+    "get_consumption_weekly_rank",
+    "get_charging_daily_detail",
+)
+
+# Nada de valor bruto num diagnóstico: só forma. Um número vira o seu tipo e a
+# sua ordem de grandeza; um texto vira o seu tamanho. O que interessa aqui é
+# saber QUAIS campos existem, não quanto o dono rodou.
+def describe_shape(value: Any, depth: int = 0, max_depth: int = 4) -> Any:
+    if depth >= max_depth:
+        return type(value).__name__ + " (profundidade cortada)"
+    if isinstance(value, dict):
+        return {str(k)[:60]: describe_shape(v, depth + 1, max_depth) for k, v in list(value.items())[:60]}
+    if isinstance(value, (list, tuple)):
+        if not value:
+            return "lista vazia"
+        return {
+            "lista": len(value),
+            "primeiro_item": describe_shape(value[0], depth + 1, max_depth),
+        }
+    if isinstance(value, bool):
+        return "bool"
+    if isinstance(value, int):
+        return f"int (~1e{len(str(abs(value))) - 1})" if value else "int (0)"
+    if isinstance(value, float):
+        return f"float (~1e{len(str(int(abs(value)))) - 1})" if value else "float (0)"
+    if value is None:
+        return "nulo"
+    if isinstance(value, str):
+        return f"texto[{len(value)}]"
+    return type(value).__name__
+
+
+def handle_driving_record(payload: dict[str, Any]) -> dict[str, Any]:
+    """Chama as leituras de histórico e devolve só a FORMA do que voltou."""
+    credentials = payload.get("credentials") if isinstance(payload.get("credentials"), dict) else {}
+    vehicle_id = str(payload.get("vehicle_id") or "").strip()
+    temp_dir = secure_temp_directory()
+    resultados: list[dict[str, Any]] = []
+    try:
+        client = create_client(credentials, temp_dir / "attempt-1", None, request_timeout_seconds=32)
+        try:
+            client.login()
+            vehicles = list(client.get_vehicle_list() or [])
+            if not vehicles:
+                return {"ok": False, "message": "A conta não retornou nenhum veículo."}
+            selected = vehicles[0]
+            if vehicle_id:
+                for item in vehicles:
+                    if vehicle_id in {
+                        str(attribute(item, "vin", "") or ""),
+                        str(attribute(item, "car_id", "") or ""),
+                    }:
+                        selected = item
+                        break
+            for nome in DRIVING_RECORD_METHODS:
+                metodo = getattr(client, nome, None)
+                if not callable(metodo):
+                    resultados.append({"metodo": nome, "existe": False})
+                    continue
+                started = time.monotonic()
+                try:
+                    try:
+                        bruto = metodo(selected)
+                    except TypeError:
+                        bruto = metodo()
+                    resultados.append({
+                        "metodo": nome,
+                        "existe": True,
+                        "ok": True,
+                        "duracao_ms": int(round((time.monotonic() - started) * 1000)),
+                        "tipo": type(bruto).__name__,
+                        "forma": describe_shape(
+                            bruto if isinstance(bruto, (dict, list)) else getattr(bruto, "__dict__", bruto)
+                        ),
+                    })
+                except Exception as exc:  # noqa: BLE001
+                    # Uma leitura que falha não pode derrubar as outras: é
+                    # justamente saber QUAIS respondem que este diagnóstico
+                    # existe para descobrir.
+                    resultados.append({
+                        "metodo": nome,
+                        "existe": True,
+                        "ok": False,
+                        "duracao_ms": int(round((time.monotonic() - started) * 1000)),
+                        "erro": clean_message(str(exc))[:300],
+                    })
+        finally:
+            try:
+                client.close()
+            except Exception:
+                pass
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+    return {
+        "ok": True,
+        "connector_version": CONNECTOR_VERSION,
+        "library_version": package_version(),
+        "leituras": resultados,
+        "aviso": "Diagnóstico: só a forma da resposta, sem valores. Nada foi consumido.",
+    }
+
+
 def handle_account(
     payload: dict[str, Any],
     sync: bool,
@@ -4346,6 +4471,8 @@ def main() -> None:
         emit(handle_account(payload, sync=True))
     if action == "command":
         emit(handle_command(payload))
+    if action == "driving_record":
+        emit(handle_driving_record(payload))
     raise ValueError("Ação não suportada pelo conector.")
 
 

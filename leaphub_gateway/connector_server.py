@@ -65,7 +65,7 @@ except ModuleNotFoundError:
         _event_transport_spec.loader.exec_module(_event_transport_module)
         EVENT_TRANSPORT = _event_transport_module.EVENT_TRANSPORT
 
-VERSION = "1.12.71"
+VERSION = "1.12.72"
 API_VERSION = 2
 CAPABILITY_SCHEMA_VERSION = 1
 MIN_SUPPORTED_CLIENT_API_VERSION = 1
@@ -1777,7 +1777,7 @@ class Handler(BaseHTTPRequestHandler):
                 "supported_api_version": API_VERSION,
             })
             return
-        if self.path not in {"/v1/accounts/test", "/v1/vehicles/sync", "/v1/vehicles/sync/status", "/v1/vehicles/command", "/v1/vehicles/command/status", "/v1/vehicles/command/cancel", "/v1/telemetry/subscriptions/upsert", "/v1/telemetry/subscriptions/remove", "/v1/telemetry/subscriptions/boost", "/v1/telemetry/subscriptions/release"}:
+        if self.path not in {"/v1/accounts/test", "/v1/vehicles/sync", "/v1/vehicles/sync/status", "/v1/vehicles/command", "/v1/vehicles/command/status", "/v1/vehicles/command/cancel", "/v1/telemetry/subscriptions/upsert", "/v1/telemetry/subscriptions/remove", "/v1/telemetry/subscriptions/boost", "/v1/telemetry/subscriptions/release", "/v1/vehicles/driving-record"}:
             self.send_json(404, {"ok": False, "message": "Página não encontrada."})
             return
         try:
@@ -1891,7 +1891,13 @@ class Handler(BaseHTTPRequestHandler):
                         "message": "Finalizando uma leitura já iniciada desta conta. O comando continua com prioridade.",
                     })
                     return
-                if self.path == "/v1/accounts/test":
+                if self.path == "/v1/vehicles/driving-record":
+                    # 1.12.72 - diagnostico read-only do historico da nuvem. Passa
+                    # pelas MESMAS travas das demais leituras de conta: ele fala com
+                    # a Leapmotor, entao nao pode furar a fila nem competir com um
+                    # comando do dono.
+                    result = connector.handle_driving_record(payload)
+                elif self.path == "/v1/accounts/test":
                     result = TELEMETRY.execute_account_operation(environment, payload, sync=False, origin="account_test")
                 elif self.path == "/v1/vehicles/sync":
                     result = TELEMETRY.execute_account_operation(environment, payload, sync=True, origin="vehicle_sync")
