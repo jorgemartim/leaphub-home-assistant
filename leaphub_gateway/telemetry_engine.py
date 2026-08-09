@@ -55,7 +55,7 @@ except ModuleNotFoundError:
         EVENT_TRANSPORT = _event_transport_module.EVENT_TRANSPORT
 
 LOG = logging.getLogger("leaphub.telemetry")
-ENGINE_VERSION = "1.12.72"  # tampa fechada nao e redesenhada
+ENGINE_VERSION = "1.12.73"  # recusa permanente sai da fila
 
 # Hospedagem compartilhada (Apache/LiteSpeed) fecha a conexão ociosa em poucos
 # segundos. Reaproveitar depois disso escreve num socket já fechado e devolve
@@ -4242,10 +4242,24 @@ class TelemetryEngine:
             by_id = {str(item.get("event_id")): item for item in (payload.get("results") or []) if isinstance(item, dict)}
             delivered_ids = []
             failed_rows = []
+            # 1.12.73 — recusa permanente sai da fila em vez de voltar para ela.
+            #
+            # Medido em 09/08/2026, com o site na 1.12.327: o MESMO evento foi
+            # recusado a cada ~2 min das 06:04 às 12:48, ~700 por dia. O site
+            # dizia "recusado", este laço entendia "adiado" e o backoff tem teto
+            # de 120 s — a repetição nunca desacelerava. A causa era um veículo
+            # não confirmado naquela conta, e nenhuma repetição confirma veículo.
+            #
+            # O site agora marca `permanent` por evento. Só isso tira da fila:
+            # ausência da marca continua sendo "tente de novo", que é o
+            # comportamento de sempre e o que um site antigo produz.
+            discarded: list[tuple[sqlite3.Row, str]] = []
             for row in valid_rows:
                 item = by_id.get(str(row["event_id"]))
                 if item and item.get("ok") is True:
                     delivered_ids.append(str(row["event_id"]))
+                elif item and item.get("permanent") is True:
+                    discarded.append((row, str(item.get("message") or "O site recusou o evento em definitivo.")))
                 else:
                     failed_rows.append(row)
             if delivered_ids:
@@ -4254,6 +4268,17 @@ class TelemetryEngine:
                     db.executemany("UPDATE events SET status='delivered', delivered_at=?, last_error=NULL WHERE event_id=?", [(now, event_id) for event_id in delivered_ids])
                     subscription_ids = sorted({str(row["subscription_id"]) for row in valid_rows if str(row["event_id"]) in delivered_ids})
                     db.executemany("UPDATE subscriptions SET last_delivery_at=?, updated_at=? WHERE subscription_id=?", [(now, now, sid) for sid in subscription_ids])
+            for row, reason in discarded:
+                self._mark_permanent_failure(str(row["event_id"]), reason)
+            if discarded:
+                # O motivo vai no log porque descarte de leitura precisa ficar
+                # explicado: quem lê "1 evento descartado" tem de saber por quê
+                # sem abrir o banco.
+                LOG.warning(
+                    "Entrega de %s evento(s) descartada em definitivo pelo site: %s",
+                    len(discarded),
+                    discarded[0][1],
+                )
             if failed_rows:
                 self._delivery_failed(failed_rows, "O site recusou parte do lote.")
         except (
@@ -4473,11 +4498,38 @@ class TelemetryEngine:
                     f"UPDATE subscriptions SET status=?, interactive_until=0, command_until=0, last_error=NULL, updated_at=? WHERE subscription_id IN ({placeholders})",
                     (expired_status, utc_iso(), *expired_windows),
                 )
-            db.execute("DELETE FROM events WHERE status='delivered' AND delivered_at<?", (cutoff_iso,))
+            # 1.12.73 — evento NAO entregue também tem horizonte.
+            #
+            # Até aqui a retenção só apagava o que já tinha sido entregue, então
+            # um evento que o site recusasse indefinidamente ficava na fila para
+            # sempre, tentando a cada 120 s. Foi assim que ~700 tentativas por
+            # dia se sustentaram por horas sem nada envelhecer.
+            #
+            # Esta é a metade que NÃO depende do site: mesmo com um site antigo,
+            # que não sabe marcar recusa permanente, a fila desiste sozinha na
+            # mesma janela em que já descartava o entregue. Telemetria com dias
+            # de atraso não tem valor — o próprio site poda o histórico dela.
+            desistidos = db.execute(
+                "UPDATE events SET status='failed', last_error=? WHERE status='pending' AND created_at<?",
+                ("A fila desistiu: nao entregue dentro da janela de retencao.", cutoff_iso),
+            ).rowcount
+            if desistidos:
+                LOG.warning(
+                    "Fila de telemetria desistiu de %s evento(s) nao entregue(s) ha mais de %s dia(s).",
+                    desistidos,
+                    self.retention_days,
+                )
+            # Terminal e velho sai do disco, tenha sido entregue ou descartado.
+            # Sem incluir 'failed' aqui, o descarte apenas trocaria um vazamento
+            # de repeticao por um vazamento de linhas.
+            db.execute(
+                "DELETE FROM events WHERE status IN ('delivered','failed') AND COALESCE(delivered_at, created_at)<?",
+                (cutoff_iso,),
+            )
             total = int(db.execute("SELECT COUNT(*) FROM events").fetchone()[0])
             if total > self.queue_max:
                 excess = total - self.queue_max
                 db.execute(
-                    "DELETE FROM events WHERE event_id IN (SELECT event_id FROM events WHERE status='delivered' ORDER BY delivered_at ASC LIMIT ?)",
+                    "DELETE FROM events WHERE event_id IN (SELECT event_id FROM events WHERE status IN ('delivered','failed') ORDER BY COALESCE(delivered_at, created_at) ASC LIMIT ?)",
                     (excess,),
                 )
