@@ -48,16 +48,31 @@ with tempfile.TemporaryDirectory(prefix="leaphub-confirmation-") as tmp:
     # que o contrato reprove por carimbar a constante antiga.
     assert engine.command_max_polls == telemetry.TelemetryEngine.COMMAND_MAX_POLLS_FLOOR
     assert engine.command_max_polls > 3
-    assert list(engine.command_cadence[:5]) == [12, 20, 35, 45, 60]
-    assert engine._adaptive_interval(["parked"], 0, command_mode=True, command_poll_count=1)[0] == 12
-    assert engine._adaptive_interval(["parked"], 0, command_mode=True, command_poll_count=5)[0] == 60
+    # 1.12.74 — o mesmo raciocínio da linha acima aplicado à ESCADA. Estas três
+    # asserções carimbavam [12, 20, 35, 45, 60] e reprovariam qualquer ajuste de
+    # cadência, inclusive o que a 1.12.74 fez para a confirmação chegar antes de
+    # o carro retrancar sozinho. A garantia é o MAPEAMENTO — a n-ésima leitura
+    # usa o n-ésimo degrau — e que a escada seja utilizável.
+    cadencia = list(engine.command_cadence)
+    assert len(cadencia) >= engine.command_max_polls, (
+        "a escada tem menos degraus que o orçamento de leituras; as últimas repetiriam o teto"
+    )
+    assert all(passo >= 2 for passo in cadencia), "algum degrau viraria laço apertado contra a nuvem"
+    assert cadencia[1:] == sorted(cadencia[1:]), "a escada parou de crescer"
+    # A primeira releitura tem de caber antes do retravamento automático do
+    # carro (~30s), senão a confirmação chega descrevendo um estado que já mudou.
+    assert cadencia[0] <= telemetry.TelemetryEngine.COMMAND_FIRST_POLL_CEILING_SECONDS <= 10
+    for indice in (1, 5, len(cadencia)):
+        assert engine._adaptive_interval(
+            ["parked"], 0, command_mode=True, command_poll_count=indice
+        )[0] == cadencia[indice - 1], f"a {indice}ª leitura não usou o {indice}º degrau"
     engine.close_storage()
     if engine._instance_lock_handle is not None:
         engine._instance_lock_handle.close()
 
 checks = {
-    "version": ('version: "1.12.48"' in config_source or 'version: "1.12.73"' in config_source)
-        and 'VERSION = "1.12.73"' in server_source,
+    "version": ('version: "1.12.48"' in config_source or 'version: "1.12.74"' in config_source)
+        and 'VERSION = "1.12.74"' in server_source,
     # O manager normaliza a opção antes de o motor vê-la: se os dois discordarem,
     # o piso do motor nunca chega a valer. Derivado da mesma fonte, de propósito.
     "manager_migrates_legacy_limit": "max({}, min({}".format(
@@ -74,4 +89,4 @@ failed = [name for name, ok in checks.items() if not ok]
 if failed:
     raise SystemExit("remote confirmation 1.12.24 failed:\n- " + "\n- ".join(failed))
 
-print({"ok": True, "checks": len(checks) + 4, "version": "1.12.73"})
+print({"ok": True, "checks": len(checks) + 4, "version": "1.12.74"})

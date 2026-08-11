@@ -67,7 +67,11 @@ class _Cadencias:
     charge_watch_seconds = 60
     parked_seconds = 90
     sleep_seconds = 600
-    command_cadence = (12, 20, 35, 45, 60, 90, 120, 120)
+    # 1.12.74 — nenhum caso deste arquivo consulta este campo (`_intervalo`
+    # chama sempre com `command_mode` falso), mas o dublê se anuncia como "os
+    # padrões reais"; deixá-lo defasado o transforma em mentira para quem ler
+    # depois.
+    command_cadence = (6, 10, 16, 24, 34, 45, 60, 90)
 
 
 def _intervalo(streak: int) -> tuple[int, str, int]:

@@ -169,5 +169,14 @@ def test_nothing_was_wired_into_the_automatic_path() -> None:
         assert nome not in ENGINE, (
             f"{nome} entrou no motor de telemetria: o historico passou a ser lido sozinho"
         )
-    # E a cadencia continua a mesma.
-    assert "self.command_cadence = (self.command_seconds, 20, 35, 45, 60, 90, 120, 120)" in ENGINE
+    # E a cadencia de comando continua sendo DERIVADA da opcao, nao substituida
+    # por algo que a sonda tenha trazido.
+    #
+    # 1.12.74 — esta assercao citava a tupla inteira, numero por numero. A
+    # 1.12.74 reescreveu a escada por um motivo que nada tem a ver com esta
+    # sonda (a confirmacao chegava depois de o carro retrancar sozinho) e
+    # derrubaria este contrato. O que ele existe para comprar e "a sonda nao
+    # mexeu na cadencia", e isso se afirma sem copiar numeros.
+    assert re.search(r"self\.command_cadence = \(\s*\n?\s*min\(\s*self\.command_seconds", ENGINE), (
+        "a cadencia de comando deixou de ser derivada de telemetry_command_seconds"
+    )

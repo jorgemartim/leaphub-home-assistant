@@ -55,7 +55,7 @@ except ModuleNotFoundError:
         EVENT_TRANSPORT = _event_transport_module.EVENT_TRANSPORT
 
 LOG = logging.getLogger("leaphub.telemetry")
-ENGINE_VERSION = "1.12.73"  # recusa permanente sai da fila
+ENGINE_VERSION = "1.12.74"  # recusa permanente sai da fila
 
 # Hospedagem compartilhada (Apache/LiteSpeed) fecha a conexão ociosa em poucos
 # segundos. Reaproveitar depois disso escreve num socket já fechado e devolve
@@ -183,6 +183,21 @@ class TelemetryEngine:
     # telemetria; alongá-la alonga a espera do comando seguinte.
     COMMAND_DISPATCH_TIMEOUT_FLOOR_SECONDS = 25
 
+    # 1.12.74 — teto da PRIMEIRA releitura depois do comando, e o motivo é o
+    # carro, não a nuvem: ele retranca sozinho em ~30s. Com a cadência antiga
+    # (12s para a primeira, +20s para a segunda) a confirmação do `unlock` de
+    # 11/08/2026 saiu às 13:11:45 para um comando despachado às 13:10:47 — 54s,
+    # cinco leituras — e chegou na tela dizendo "destravado" quando o carro já
+    # tinha retrancado. Segundos depois a leitura seguinte, essa fresca, dizia
+    # "travado". A tela nunca esteve errada; estava atrasada.
+    #
+    # É TETO em código, e não padrão no config.yaml, porque a instalação
+    # existente guarda o valor antigo da opção e nunca releria um padrão novo —
+    # a mesma razão de COMMAND_DISPATCH_TIMEOUT_FLOOR_SECONDS e de
+    # COMMAND_MAX_POLLS_FLOOR. O orçamento total de leituras não muda: são as
+    # mesmas 8, apenas distribuídas mais cedo.
+    COMMAND_FIRST_POLL_CEILING_SECONDS = 6
+
     def __init__(
         self,
         options: dict[str, Any],
@@ -270,7 +285,23 @@ class TelemetryEngine:
             self.COMMAND_MAX_POLLS_FLOOR,
             self.COMMAND_MAX_POLLS_CEILING,
         )
-        self.command_cadence = (self.command_seconds, 20, 35, 45, 60, 90, 120, 120)
+        # 1.12.74 — a escada antiga era (12, 20, 35, 45, 60, 90, 120, 120):
+        # acumulada 0, 12, 32, 67, 112, 172, 262, 382, com apenas três leituras
+        # dentro dos primeiros 32s e os dois últimos degraus fora da janela de
+        # 180s, onde `_within_command_window` tinha de encurtá-los. A nova
+        # acumula 0, 6, 16, 32, 56, 90, 135, 195: quatro leituras nos primeiros
+        # 32s — antes do retravamento automático do carro — e a cauda cabendo
+        # na janela. Mesmo número de leituras, distribuídas onde adiantam.
+        self.command_cadence = (
+            min(self.command_seconds, self.COMMAND_FIRST_POLL_CEILING_SECONDS),
+            10,
+            16,
+            24,
+            34,
+            45,
+            60,
+            90,
+        )
         self.charging_seconds = self._bounded("telemetry_charging_seconds", 25, 15, 600)
         self.parked_seconds = self._bounded("telemetry_parked_seconds", 90, 60, 3600)
         self.sleep_seconds = self._bounded("telemetry_sleep_seconds", 600, 300, 14400)
@@ -2042,6 +2073,50 @@ class TelemetryEngine:
                 anonymous = row
         return anonymous
 
+    def _settled_confirmation(
+        self,
+        db: sqlite3.Connection,
+        subscription_id: str,
+        command_key: str,
+        vehicle_id: str,
+        now_epoch: float,
+        window_seconds: int,
+    ) -> sqlite3.Row | None:
+        """Veredito recente do MESMO comando, para um boost que chega sem id.
+
+        1.12.74 — `_adopt_legacy_confirmation` já se protege disto desde a
+        1.12.70 (a guarda logo acima do INSERT dela), mas o `boost` não se
+        protegia, e é por ele que a repetição chega.
+
+        O site repete o boost depois do comando como sinal de recuperação.
+        Quando ele chega SEM `request_id` e a espera nomeada — armada pelo
+        próprio Gateway no despacho, com o id do comando — já confirmou, não há
+        nada pendente para adotar: nasce uma gêmea. Ela confirma na primeira
+        leitura, porque o estado que procura já foi atingido, e enquanto vive
+        mantém a assinatura em cadência de comando, gastando leituras da nuvem e
+        trava de conta de que o comando SEGUINTE precisa.
+
+        Medido em campo em 11/08/2026: `unlock (ref_…)` confirmado às 13:14:29 e
+        `unlock (sem request_id)` às 13:14:37; a gêmea do `sunshade_open` das
+        13:16:11 nasceu às 13:17:21 e gastou 8 leituras/111s procurando a
+        cortina aberta enquanto ela era fechada.
+
+        Só vale para veredito POSITIVO. Uma janela que se esgotou sem concluir
+        merece ser rearmada — ali o boost do site é recuperação de verdade, e
+        recusá-la deixaria o comando sem veredito.
+        """
+        return db.execute(
+            "SELECT * FROM command_confirmations WHERE subscription_id=? AND command_key=? "
+            "AND IFNULL(command_vehicle_id,'')=? AND status='confirmed' AND resolved_at>=? "
+            "ORDER BY resolved_at DESC LIMIT 1",
+            (
+                subscription_id,
+                command_key,
+                vehicle_id,
+                now_epoch - max(1, int(window_seconds)),
+            ),
+        ).fetchone()
+
     def _register_confirmation(
         self,
         db: sqlite3.Connection,
@@ -2075,6 +2150,16 @@ class TelemetryEngine:
                     (now_epoch + seconds, context_json, now_iso, adopted),
                 )
             return adopted, True
+        if not request_id:
+            settled = self._settled_confirmation(
+                db, subscription_id, command_key, vehicle_id, now_epoch, seconds
+            )
+            if settled is not None:
+                # Nada a rearmar e nada a mexer na linha: ela já tem veredito.
+                # Devolver `True` faz o `boost` tomar o ramo de janela reusada,
+                # que não zera `command_poll_count` nem reescreve o contexto do
+                # comando na assinatura.
+                return str(settled["confirmation_id"] or ""), True
         confirmation_id = self._confirmation_id(subscription_id, command_key, vehicle_id, request_id)
         db.execute(
             "INSERT OR REPLACE INTO command_confirmations "
@@ -4242,7 +4327,7 @@ class TelemetryEngine:
             by_id = {str(item.get("event_id")): item for item in (payload.get("results") or []) if isinstance(item, dict)}
             delivered_ids = []
             failed_rows = []
-            # 1.12.73 — recusa permanente sai da fila em vez de voltar para ela.
+            # 1.12.74 — recusa permanente sai da fila em vez de voltar para ela.
             #
             # Medido em 09/08/2026, com o site na 1.12.327: o MESMO evento foi
             # recusado a cada ~2 min das 06:04 às 12:48, ~700 por dia. O site
@@ -4498,7 +4583,7 @@ class TelemetryEngine:
                     f"UPDATE subscriptions SET status=?, interactive_until=0, command_until=0, last_error=NULL, updated_at=? WHERE subscription_id IN ({placeholders})",
                     (expired_status, utc_iso(), *expired_windows),
                 )
-            # 1.12.73 — evento NAO entregue também tem horizonte.
+            # 1.12.74 — evento NAO entregue também tem horizonte.
             #
             # Até aqui a retenção só apagava o que já tinha sido entregue, então
             # um evento que o site recusasse indefinidamente ficava na fila para
