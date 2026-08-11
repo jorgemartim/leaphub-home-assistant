@@ -155,7 +155,13 @@ class Harness:
 
 def test_confirmation_window_has_its_own_transient_backoff() -> None:
     engine = telemetry.TelemetryEngine
-    cadencia_inicial = 12
+    # 1.12.74 — este número era o literal `12`, a primeira cadência da época.
+    # Quando a 1.12.74 baixou a primeira releitura para caber antes do
+    # retravamento automático do carro, o contrato reprovaria por carimbo, e não
+    # por regressão. Derivar da instância é o que ele sempre quis dizer.
+    with Harness() as _h:
+        cadencia = list(_h.engine.command_cadence)
+    cadencia_inicial = cadencia[1]
 
     for falhas in (1, 2, 3):
         janela = engine._transient_backoff(falhas, True, command_mode=True)
@@ -169,6 +175,8 @@ def test_confirmation_window_has_its_own_transient_backoff() -> None:
 
     # A primeira tentativa tem de caber na cadência que a janela publica: o
     # sentido do conserto é não perder leituras, não empurrá-las para fora.
+    # Uma falha temporária pode custar, no máximo, uma leitura nominal: a
+    # retentativa não pode ser mais lenta que o SEGUNDO degrau da escada.
     primeira = engine._transient_backoff(1, True, command_mode=True)
     assert primeira <= cadencia_inicial, (
         f"a primeira retentativa da janela ({primeira}s) já é mais lenta que a cadência ({cadencia_inicial}s)"

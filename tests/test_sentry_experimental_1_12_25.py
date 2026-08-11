@@ -10,7 +10,7 @@ assert spec is not None and spec.loader is not None
 connector = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(connector)
 
-assert connector.CONNECTOR_VERSION == "1.12.73"
+assert connector.CONNECTOR_VERSION == "1.12.74"
 assert len(connector.COMMAND_METHODS) == 40
 assert connector.EXPERIMENTAL_COMMAND_METHODS == {
     "sentry_on": "sentry_mode_on",
