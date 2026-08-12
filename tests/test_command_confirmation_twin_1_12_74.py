@@ -325,8 +325,9 @@ def test_first_reread_lands_before_the_car_relocks_itself() -> None:
             "a confirmação volta a descrever um estado que o carro já desfez"
         )
 
-        # E a escada não pode ter virado laço apertado contra a nuvem: o
-        # orçamento total de leituras é o mesmo, só distribuído mais cedo.
+        # E a escada não pode ter virado laço apertado contra a nuvem. (1.12.75:
+        # o orçamento deixou de ser "o mesmo" — virou teto derivado da janela.
+        # Quem limita o tráfego é a escada, e é ela que este bloco protege.)
         assert h.engine.command_max_polls <= telemetry.TelemetryEngine.COMMAND_MAX_POLLS_CEILING
         assert all(passo >= 5 for passo in cadencia)
 
@@ -336,11 +337,18 @@ def test_the_ladder_still_covers_the_whole_window() -> None:
     with Harness() as h:
         cadencia = list(h.engine.command_cadence)
         orcamento = h.engine.command_max_polls
-        assert len(cadencia) >= orcamento
+        # 1.12.75 — aqui estava `len(cadencia) >= orcamento`, e era o mesmo erro
+        # que o teto de leituras: exigia um degrau por leitura do orçamento. O
+        # orçamento agora é derivado da janela (31 leituras no pior caso) e a
+        # escada continua com 8 degraus, saturando no último de propósito. Quem
+        # precisa cobrir os 180s é a ESCADA, não a contagem.
+        assert h.engine._adaptive_interval(
+            ["parked"], 0, command_mode=True, command_poll_count=orcamento
+        )[0] == cadencia[-1], "leitura além da escada não saturou no último degrau"
 
-        cobertura = sum(cadencia[: orcamento - 1])
+        cobertura = sum(cadencia)
         assert cobertura >= 180, (
-            f"{orcamento} leituras cobrem apenas {cobertura}s dos 180s da janela"
+            f"a escada inteira cobre apenas {cobertura}s dos 180s da janela"
         )
 
         # CONTROLE DE REGRESSÃO contra a escada antiga: ela também cobria os
@@ -349,7 +357,11 @@ def test_the_ladder_still_covers_the_whole_window() -> None:
         acumulada = [0]
         for passo in cadencia[:-1]:
             acumulada.append(acumulada[-1] + passo)
-        assert sum(1 for instante in acumulada if instante <= 180) >= orcamento - 1, (
+        # 1.12.75 — medido contra o tamanho da ESCADA, não contra o orçamento:
+        # no máximo um degrau pode cair fora da janela. Com a escada antiga
+        # (0, 12, 32, 67, 112, 172, 262) sobravam dois de fora, então este segue
+        # sendo o controle de regressão contra ela.
+        assert sum(1 for instante in acumulada if instante <= 180) >= len(cadencia) - 1, (
             "degraus demais caem fora da janela e dependem de encurtamento para existir"
         )
 

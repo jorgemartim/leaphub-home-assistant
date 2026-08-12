@@ -13,9 +13,22 @@ checks = {
     "recovered_session_is_retained": '"session_retained_for_fast_confirmation"' in TELEMETRY
         and 'recovered["session_reused"] = True' in TELEMETRY,
     "pre_dispatch_recovery_log": "recriando uma única vez antes da ação" in TELEMETRY,
-    "version": any(v in (ROOT / "leaphub_gateway" / "config.yaml").read_text(encoding="utf-8") for v in ('version: "1.12.48"', 'version: "1.12.74"')),
+    # 1.12.75 — carimbava versões literais e reprovava dentro da cópia PROMOVIDA
+    # da validação. A garantia é a publicação em duas fases: o config.yaml nunca
+    # passa do RELEASE_TARGET.
+    "version": tuple(
+        int(p)
+        for p in next(
+            linha.split(":", 1)[1].strip().strip('"')
+            for linha in (ROOT / "leaphub_gateway" / "config.yaml").read_text(encoding="utf-8").splitlines()
+            if linha.startswith("version:")
+        ).split(".")
+    ) <= tuple(
+        int(p)
+        for p in (ROOT / "leaphub_gateway" / "RELEASE_TARGET").read_text(encoding="utf-8").strip().split(".")
+    ),
 }
 failed = [name for name, ok in checks.items() if not ok]
 if failed:
     raise SystemExit("pre-dispatch token recovery contract failed: " + ", ".join(failed))
-print({"ok": True, "checks": len(checks), "version": "1.12.74"})
+print({"ok": True, "checks": len(checks), "version": "1.12.75"})

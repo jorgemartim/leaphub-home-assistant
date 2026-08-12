@@ -6,8 +6,8 @@ APP = ROOT / 'leaphub_gateway'
 config = yaml.safe_load((APP / 'config.yaml').read_text(encoding='utf-8'))
 target = (APP / 'RELEASE_TARGET').read_text(encoding='utf-8').strip()
 build = (ROOT / '.github/workflows/build.yml').read_text(encoding='utf-8')
-assert target == '1.12.74'
-assert config['version'] in {'1.12.48', '1.12.74'}
+assert target == '1.12.75'
+assert config['version'] in {'1.12.74', '1.12.75'}
 assert config['image'] == 'ghcr.io/jorgemartim/leaphub-gateway'
 assert 'Smoke test exact published image while authenticated' in build
 assert 'import gateway_manager' not in build
@@ -16,6 +16,6 @@ assert 'timeout 60s docker run' in build
 assert 'Verify anonymous GHCR access before exposing update to Home Assistant' in build
 assert 'Promote App metadata only after image is public' in build
 assert 'continue-on-error: true' not in build
-assert (APP / 'RELEASE-1.12.74.md').is_file()
-assert re.findall(r'^##\s+(.+)$', (APP / 'CHANGELOG.md').read_text(encoding='utf-8'), re.M) == ['1.12.74']
-print({'ok': True, 'version': '1.12.74', 'distribution': 'prebuilt-staged'})
+assert (APP / 'RELEASE-1.12.75.md').is_file()
+assert re.findall(r'^##\s+(.+)$', (APP / 'CHANGELOG.md').read_text(encoding='utf-8'), re.M) == ['1.12.75']
+print({'ok': True, 'version': '1.12.75', 'distribution': 'prebuilt-staged'})

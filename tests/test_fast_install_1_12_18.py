@@ -29,7 +29,7 @@ assert "ca-certificates libstdc++6" in dockerfile
 
 manager = (APP / "gateway_manager.py").read_text(encoding="utf-8")
 for marker in (
-    'VERSION = "1.12.74"',
+    'VERSION = "1.12.75"',
     "def resolve_cloudflared()",
     "CLOUDFLARED_SHA256_AMD64",
     "MAX_CLOUDFLARED_BYTES",

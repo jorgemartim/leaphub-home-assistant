@@ -55,7 +55,7 @@ except ModuleNotFoundError:
         EVENT_TRANSPORT = _event_transport_module.EVENT_TRANSPORT
 
 LOG = logging.getLogger("leaphub.telemetry")
-ENGINE_VERSION = "1.12.74"  # recusa permanente sai da fila
+ENGINE_VERSION = "1.12.75"  # o orcamento de leituras voltou a ser teto
 
 # Hospedagem compartilhada (Apache/LiteSpeed) fecha a conexão ociosa em poucos
 # segundos. Reaproveitar depois disso escreve num socket já fechado e devolve
@@ -150,7 +150,12 @@ class TelemetryEngine:
     # uma fonte só: quando o piso subiu de 5 para 8, o valor estava repetido em
     # três lugares e um contrato reprovava por carimbar o antigo.
     COMMAND_MAX_POLLS_FLOOR = 8
-    COMMAND_MAX_POLLS_CEILING = 12
+    COMMAND_MAX_POLLS_CEILING = 64
+
+    # 1.12.75 — espelha o teto de `seconds` em `signal_presence`
+    # (`max(30, min(180, int(seconds)))`). O piso do orçamento é DERIVADO dele;
+    # ver o comentário em `__init__`.
+    COMMAND_WINDOW_CEILING_SECONDS = 180
 
     # 1.12.70 — backoff próprio da janela de confirmação.
     #
@@ -279,11 +284,30 @@ class TelemetryEngine:
         # aconteceu em campo com o `unlock` cuja amostra chegou a +89s. O piso
         # cobre os 180s inteiros com a cadência abaixo; instalações com o valor
         # legado menor são elevadas a ele automaticamente.
+        #
+        # 1.12.75 — e na 1.12.74 eu o quebrei. Adensei a escada e mantive "as
+        # mesmas 8 leituras": a 8ª saiu de 382s para 195s, e o TETO passou a
+        # encerrar a espera antes do PRAZO. Medido em campo em 11/08/2026: duas
+        # janelas de `unlock` fechadas por "orçamento de leituras esgotado" aos
+        # 135s e aos 60s, com 180s disponíveis nas duas.
+        #
+        # Basta UMA leitura extra para isso, e ela é comum: a cadência acompanha
+        # a espera mais nova (`min(poll_count)`) enquanto cada leitura consome o
+        # orçamento de TODAS as pendentes. Apertar um segundo botão reinicia a
+        # escada no primeiro degrau e queima o resto do orçamento do comando
+        # anterior em segundos — foi o que aconteceu às 14:52:55.
+        #
+        # O piso agora é DERIVADO, não escolhido: é quantas leituras cabem na
+        # janela cheia com o menor degrau da escada. Elevá-lo não cria requisição
+        # nenhuma — quem marca o ritmo é a cadência; o teto só trunca.
+        first_step = max(1, min(self.command_seconds, self.COMMAND_FIRST_POLL_CEILING_SECONDS))
+        derived_floor = -(-self.COMMAND_WINDOW_CEILING_SECONDS // first_step) + 1
+        polls_floor = max(self.COMMAND_MAX_POLLS_FLOOR, derived_floor)
         self.command_max_polls = self._bounded(
             "telemetry_command_max_polls",
-            self.COMMAND_MAX_POLLS_FLOOR,
-            self.COMMAND_MAX_POLLS_FLOOR,
-            self.COMMAND_MAX_POLLS_CEILING,
+            polls_floor,
+            polls_floor,
+            max(self.COMMAND_MAX_POLLS_CEILING, polls_floor),
         )
         # 1.12.74 — a escada antiga era (12, 20, 35, 45, 60, 90, 120, 120):
         # acumulada 0, 12, 32, 67, 112, 172, 262, 382, com apenas três leituras

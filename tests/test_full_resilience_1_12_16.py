@@ -108,8 +108,21 @@ with tempfile.TemporaryDirectory(prefix="leaphub-1-12-16-") as tmp:
     check("if streak >= 6:" in telemetry, "Repouso ainda demora consultas demais")
     check("renovada por refresh durante a leitura de mensagens" in telemetry, "Mensagens ainda forçam relogin direto")
     check('required = ("name", "version", "slug", "description", "arch")' in validator, "Validador ainda exige imagem GHCR")
-    check(any(v in (APP / "config.yaml").read_text() for v in ('version: \"1.12.48\"', 'version: \"1.12.74\"')), "Versão do App divergente")
+    # 1.12.75 — carimbava versões literais e reprovava a cada release, dentro da
+    # cópia PROMOVIDA da validação (onde o config.yaml já foi reescrito para o
+    # alvo). A garantia é a publicação em duas fases: o config nunca passa do
+    # RELEASE_TARGET. Derivado da fonte.
+    _alvo_app = tuple(int(p) for p in (APP / "RELEASE_TARGET").read_text(encoding="utf-8").strip().split("."))
+    _cfg_app = tuple(
+        int(p)
+        for p in next(
+            linha.split(":", 1)[1].strip().strip('"')
+            for linha in (APP / "config.yaml").read_text(encoding="utf-8").splitlines()
+            if linha.startswith("version:")
+        ).split(".")
+    )
+    check(_cfg_app <= _alvo_app, "Versão do App divergente")
 
 if failures:
     raise SystemExit("full resilience 1.12.24 failed:\n- " + "\n- ".join(failures))
-print({"ok": True, "checks": 12, "version": "1.12.74"})
+print({"ok": True, "checks": 12, "version": "1.12.75"})
