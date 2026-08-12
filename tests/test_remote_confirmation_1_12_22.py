@@ -116,4 +116,4 @@ failed = [name for name, ok in checks.items() if not ok]
 if failed:
     raise SystemExit("remote confirmation 1.12.24 failed:\n- " + "\n- ".join(failed))
 
-print({"ok": True, "checks": len(checks) + 4, "version": "1.12.75"})
+print({"ok": True, "checks": len(checks) + 4, "version": "1.12.76"})

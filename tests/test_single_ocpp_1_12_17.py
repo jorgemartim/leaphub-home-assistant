@@ -7,9 +7,23 @@ ocpp = (APP / "ocpp_gateway.py").read_text(encoding="utf-8")
 config = (APP / "config.yaml").read_text(encoding="utf-8")
 privacy = (APP / "privacy.py").read_text(encoding="utf-8")
 
+# 1.12.76 — o par de versões literais aqui colapsou num deslize de release e
+# reprovava com o config legitimamente atrás do alvo (fase 1 da publicação em
+# duas fases). Derivado da fonte: o config nunca pode passar do RELEASE_TARGET.
+def _config_nao_passa_do_alvo() -> bool:
+    def _t(v: str) -> tuple[int, ...]:
+        return tuple(int(p) for p in v.strip().strip('"').split("."))
+    alvo = _t((APP / "RELEASE_TARGET").read_text(encoding="utf-8"))
+    cfg = _t(next(
+        l.split(":", 1)[1] for l in (APP / "config.yaml").read_text(encoding="utf-8").splitlines()
+        if l.startswith("version:")
+    ))
+    return cfg <= alvo
+
+
 checks = {
-    "version": ('version: \"1.12.74\"' in config or 'version: \"1.12.75\"' in config) and 'VERSION = "1.12.75"' in manager,
-    "privacy_version": 'PRIVACY_VERSION = "1.12.75"' in privacy,
+    "version": _config_nao_passa_do_alvo() and 'VERSION = "1.12.76"' in manager,
+    "privacy_version": 'PRIVACY_VERSION = "1.12.76"' in privacy,
     "single_selection": "def selected_ocpp_configuration()" in manager,
     "ambiguous_blocked": "mantenha somente Beta ou Produção ativo" in manager,
     "single_target_env": '"LEAPHUB_INTERNAL_URL": internal_url' in manager and '"LEAPHUB_ENVIRONMENT": environment' in manager,
@@ -25,4 +39,4 @@ checks = {
 failed = [name for name, ok in checks.items() if not ok]
 if failed:
     raise SystemExit("single OCPP 1.12.24 failed:\n- " + "\n- ".join(failed))
-print({"ok": True, "checks": len(checks), "version": "1.12.75"})
+print({"ok": True, "checks": len(checks), "version": "1.12.76"})

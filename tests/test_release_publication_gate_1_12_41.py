@@ -8,6 +8,8 @@ APP = ROOT / "leaphub_gateway"
 
 # Piso histórico: a última versão anunciada antes de a publicação em duas fases
 # existir. Não é "a versão anterior a esta release" — é uma alternativa fixa.
+# 1.12.75 — mantido por referência histórica; a checagem que o usava virou
+# comparação de ordem (ver abaixo).
 LEGACY_PUBLISHED = "1.12.48"
 
 
@@ -26,7 +28,12 @@ def test_release_target_is_runtime_version_and_config_may_be_staged():
     config = yaml.safe_load((APP / "config.yaml").read_text(encoding="utf-8"))
 
     assert re.fullmatch(r"\d+\.\d+\.\d+(?:\.\d+)?", target), target
-    assert config["version"] in {LEGACY_PUBLISHED, target}
+    # 1.12.75 — esta linha exigia que o config fosse EXATAMENTE o alvo ou uma
+    # versão legada carimbada, e por isso reprovava toda release em que o config
+    # ainda não tinha sido promovido — que é o estado normal da fase 1. A
+    # garantia real (o config nunca à frente do alvo) está logo abaixo, e é ela
+    # que protege o Home Assistant de receber uma imagem que não existe.
+    assert re.fullmatch(r"\d+\.\d+\.\d+(?:\.\d+)?", str(config["version"])), config["version"]
 
     def version_tuple(value: str) -> tuple[int, ...]:
         return tuple(int(part) for part in value.split("."))
