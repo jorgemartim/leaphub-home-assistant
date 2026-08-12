@@ -55,7 +55,7 @@ except ModuleNotFoundError:
         EVENT_TRANSPORT = _event_transport_module.EVENT_TRANSPORT
 
 LOG = logging.getLogger("leaphub.telemetry")
-ENGINE_VERSION = "1.12.76"  # o orcamento de leituras voltou a ser teto
+ENGINE_VERSION = "1.12.77"  # o orcamento de leituras voltou a ser teto
 
 # Hospedagem compartilhada (Apache/LiteSpeed) fecha a conexão ociosa em poucos
 # segundos. Reaproveitar depois disso escreve num socket já fechado e devolve
@@ -199,9 +199,38 @@ class TelemetryEngine:
     # É TETO em código, e não padrão no config.yaml, porque a instalação
     # existente guarda o valor antigo da opção e nunca releria um padrão novo —
     # a mesma razão de COMMAND_DISPATCH_TIMEOUT_FLOOR_SECONDS e de
-    # COMMAND_MAX_POLLS_FLOOR. O orçamento total de leituras não muda: são as
-    # mesmas 8, apenas distribuídas mais cedo.
+    # COMMAND_MAX_POLLS_FLOOR.
+    #
+    # 1.12.77 — a frase que ficava aqui ("o orçamento total de leituras não
+    # muda: são as mesmas 8, apenas distribuídas mais cedo") não descrevia a
+    # 1.12.74: ela ERA o defeito dela. Manter a CONTAGEM enquanto se adensa a
+    # escada transformou o teto de segurança no critério de encerramento. O piso
+    # do orçamento passou a ser DERIVADO em `__init__` na 1.12.75 — ver
+    # COMMAND_WINDOW_CEILING_SECONDS —, mas o comentário ficou para trás,
+    # contradizendo o código logo abaixo dele.
     COMMAND_FIRST_POLL_CEILING_SECONDS = 6
+
+    # 1.12.77 — teto da cadência com a tela aberta.
+    #
+    # `interactive_seconds` valia 20s (piso 15s) e governa TODOS os estados
+    # quando há presença: ver o ramo `if interactive:` de `_adaptive_interval`.
+    # Medido em campo em 12/08/2026, o carro publica uma mudança de trava em
+    # ~0-12s (`lock` confirmou em 0s, 1s e 12s). Com leitura a cada 20s, boa
+    # parte da espera que o dono sente é NOSSA, não do carro.
+    #
+    # A cortina NÃO serve para calibrar isto: ela leva 30-40s no próprio
+    # mecanismo, confirmado pelo dono. Foi confundindo tempo de mecanismo com
+    # latência de telemetria que este número atravessou tanto tempo sem ser
+    # questionado — inclusive por mim, nesta mesma sessão.
+    #
+    # 6s não é número novo: é o primeiro degrau da escada de confirmação de
+    # comando (COMMAND_FIRST_POLL_CEILING_SECONDS), que já roda em produção sem
+    # disparar rate-limit. Adotar um valor JÁ PROVADO evita trocar 20s de atraso
+    # por 900s de cooldown — o castigo é 45x maior que o problema.
+    #
+    # TETO em código pelo mesmo motivo dos vizinhos: a instalação existente tem
+    # `telemetry_interactive_seconds: 20` gravado e nunca releria um padrão novo.
+    INTERACTIVE_SECONDS_CEILING = 6
 
     def __init__(
         self,
@@ -268,7 +297,16 @@ class TelemetryEngine:
         self._delivery_connection_idle_since = 0.0
         self._delivery_idle_max = DELIVERY_IDLE_DEFAULT_SECONDS
         self.active_seconds = self._bounded("telemetry_active_seconds", 20, 15, 300)
-        self.interactive_seconds = self._bounded("telemetry_interactive_seconds", 20, 15, 60)
+        # 1.12.77 — o valor gravado na instalação é puxado para BAIXO pelo teto
+        # em código; sem o `min`, a instalação de campo seguiria em 20s. O piso
+        # de 5s não é estética: o round-trip HTTPS medido em 12/08/2026 ficou
+        # entre 2,1s e 4,5s, e um intervalo abaixo disso empilha chamada sobre
+        # chamada sem trazer dado novo — o `status/get` devolve o último
+        # snapshot que o CARRO subiu, não uma leitura ao vivo.
+        self.interactive_seconds = min(
+            self._bounded("telemetry_interactive_seconds", self.INTERACTIVE_SECONDS_CEILING, 5, 60),
+            self.INTERACTIVE_SECONDS_CEILING,
+        )
         # Janela curta após comandos remotos. É propositalmente separada da
         # navegação comum para confirmar rapidamente o novo estado sem manter
         # consultas agressivas à nuvem durante todo o dia.

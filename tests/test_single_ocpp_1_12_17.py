@@ -22,8 +22,8 @@ def _config_nao_passa_do_alvo() -> bool:
 
 
 checks = {
-    "version": _config_nao_passa_do_alvo() and 'VERSION = "1.12.76"' in manager,
-    "privacy_version": 'PRIVACY_VERSION = "1.12.76"' in privacy,
+    "version": _config_nao_passa_do_alvo() and 'VERSION = "1.12.77"' in manager,
+    "privacy_version": 'PRIVACY_VERSION = "1.12.77"' in privacy,
     "single_selection": "def selected_ocpp_configuration()" in manager,
     "ambiguous_blocked": "mantenha somente Beta ou Produção ativo" in manager,
     "single_target_env": '"LEAPHUB_INTERNAL_URL": internal_url' in manager and '"LEAPHUB_ENVIRONMENT": environment' in manager,
@@ -39,4 +39,4 @@ checks = {
 failed = [name for name, ok in checks.items() if not ok]
 if failed:
     raise SystemExit("single OCPP 1.12.24 failed:\n- " + "\n- ".join(failed))
-print({"ok": True, "checks": len(checks), "version": "1.12.76"})
+print({"ok": True, "checks": len(checks), "version": "1.12.77"})

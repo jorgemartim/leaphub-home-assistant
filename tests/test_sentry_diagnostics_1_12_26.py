@@ -21,4 +21,4 @@ assert '"sentry_probe": command in SENTRY_COMMANDS' in CONNECTOR
 assert 'confirmation_reason == "result_timeout"' in CONNECTOR
 assert 'resultado_remoto=%s' in SERVER
 assert 'motivo=%s' in SERVER
-print({"ok": True, "checks": 10, "version": "1.12.76"})
+print({"ok": True, "checks": 10, "version": "1.12.77"})

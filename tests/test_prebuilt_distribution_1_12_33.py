@@ -3,15 +3,26 @@ import re
 import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
+
+# 1.12.77 — este arquivo carimbava a versao literal em cinco lugares e reprovava
+# a cada release. As garantias reais: o config nunca passa do RELEASE_TARGET
+# (publicacao em duas fases) e os artefatos descrevem o ALVO, seja ele qual for.
+_ALVO = (ROOT / "leaphub_gateway" / "RELEASE_TARGET").read_text(encoding="utf-8").strip()
+
+
+def _tupla_versao(v: str) -> tuple[int, ...]:
+    return tuple(int(x) for x in str(v).strip().strip('"').strip("'").split("."))
+
+
 APP = ROOT / "leaphub_gateway"
 config = yaml.safe_load((APP / "config.yaml").read_text(encoding="utf-8"))
-assert config["version"] in {"1.12.75", "1.12.76"}
+assert _tupla_versao(config["version"]) <= _tupla_versao(_ALVO)
 assert config["image"] == "ghcr.io/jorgemartim/leaphub-gateway"
 assert config["arch"] == ["amd64"]
 
 changelog = (APP / "CHANGELOG.md").read_text(encoding="utf-8")
 headings = re.findall(r"^##\s+(.+)$", changelog, flags=re.MULTILINE)
-assert headings == ["1.12.76"], headings
+assert headings == [_ALVO], headings
 
 workflow = (ROOT / ".github/workflows/build.yml").read_text(encoding="utf-8")
 for marker in (
@@ -29,7 +40,7 @@ for marker in (
     assert marker in workflow, marker
 assert "actions/checkout@v7" not in workflow
 assert "docker/login-action@v4.4.0" not in workflow
-assert (ROOT / "GITHUB-RECOVERY-1.12.76.md").is_file()
-assert (ROOT / "RELEASE-1.12.76.md").is_file()
-assert (APP / "RELEASE-1.12.76.md").is_file()
+assert (ROOT / f"GITHUB-RECOVERY-{_ALVO}.md").is_file()
+assert (ROOT / f"RELEASE-{_ALVO}.md").is_file()
+assert (APP / f"RELEASE-{_ALVO}.md").is_file()
 print({"ok": True, "version": config["version"], "release_headings": headings})
