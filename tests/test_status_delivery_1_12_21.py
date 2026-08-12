@@ -21,7 +21,7 @@ def _config_nao_passa_do_alvo() -> bool:
 
 
 checks = {
-    "version": _config_nao_passa_do_alvo() and 'VERSION = "1.12.76"' in SERVER,
+    "version": _config_nao_passa_do_alvo() and 'VERSION = "1.12.77"' in SERVER,
     "optional_close_argument": "close_connection: bool = False" in SERVER,
     "close_header": 'self.send_header("Connection", "close")' in SERVER,
     "public_health_keeps_alive": "public_health_payload(), close_connection=True" not in SERVER,
@@ -35,4 +35,4 @@ failed = [name for name, ok in checks.items() if not ok]
 if failed:
     raise SystemExit("status delivery 1.12.24 failed:\n- " + "\n- ".join(failed))
 
-print({"ok": True, "checks": len(checks), "version": "1.12.76"})
+print({"ok": True, "checks": len(checks), "version": "1.12.77"})
