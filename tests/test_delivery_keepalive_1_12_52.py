@@ -19,6 +19,7 @@ import threading
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+_RELEASE_TARGET = (ROOT / "leaphub_gateway" / "RELEASE_TARGET").read_text(encoding="utf-8").strip()
 APP = ROOT / "leaphub_gateway"
 
 
@@ -211,4 +212,4 @@ def test_delivery_signs_every_attempt():
     source = (Path(__file__).resolve().parents[1] / "leaphub_gateway" / "telemetry_engine.py").read_text(encoding="utf-8")
     assert "def sign_headers() -> dict[str, str]:" in source
     assert "payload = self._post_delivery(url, headers, body, sign=sign_headers)" in source
-    assert 'ENGINE_VERSION = "1.12.77"' in source
+    assert f'ENGINE_VERSION = "{_RELEASE_TARGET}"' in source

@@ -1,10 +1,11 @@
-## 1.12.77
+## 1.12.78
 
 Distribuição pré-compilada preservada, com publicação em duas fases.
 
-Com a tela aberta, a telemetria passa a ser lida na mesma cadência já provada
-para confirmação de comando. O valor antigo (20s) era mais lento que a própria
-publicação do carro (~0-12s medidos em campo). Teto em código, porque a
-instalação existente guarda a opção antiga. A telemetria de fundo não muda.
+Ao concluir um comando, o Gateway avisa o site na hora, em vez de esperar
+que o ciclo do cron venha buscar o resultado. Medido em campo em 12/08/2026:
+carro 3s, worker 6,2s, tela 41-65s — o intervalo inteiro era espera pela
+descoberta. O anúncio é melhor esforço e não segura o worker; um site sem a
+rota continua sendo reconciliado pelo ciclo, como antes.
 
-Ver RELEASE-1.12.77.md.
+Ver RELEASE-1.12.78.md.

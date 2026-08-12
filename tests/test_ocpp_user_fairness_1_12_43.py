@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+_RELEASE_TARGET = (ROOT / "leaphub_gateway" / "RELEASE_TARGET").read_text(encoding="utf-8").strip()
 MODULE_PATH = ROOT / "leaphub_gateway" / "ocpp_gateway.py"
 
 
@@ -54,7 +55,7 @@ def configure(gateway):
 
 def test_backlog_from_one_user_does_not_starve_another_user(tmp_path: Path) -> None:
     gateway = load_gateway(tmp_path)
-    assert gateway.GATEWAY_VERSION == "1.12.77"
+    assert gateway.GATEWAY_VERSION == _RELEASE_TARGET
     configure(gateway)
     gateway.remember_queue_owner("staging", "CP-A", 101)
     gateway.remember_queue_owner("staging", "CP-B", 202)

@@ -1,6 +1,7 @@
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+_RELEASE_TARGET = (ROOT / "leaphub_gateway" / "RELEASE_TARGET").read_text(encoding="utf-8").strip()
 CONNECTOR = (ROOT / "leaphub_gateway" / "connector.py").read_text(encoding="utf-8")
 TELEMETRY = (ROOT / "leaphub_gateway" / "telemetry_engine.py").read_text(encoding="utf-8")
 
@@ -31,4 +32,4 @@ checks = {
 failed = [name for name, ok in checks.items() if not ok]
 if failed:
     raise SystemExit("pre-dispatch token recovery contract failed: " + ", ".join(failed))
-print({"ok": True, "checks": len(checks), "version": "1.12.77"})
+print({"ok": True, "checks": len(checks), "version": _RELEASE_TARGET})

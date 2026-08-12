@@ -15,6 +15,7 @@ import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+_RELEASE_TARGET = (ROOT / "leaphub_gateway" / "RELEASE_TARGET").read_text(encoding="utf-8").strip()
 APP = ROOT / "leaphub_gateway"
 
 ENGINE = (APP / "telemetry_engine.py").read_text(encoding="utf-8")
@@ -116,5 +117,5 @@ def test_log_line_placeholders_match_its_arguments():
 
 
 def test_version_follows_the_release():
-    assert 'ENGINE_VERSION = "1.12.77"' in ENGINE
-    assert 'CONNECTOR_VERSION = "1.12.77"' in CONNECTOR
+    assert f'ENGINE_VERSION = "{_RELEASE_TARGET}"' in ENGINE
+    assert f'CONNECTOR_VERSION = "{_RELEASE_TARGET}"' in CONNECTOR

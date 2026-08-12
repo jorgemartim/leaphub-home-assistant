@@ -4,6 +4,7 @@ import importlib.util
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+_RELEASE_TARGET = (ROOT / "leaphub_gateway" / "RELEASE_TARGET").read_text(encoding="utf-8").strip()
 CONNECTOR_PATH = ROOT / "leaphub_gateway" / "connector.py"
 spec = importlib.util.spec_from_file_location("leaphub_gateway_contract_connector", CONNECTOR_PATH)
 if spec is None or spec.loader is None:
@@ -63,7 +64,7 @@ def check(condition: bool, message: str) -> None:
     if not condition:
         failures.append(message)
 
-check(connector.CONNECTOR_VERSION == "1.12.77", "Versão do Connector divergente")
+check(connector.CONNECTOR_VERSION == _RELEASE_TARGET, "Versão do Connector divergente")
 check(connector.COMMAND_METHODS == expected_methods, "Matriz COMMAND_METHODS divergente")
 check(len(connector.COMMAND_METHODS) == 40, "A matriz precisa conter 40 comandos")
 check(

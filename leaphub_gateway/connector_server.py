@@ -65,7 +65,7 @@ except ModuleNotFoundError:
         _event_transport_spec.loader.exec_module(_event_transport_module)
         EVENT_TRANSPORT = _event_transport_module.EVENT_TRANSPORT
 
-VERSION = "1.12.77"
+VERSION = "1.12.78"
 API_VERSION = 2
 CAPABILITY_SCHEMA_VERSION = 1
 MIN_SUPPORTED_CLIENT_API_VERSION = 1
@@ -501,9 +501,16 @@ def command_journal_progress(
         LOG.warning("Não foi possível atualizar o andamento do comando: %s", exc)
 
 
-def command_journal_finish(request_hash: str | None, request_id: str, response: dict[str, Any]) -> None:
+def command_journal_finish(request_hash: str | None, request_id: str, response: dict[str, Any]) -> dict[str, Any] | None:
+    """Fecha o diário do comando e devolve o payload que o site vai ler.
+
+    1.12.78 — o retorno é novo. O anúncio imediato ao site precisa enviar
+    EXATAMENTE o mesmo dicionário que `/v1/vehicles/command/status` devolveria,
+    senão push e cron passariam a produzir estados diferentes para o mesmo
+    comando. Devolvendo `safe` aqui, existe uma única fonte desse payload.
+    """
     if not request_hash:
-        return
+        return None
     safe = dict(response)
     safe["request_id"] = request_id
     # A entrega à nuvem e a aplicação física são resultados diferentes. Uma
@@ -533,6 +540,32 @@ def command_journal_finish(request_hash: str | None, request_id: str, response: 
             db.commit()
     except (OSError, sqlite3.Error) as exc:
         LOG.warning("Não foi possível concluir o diário de comandos: %s", exc)
+    return safe
+
+
+def announce_command_result_async(environment: str, request_id: str, payload: dict[str, Any] | None) -> None:
+    """Anuncia ao site o fim do comando sem segurar o worker.
+
+    1.12.78 — em thread própria porque, neste ponto, o worker ainda precisa
+    liberar a trava da conta e a vaga do connector. Um site lento não pode
+    atrasar o PRÓXIMO comando do dono: o anúncio é atalho, não etapa. Sem ele,
+    nada quebra — só volta a valer o ciclo do cron.
+    """
+    if not payload or not request_id:
+        return
+
+    def _run() -> None:
+        try:
+            TELEMETRY.announce_command_result(environment, request_id, payload)
+        except Exception as exc:
+            LOG.debug("Anúncio do comando %s falhou: %s", str(request_id)[:12], exc)
+
+    try:
+        threading.Thread(target=_run, name="leaphub-command-announce", daemon=True).start()
+    except RuntimeError as exc:
+        # Interpretador em desligamento não aceita thread nova. O comando já
+        # está gravado no diário; a reconciliação segue pelo ciclo do cron.
+        LOG.debug("Anúncio do comando %s não pôde ser agendado: %s", str(request_id)[:12], exc)
 
 
 def command_journal_wait_auth(request_hash: str | None, request_id: str, retry_after_seconds: int) -> None:
@@ -1003,7 +1036,14 @@ def run_command_job(
             result["request_id"] = request_id
         result["queued"] = False
         result["queue_wait_seconds"] = int(round(slot_acquired_at - queue_started))
-        command_journal_finish(request_hash, request_id, result)
+        # 1.12.78 — o diário devolve o payload que o site leria em
+        # `/v1/vehicles/command/status`, e o anúncio o entrega na hora. Antes,
+        # este desfecho ficava só aqui até o cron do site vir buscá-lo.
+        announce_command_result_async(
+            environment,
+            request_id,
+            command_journal_finish(request_hash, request_id, result),
+        )
         # Preserve uma janela curta para uma ação manual seguinte. Antes, a
         # telemetria de confirmação assumia a conta após três segundos e
         # abrir/fechar ou travar/destravar em sequência aguardava até 31s.

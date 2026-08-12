@@ -6,6 +6,7 @@ from pathlib import Path
 import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
+_RELEASE_TARGET = (ROOT / "leaphub_gateway" / "RELEASE_TARGET").read_text(encoding="utf-8").strip()
 APP = ROOT / "leaphub_gateway"
 config = yaml.safe_load((APP / "config.yaml").read_text(encoding="utf-8"))
 # 1.12.74 — lido do alvo em vez de escrito a mao. O par {anterior, atual} era
@@ -29,7 +30,7 @@ assert "ca-certificates libstdc++6" in dockerfile
 
 manager = (APP / "gateway_manager.py").read_text(encoding="utf-8")
 for marker in (
-    'VERSION = "1.12.77"',
+    f'VERSION = "{_RELEASE_TARGET}"',
     "def resolve_cloudflared()",
     "CLOUDFLARED_SHA256_AMD64",
     "MAX_CLOUDFLARED_BYTES",

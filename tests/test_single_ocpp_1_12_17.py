@@ -1,6 +1,7 @@
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+_RELEASE_TARGET = (ROOT / "leaphub_gateway" / "RELEASE_TARGET").read_text(encoding="utf-8").strip()
 APP = ROOT / "leaphub_gateway"
 manager = (APP / "gateway_manager.py").read_text(encoding="utf-8")
 ocpp = (APP / "ocpp_gateway.py").read_text(encoding="utf-8")
@@ -22,8 +23,8 @@ def _config_nao_passa_do_alvo() -> bool:
 
 
 checks = {
-    "version": _config_nao_passa_do_alvo() and 'VERSION = "1.12.77"' in manager,
-    "privacy_version": 'PRIVACY_VERSION = "1.12.77"' in privacy,
+    "version": _config_nao_passa_do_alvo() and f'VERSION = "{_RELEASE_TARGET}"' in manager,
+    "privacy_version": f'PRIVACY_VERSION = "{_RELEASE_TARGET}"' in privacy,
     "single_selection": "def selected_ocpp_configuration()" in manager,
     "ambiguous_blocked": "mantenha somente Beta ou Produção ativo" in manager,
     "single_target_env": '"LEAPHUB_INTERNAL_URL": internal_url' in manager and '"LEAPHUB_ENVIRONMENT": environment' in manager,
@@ -39,4 +40,4 @@ checks = {
 failed = [name for name, ok in checks.items() if not ok]
 if failed:
     raise SystemExit("single OCPP 1.12.24 failed:\n- " + "\n- ".join(failed))
-print({"ok": True, "checks": len(checks), "version": "1.12.77"})
+print({"ok": True, "checks": len(checks), "version": _RELEASE_TARGET})

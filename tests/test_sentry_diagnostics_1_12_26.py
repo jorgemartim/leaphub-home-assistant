@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+_RELEASE_TARGET = (ROOT / "leaphub_gateway" / "RELEASE_TARGET").read_text(encoding="utf-8").strip()
 CONNECTOR = (ROOT / "leaphub_gateway" / "connector.py").read_text(encoding="utf-8")
 SERVER = (ROOT / "leaphub_gateway" / "connector_server.py").read_text(encoding="utf-8")
 
@@ -21,4 +22,4 @@ assert '"sentry_probe": command in SENTRY_COMMANDS' in CONNECTOR
 assert 'confirmation_reason == "result_timeout"' in CONNECTOR
 assert 'resultado_remoto=%s' in SERVER
 assert 'motivo=%s' in SERVER
-print({"ok": True, "checks": 10, "version": "1.12.77"})
+print({"ok": True, "checks": 10, "version": _RELEASE_TARGET})

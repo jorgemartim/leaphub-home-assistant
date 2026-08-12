@@ -4,6 +4,7 @@ import importlib.util
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+_RELEASE_TARGET = (ROOT / "leaphub_gateway" / "RELEASE_TARGET").read_text(encoding="utf-8").strip()
 SPEC = importlib.util.spec_from_file_location("event_transport_test", ROOT / "leaphub_gateway" / "event_transport.py")
 assert SPEC is not None and SPEC.loader is not None
 MODULE = importlib.util.module_from_spec(SPEC)
@@ -38,7 +39,7 @@ def test_mqtt_is_not_claimed_active_before_homologation() -> None:
 
 
 def test_event_layer_is_wired_without_new_physical_command_path() -> None:
-    assert 'ENGINE_VERSION = "1.12.77"' in TELEMETRY
+    assert f'ENGINE_VERSION = "{_RELEASE_TARGET}"' in TELEMETRY
     assert 'EVENT_TRANSPORT.register_wake_callback(self._wake_from_event)' in TELEMETRY
     assert '"event_transport": EVENT_TRANSPORT.snapshot()' in SERVER
     assert 'event_transport.py' in DOCKER

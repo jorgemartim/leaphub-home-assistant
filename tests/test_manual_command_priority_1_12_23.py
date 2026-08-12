@@ -5,12 +5,13 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+_RELEASE_TARGET = (ROOT / "leaphub_gateway" / "RELEASE_TARGET").read_text(encoding="utf-8").strip()
 SERVER = (ROOT / "leaphub_gateway" / "connector_server.py").read_text(encoding="utf-8")
 CONFIG = (ROOT / "leaphub_gateway" / "config.yaml").read_text(encoding="utf-8")
 
 
 def test_manual_settle_window_is_bounded_and_configured() -> None:
-    assert 'VERSION = "1.12.77"' in SERVER
+    assert f'VERSION = "{_RELEASE_TARGET}"' in SERVER
     assert 'OPTIONS.get("connector_manual_settle_seconds") or 20' in SERVER
     assert "MANUAL_SETTLE_SECONDS = max(8, min(45," in SERVER
     assert "defer_seconds = MANUAL_SETTLE_SECONDS" in SERVER

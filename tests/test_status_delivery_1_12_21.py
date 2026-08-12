@@ -2,6 +2,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+_RELEASE_TARGET = (ROOT / "leaphub_gateway" / "RELEASE_TARGET").read_text(encoding="utf-8").strip()
 SERVER = (ROOT / "leaphub_gateway" / "connector_server.py").read_text(encoding="utf-8")
 CONNECTOR = (ROOT / "leaphub_gateway" / "connector.py").read_text(encoding="utf-8")
 CONFIG = (ROOT / "leaphub_gateway" / "config.yaml").read_text(encoding="utf-8")
@@ -21,7 +22,7 @@ def _config_nao_passa_do_alvo() -> bool:
 
 
 checks = {
-    "version": _config_nao_passa_do_alvo() and 'VERSION = "1.12.77"' in SERVER,
+    "version": _config_nao_passa_do_alvo() and f'VERSION = "{_RELEASE_TARGET}"' in SERVER,
     "optional_close_argument": "close_connection: bool = False" in SERVER,
     "close_header": 'self.send_header("Connection", "close")' in SERVER,
     "public_health_keeps_alive": "public_health_payload(), close_connection=True" not in SERVER,
@@ -35,4 +36,4 @@ failed = [name for name, ok in checks.items() if not ok]
 if failed:
     raise SystemExit("status delivery 1.12.24 failed:\n- " + "\n- ".join(failed))
 
-print({"ok": True, "checks": len(checks), "version": "1.12.77"})
+print({"ok": True, "checks": len(checks), "version": _RELEASE_TARGET})

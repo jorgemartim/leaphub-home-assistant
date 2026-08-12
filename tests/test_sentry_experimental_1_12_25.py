@@ -4,13 +4,14 @@ import importlib.util
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+_RELEASE_TARGET = (ROOT / "leaphub_gateway" / "RELEASE_TARGET").read_text(encoding="utf-8").strip()
 CONNECTOR_PATH = ROOT / "leaphub_gateway" / "connector.py"
 spec = importlib.util.spec_from_file_location("leaphub_gateway_sentry_connector", CONNECTOR_PATH)
 assert spec is not None and spec.loader is not None
 connector = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(connector)
 
-assert connector.CONNECTOR_VERSION == "1.12.77"
+assert connector.CONNECTOR_VERSION == _RELEASE_TARGET
 assert len(connector.COMMAND_METHODS) == 40
 assert connector.EXPERIMENTAL_COMMAND_METHODS == {
     "sentry_on": "sentry_mode_on",

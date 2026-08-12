@@ -1,6 +1,7 @@
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+_RELEASE_TARGET = (ROOT / "leaphub_gateway" / "RELEASE_TARGET").read_text(encoding="utf-8").strip()
 APP = ROOT / "leaphub_gateway"
 server = (APP / "connector_server.py").read_text(encoding="utf-8")
 telemetry = (APP / "telemetry_engine.py").read_text(encoding="utf-8")
@@ -9,7 +10,7 @@ events = (APP / "event_transport.py").read_text(encoding="utf-8")
 build = (ROOT / ".github/workflows/build.yml").read_text(encoding="utf-8")
 
 checks = {
-    "version": 'VERSION = "1.12.77"' in server and 'ENGINE_VERSION = "1.12.77"' in telemetry,
+    "version": f'VERSION = "{_RELEASE_TARGET}"' in server and f'ENGINE_VERSION = "{_RELEASE_TARGET}"' in telemetry,
     "active_manual_provider": "def manual_operation_active" in server
         and "manual_active_provider=manual_operation_active" in server,
     "confirmation_ignores_settle_only": "self.manual_active_provider if command_mode else self.manual_pending_provider" in telemetry,
@@ -22,4 +23,4 @@ checks = {
 failed = [name for name, ok in checks.items() if not ok]
 if failed:
     raise SystemExit(f"failed: {failed}")
-print({"ok": True, "checks": len(checks), "version": "1.12.77"})
+print({"ok": True, "checks": len(checks), "version": _RELEASE_TARGET})

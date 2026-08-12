@@ -3,15 +3,16 @@ from __future__ import annotations
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+_RELEASE_TARGET = (ROOT / "leaphub_gateway" / "RELEASE_TARGET").read_text(encoding="utf-8").strip()
 CONNECTOR = (ROOT / "leaphub_gateway" / "connector.py").read_text(encoding="utf-8")
 TELEMETRY = (ROOT / "leaphub_gateway" / "telemetry_engine.py").read_text(encoding="utf-8")
 SERVER = (ROOT / "leaphub_gateway" / "connector_server.py").read_text(encoding="utf-8")
 
 
 def test_current_version_and_existing_priority_are_preserved() -> None:
-    assert 'VERSION = "1.12.77"' in SERVER
-    assert 'CONNECTOR_VERSION = "1.12.77"' in CONNECTOR
-    assert 'ENGINE_VERSION = "1.12.77"' in TELEMETRY
+    assert f'VERSION = "{_RELEASE_TARGET}"' in SERVER
+    assert f'CONNECTOR_VERSION = "{_RELEASE_TARGET}"' in CONNECTOR
+    assert f'ENGINE_VERSION = "{_RELEASE_TARGET}"' in TELEMETRY
     assert "manual_operation_enter(environment, payload)" in SERVER
     assert "manual_pending_provider=manual_operation_pending" in SERVER
 

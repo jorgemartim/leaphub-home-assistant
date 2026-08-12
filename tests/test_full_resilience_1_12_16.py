@@ -11,6 +11,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+_RELEASE_TARGET = (ROOT / "leaphub_gateway" / "RELEASE_TARGET").read_text(encoding="utf-8").strip()
 APP = ROOT / "leaphub_gateway"
 sys.path.insert(0, str(APP))
 
@@ -125,4 +126,4 @@ with tempfile.TemporaryDirectory(prefix="leaphub-1-12-16-") as tmp:
 
 if failures:
     raise SystemExit("full resilience 1.12.24 failed:\n- " + "\n- ".join(failures))
-print({"ok": True, "checks": 12, "version": "1.12.77"})
+print({"ok": True, "checks": 12, "version": _RELEASE_TARGET})

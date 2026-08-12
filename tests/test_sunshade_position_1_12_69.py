@@ -25,6 +25,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+_RELEASE_TARGET = (ROOT / "leaphub_gateway" / "RELEASE_TARGET").read_text(encoding="utf-8").strip()
 sys.path.insert(0, str(ROOT / "leaphub_gateway"))
 
 import connector  # noqa: E402
@@ -141,7 +142,7 @@ confere(
 )
 
 if falhas:
-    print({"ok": False, "falhas": falhas, "version": "1.12.77"})
+    print({"ok": False, "falhas": falhas, "version": _RELEASE_TARGET})
     raise SystemExit(1)
 
-print({"ok": True, "checks": checks, "version": "1.12.77"})
+print({"ok": True, "checks": checks, "version": _RELEASE_TARGET})

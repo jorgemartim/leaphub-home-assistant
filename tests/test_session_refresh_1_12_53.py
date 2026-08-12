@@ -14,6 +14,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+_RELEASE_TARGET = (ROOT / "leaphub_gateway" / "RELEASE_TARGET").read_text(encoding="utf-8").strip()
 APP = ROOT / "leaphub_gateway"
 
 
@@ -94,4 +95,4 @@ def test_client_without_any_refresh_does_not_break():
 def test_alias_chain_declares_the_real_method_name():
     source = (APP / "telemetry_engine.py").read_text(encoding="utf-8")
     assert '"token_refresh", "refresh_session", "refresh_token", "refresh"' in source
-    assert 'ENGINE_VERSION = "1.12.77"' in source
+    assert f'ENGINE_VERSION = "{_RELEASE_TARGET}"' in source

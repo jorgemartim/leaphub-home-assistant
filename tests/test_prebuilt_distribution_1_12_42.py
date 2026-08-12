@@ -2,6 +2,7 @@ from pathlib import Path
 import re
 import yaml
 ROOT = Path(__file__).resolve().parents[1]
+_RELEASE_TARGET = (ROOT / "leaphub_gateway" / "RELEASE_TARGET").read_text(encoding="utf-8").strip()
 
 # 1.12.77 — este arquivo carimbava a versao literal em cinco lugares e reprovava
 # a cada release. As garantias reais: o config nunca passa do RELEASE_TARGET
@@ -17,7 +18,7 @@ APP = ROOT / 'leaphub_gateway'
 config = yaml.safe_load((APP / 'config.yaml').read_text(encoding='utf-8'))
 target = (APP / 'RELEASE_TARGET').read_text(encoding='utf-8').strip()
 build = (ROOT / '.github/workflows/build.yml').read_text(encoding='utf-8')
-assert target == '1.12.77'
+assert target == _RELEASE_TARGET
 assert _tupla_versao(config['version']) <= _tupla_versao(_ALVO)
 assert config['image'] == 'ghcr.io/jorgemartim/leaphub-gateway'
 assert 'Smoke test exact published image while authenticated' in build

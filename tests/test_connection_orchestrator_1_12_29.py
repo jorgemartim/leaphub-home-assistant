@@ -5,6 +5,7 @@ from pathlib import Path
 import importlib.util
 
 ROOT = Path(__file__).resolve().parents[1]
+_RELEASE_TARGET = (ROOT / "leaphub_gateway" / "RELEASE_TARGET").read_text(encoding="utf-8").strip()
 SPEC = importlib.util.spec_from_file_location("connection_orchestrator_test", ROOT / "leaphub_gateway" / "connection_orchestrator.py")
 assert SPEC is not None and SPEC.loader is not None
 MODULE = importlib.util.module_from_spec(SPEC)
@@ -56,9 +57,9 @@ def test_command_latency_is_aggregated_without_identifiers() -> None:
 
 
 def test_fast_slow_profiles_and_health_are_wired() -> None:
-    assert 'ENGINE_VERSION = "1.12.77"' in TELEMETRY
-    assert 'CONNECTOR_VERSION = "1.12.77"' in CONNECTOR
-    assert 'VERSION = "1.12.77"' in SERVER
+    assert f'ENGINE_VERSION = "{_RELEASE_TARGET}"' in TELEMETRY
+    assert f'CONNECTOR_VERSION = "{_RELEASE_TARGET}"' in CONNECTOR
+    assert f'VERSION = "{_RELEASE_TARGET}"' in SERVER
     assert '"collection_profile": "slow" if slow_cycle else "fast"' in TELEMETRY
     assert 'include_secondary_network=slow_cycle' in TELEMETRY
     assert 'ORCHESTRATOR.is_degraded(environment)' in TELEMETRY

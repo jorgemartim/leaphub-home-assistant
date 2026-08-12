@@ -7,9 +7,17 @@ TARGET = (ROOT / "leaphub_gateway" / "RELEASE_TARGET").read_text(encoding="utf-8
 
 
 def test_staged_release_metadata():
-    assert any(v in CONFIG for v in ('version: \"1.12.76\"', 'version: \"1.12.77\"'))
-    assert TARGET == "1.12.77"
-    assert 'VERSION = "1.12.77"' in MANAGER
+    # Publicação em duas fases: o `config.yaml` só anuncia o alvo depois que a
+    # imagem está pública; até lá fica exatamente uma versão atrás. Derivado do
+    # RELEASE_TARGET de propósito — carimbar o literal aqui obrigava a editar
+    # este contrato a cada release, e era ele que reprovava sozinho na cópia
+    # promovida da validação.
+    major, minor, patch = (int(part) for part in TARGET.split("."))
+    anterior = f"{major}.{minor}.{patch - 1}"
+    assert any(f'version: "{v}"' in CONFIG for v in (TARGET, anterior)), (
+        f"config.yaml precisa anunciar {TARGET} (promovido) ou {anterior} (aguardando)"
+    )
+    assert f'VERSION = "{TARGET}"' in MANAGER
 
 
 def test_tunnel_starts_after_local_origin_gate():

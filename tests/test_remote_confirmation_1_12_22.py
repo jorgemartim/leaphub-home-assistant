@@ -9,6 +9,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+_RELEASE_TARGET = (ROOT / "leaphub_gateway" / "RELEASE_TARGET").read_text(encoding="utf-8").strip()
 APP = ROOT / "leaphub_gateway"
 
 
@@ -116,4 +117,4 @@ failed = [name for name, ok in checks.items() if not ok]
 if failed:
     raise SystemExit("remote confirmation 1.12.24 failed:\n- " + "\n- ".join(failed))
 
-print({"ok": True, "checks": len(checks) + 4, "version": "1.12.77"})
+print({"ok": True, "checks": len(checks) + 4, "version": _RELEASE_TARGET})

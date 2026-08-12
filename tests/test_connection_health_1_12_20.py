@@ -10,6 +10,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+_RELEASE_TARGET = (ROOT / "leaphub_gateway" / "RELEASE_TARGET").read_text(encoding="utf-8").strip()
 APP = ROOT / "leaphub_gateway"
 
 
@@ -80,4 +81,4 @@ with tempfile.TemporaryDirectory(prefix="leaphub-health-") as tmp:
     # A conexão da fila é reaproveitada desde 1.12.51; libere antes do tempdir sair.
     server.TELEMETRY.close_storage()
 
-print({"ok": True, "checks": 9, "version": "1.12.77"})
+print({"ok": True, "checks": 9, "version": _RELEASE_TARGET})

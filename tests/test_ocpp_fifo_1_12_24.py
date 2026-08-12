@@ -8,6 +8,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+_RELEASE_TARGET = (ROOT / "leaphub_gateway" / "RELEASE_TARGET").read_text(encoding="utf-8").strip()
 MODULE_PATH = ROOT / "leaphub_gateway" / "ocpp_gateway.py"
 
 
@@ -36,7 +37,7 @@ def insert_event(gateway, target_name: str, identity: str, message_id: str, acti
 
 def test_strict_fifo_blocks_overtake_but_not_other_wallboxes(tmp_path: Path) -> None:
     gateway = load_gateway(tmp_path)
-    assert gateway.GATEWAY_VERSION == "1.12.77"
+    assert gateway.GATEWAY_VERSION == _RELEASE_TARGET
 
     target = gateway.ApiTarget("staging", "https://example.invalid/internal/ocpp", "secret")
     gateway.TARGETS_BY_NAME = {"staging": target}

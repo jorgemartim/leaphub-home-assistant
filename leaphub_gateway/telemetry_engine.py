@@ -55,7 +55,7 @@ except ModuleNotFoundError:
         EVENT_TRANSPORT = _event_transport_module.EVENT_TRANSPORT
 
 LOG = logging.getLogger("leaphub.telemetry")
-ENGINE_VERSION = "1.12.77"  # o orcamento de leituras voltou a ser teto
+ENGINE_VERSION = "1.12.78"  # o fim do comando passa a ser anunciado ao site
 
 # Hospedagem compartilhada (Apache/LiteSpeed) fecha a conexão ociosa em poucos
 # segundos. Reaproveitar depois disso escreve num socket já fechado e devolve
@@ -71,6 +71,16 @@ DELIVERY_IDLE_MAX_SECONDS = 30.0
 # somando ~5s. Sem teto, trava presa e leitura lenta são indistinguíveis e o
 # dono fica dois minutos olhando a tela sem resposta.
 ENGINE_LOCK_COMMAND_TIMEOUT_SECONDS = 20.0
+
+# 1.12.78 — o anúncio do fim do comando é melhor esforço, e o teto é curto de
+# propósito. Ele existe para o site não esperar a próxima volta do cron; se
+# demorar mais que isso, o ciclo do cron reconcilia do mesmo jeito e insistir só
+# gastaria a conexão residencial. O destino é derivado da URL de telemetria já
+# configurada, trocando somente o sufixo da rota — nenhuma opção nova precisa
+# ser preenchida na instalação de campo.
+COMMAND_ANNOUNCE_TIMEOUT_SECONDS = 8.0
+COMMAND_ANNOUNCE_SOURCE_SUFFIX = "/api/internal/telemetry/events"
+COMMAND_ANNOUNCE_TARGET_SUFFIX = "/api/internal/commands/result"
 
 TELEMETRY_CONFIRMABLE_COMMANDS = frozenset({
     "lock",
@@ -4451,6 +4461,106 @@ class TelemetryEngine:
         ) as exc:
             self._close_delivery_connection()
             self._delivery_failed(valid_rows, connector.clean_message(str(exc)))
+
+    def announce_command_result(self, environment: str, request_id: str, result: dict[str, Any]) -> bool:
+        """Avisa o site, no mesmo instante, que o worker terminou um comando.
+
+        1.12.78 — antes, o site só descobria o desfecho na próxima volta do
+        cron. Medido em 12/08/2026 (`unlock`, conta acct_1c8b987d): o carro
+        obedeceu em ~3 s, o worker terminou em 6,2 s e a tela só confirmou entre
+        41 s e 65 s depois. O navegador já perguntava a cada 4-6 s e recebia
+        `executing` em todas as vezes — não havia nada novo para ler, porque o
+        desfecho existia apenas aqui dentro.
+
+        Melhor esforço, e deliberadamente FORA da conexão da thread de entrega:
+        usar `_post_delivery` colocaria o anúncio atrás de um lote de telemetria
+        no mesmo `_delivery_guard`, que é exatamente a fila que ele veio
+        desfazer. Qualquer falha é silenciosa — o ciclo do cron continua sendo a
+        rede de segurança, e um site anterior à 1.12.333 simplesmente responde
+        404.
+        """
+        request_id = str(request_id or "").strip()
+        if not request_id or not isinstance(result, dict) or not result:
+            return False
+        url = self.delivery_urls.get(environment, "")
+        secret = self.secrets.get(environment, "")
+        if not url or len(secret) < 32:
+            return False
+        if not url.endswith(COMMAND_ANNOUNCE_SOURCE_SUFFIX):
+            # Destino fora do formato conhecido: sem palpite sobre a rota.
+            return False
+        url = url[: -len(COMMAND_ANNOUNCE_SOURCE_SUFFIX)] + COMMAND_ANNOUNCE_TARGET_SUFFIX
+
+        try:
+            body = json.dumps(
+                {
+                    "request_id": request_id,
+                    "result": result,
+                    "gateway_version": ENGINE_VERSION,
+                    "sent_at": utc_iso(),
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+                default=connector.json_default,
+            ).encode("utf-8")
+        except (TypeError, ValueError) as exc:
+            LOG.debug("Anúncio de comando não pôde ser serializado: %s", exc)
+            return False
+
+        parsed = urllib.parse.urlparse(url)
+        path = parsed.path or "/"
+        timestamp = str(int(time.time()))
+        nonce = os.urandom(16).hex()
+        canonical = f"POST\n{path}\n{timestamp}\n{nonce}\n{hashlib.sha256(body).hexdigest()}".encode()
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": f"LeapHubGateway/{ENGINE_VERSION}",
+            "Content-Length": str(len(body)),
+            "Connection": "close",
+            "X-LeapHub-Timestamp": timestamp,
+            "X-LeapHub-Nonce": nonce,
+            "X-LeapHub-Environment": environment,
+            "X-LeapHub-Signature": hmac.new(secret.encode(), canonical, hashlib.sha256).hexdigest(),
+        }
+        target = f"{path}?{parsed.query}" if parsed.query else path
+
+        connection: http.client.HTTPConnection | None = None
+        try:
+            if parsed.scheme == "https":
+                connection = http.client.HTTPSConnection(
+                    parsed.hostname or "", parsed.port, timeout=COMMAND_ANNOUNCE_TIMEOUT_SECONDS
+                )
+            elif parsed.scheme == "http":
+                connection = http.client.HTTPConnection(
+                    parsed.hostname or "", parsed.port, timeout=COMMAND_ANNOUNCE_TIMEOUT_SECONDS
+                )
+            else:
+                return False
+            connection.request("POST", target, body=body, headers=headers)
+            response = connection.getresponse()
+            status = int(response.status)
+            response.read(65536)
+        except Exception as exc:
+            # Amplo de propósito: este anúncio é um atalho, e nenhuma falha dele
+            # pode derrubar o worker que já concluiu o comando com sucesso.
+            LOG.debug(
+                "Anúncio do comando %s não chegou ao site: %s",
+                request_id[:12],
+                connector.clean_message(str(exc)),
+            )
+            return False
+        finally:
+            if connection is not None:
+                try:
+                    connection.close()
+                except Exception:
+                    pass
+
+        if 200 <= status < 300:
+            return True
+        LOG.debug("O site respondeu HTTP %s ao anúncio do comando %s.", status, request_id[:12])
+        return False
 
     def _post_delivery(
         self,

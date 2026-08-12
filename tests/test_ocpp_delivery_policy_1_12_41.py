@@ -8,6 +8,7 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+_RELEASE_TARGET = (ROOT / "leaphub_gateway" / "RELEASE_TARGET").read_text(encoding="utf-8").strip()
 MODULE_PATH = ROOT / "leaphub_gateway" / "ocpp_gateway.py"
 
 
@@ -36,7 +37,7 @@ def insert_event(gateway, identity: str, message_id: str, action: str = "StatusN
 
 def test_http_error_classification_is_fail_safe(tmp_path: Path) -> None:
     gateway = load_gateway(tmp_path)
-    assert gateway.GATEWAY_VERSION == "1.12.77"
+    assert gateway.GATEWAY_VERSION == _RELEASE_TARGET
 
     permanent = gateway.classify_api_error(
         403,

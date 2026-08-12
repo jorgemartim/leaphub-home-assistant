@@ -2,13 +2,14 @@ from pathlib import Path
 import importlib.util
 
 ROOT = Path(__file__).resolve().parents[1]
+_RELEASE_TARGET = (ROOT / "leaphub_gateway" / "RELEASE_TARGET").read_text(encoding="utf-8").strip()
 CONNECTOR_PATH = ROOT / "leaphub_gateway" / "connector.py"
 spec = importlib.util.spec_from_file_location("leaphub_gateway_sentry_evidence", CONNECTOR_PATH)
 assert spec and spec.loader
 connector = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(connector)
 
-assert connector.CONNECTOR_VERSION == "1.12.77"
+assert connector.CONNECTOR_VERSION == _RELEASE_TARGET
 
 positive = connector.safe_remote_result_summary({"result": 0, "message": "ok", "remoteCtlId": "secret-id", "token": "must-not-leak"})
 assert positive["result"] == 0
@@ -35,4 +36,4 @@ server_source = (ROOT / "leaphub_gateway" / "connector_server.py").read_text(enc
 for token in ("evidencia=%s", "sinal=%s", "resumo=%s", "remote_result_summary"):
     assert token in server_source
 
-print({"ok": True, "checks": 16, "version": "1.12.77"})
+print({"ok": True, "checks": 16, "version": _RELEASE_TARGET})
