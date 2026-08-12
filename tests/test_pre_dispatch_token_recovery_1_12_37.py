@@ -31,4 +31,4 @@ checks = {
 failed = [name for name, ok in checks.items() if not ok]
 if failed:
     raise SystemExit("pre-dispatch token recovery contract failed: " + ", ".join(failed))
-print({"ok": True, "checks": len(checks), "version": "1.12.75"})
+print({"ok": True, "checks": len(checks), "version": "1.12.76"})

@@ -1,11 +1,10 @@
-## 1.12.75
+## 1.12.76
 
 Distribuição pré-compilada preservada, com publicação em duas fases.
 
-O orçamento de leituras da janela de confirmação voltou a ser teto de segurança.
-A 1.12.74 adensou a escada e manteve as mesmas 8 leituras, e com isso o teto
-passou a encerrar a espera antes do prazo — medido em campo aos 135s e aos 60s
-de uma janela de 180s. O piso agora é derivado da janela e do menor degrau da
-escada, e elevá-lo não cria requisição nenhuma: quem marca o ritmo é a cadência.
+Uma confirmação por comando, também quando o boost traz `request_id`. A guarda da
+1.12.74 só cobria o boost anônimo; com o id devolvido pelo site na 1.12.331, o
+caso comum atravessava a guarda e ressuscitava a linha já confirmada. Medido em
+campo: cinco dos seis comandos confirmavam duas vezes.
 
-Ver RELEASE-1.12.75.md.
+Ver RELEASE-1.12.76.md.
