@@ -2105,8 +2105,9 @@ class TelemetryEngine:
         vehicle_id: str,
         now_epoch: float,
         window_seconds: int,
+        request_id: str = "",
     ) -> sqlite3.Row | None:
-        """Veredito recente do MESMO comando, para um boost que chega sem id.
+        """Veredito recente do MESMO comando, para um boost repetido.
 
         1.12.74 — `_adopt_legacy_confirmation` já se protege disto desde a
         1.12.70 (a guarda logo acima do INSERT dela), mas o `boost` não se
@@ -2129,16 +2130,27 @@ class TelemetryEngine:
         merece ser rearmada — ali o boost do site é recuperação de verdade, e
         recusá-la deixaria o comando sem veredito.
         """
+        # 1.12.75 — quando o boost traz `request_id`, a busca é POR ELE. A
+        # 1.12.74 só cobria o caso anônimo porque, na época, o site descartava o
+        # id (consertado na 1.12.331 do site). Com o id de volta, o caso comum
+        # passou a ser o IDENTIFICADO — e ele atravessava esta guarda, caía no
+        # `INSERT OR REPLACE` do `_register_confirmation` e RESSUSCITAVA a linha
+        # já confirmada com `started_at` novo. Medido em campo em 12/08/2026:
+        # cinco dos seis comandos confirmaram DUAS vezes com o mesmo `ref_`, a
+        # segunda com "1 leitura e 0s", ~45s depois — a cadência do boost da tela.
+        #
+        # Com identidade exata isto é seguro: um toque NOVO no botão gera um
+        # `request_uuid` novo, logo um `confirmation_id` novo, e não é suprimido.
+        parametros: list[Any] = [subscription_id, command_key, vehicle_id]
+        if request_id:
+            parametros.append(request_id)
+        parametros.append(now_epoch - max(1, int(window_seconds)))
         return db.execute(
             "SELECT * FROM command_confirmations WHERE subscription_id=? AND command_key=? "
-            "AND IFNULL(command_vehicle_id,'')=? AND status='confirmed' AND resolved_at>=? "
-            "ORDER BY resolved_at DESC LIMIT 1",
-            (
-                subscription_id,
-                command_key,
-                vehicle_id,
-                now_epoch - max(1, int(window_seconds)),
-            ),
+            "AND IFNULL(command_vehicle_id,'')=?"
+            + (" AND request_id=?" if request_id else "")
+            + " AND status='confirmed' AND resolved_at>=? ORDER BY resolved_at DESC LIMIT 1",
+            tuple(parametros),
         ).fetchone()
 
     def _register_confirmation(
@@ -2174,16 +2186,15 @@ class TelemetryEngine:
                     (now_epoch + seconds, context_json, now_iso, adopted),
                 )
             return adopted, True
-        if not request_id:
-            settled = self._settled_confirmation(
-                db, subscription_id, command_key, vehicle_id, now_epoch, seconds
-            )
-            if settled is not None:
-                # Nada a rearmar e nada a mexer na linha: ela já tem veredito.
-                # Devolver `True` faz o `boost` tomar o ramo de janela reusada,
-                # que não zera `command_poll_count` nem reescreve o contexto do
-                # comando na assinatura.
-                return str(settled["confirmation_id"] or ""), True
+        settled = self._settled_confirmation(
+            db, subscription_id, command_key, vehicle_id, now_epoch, seconds, request_id
+        )
+        if settled is not None:
+            # Nada a rearmar e nada a mexer na linha: ela já tem veredito.
+            # Devolver `True` faz o `boost` tomar o ramo de janela reusada, que
+            # não zera `command_poll_count` nem reescreve o contexto do comando
+            # na assinatura.
+            return str(settled["confirmation_id"] or ""), True
         confirmation_id = self._confirmation_id(subscription_id, command_key, vehicle_id, request_id)
         db.execute(
             "INSERT OR REPLACE INTO command_confirmations "

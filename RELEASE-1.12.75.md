@@ -44,3 +44,29 @@ Três contratos carimbavam `len(escada) >= orçamento`, que deixou de valer de
 propósito, e um carimbava duas versões literais. Reescritos para a garantia:
 saturação do índice, cobertura da janela pela escada, e publicação em duas fases
 derivada do `RELEASE_TARGET`.
+
+## E a confirmação em dobro, que só apareceu depois da 1.12.331
+
+Medido em campo em 12/08/2026, conta `acct_1c8b987d`: **cinco dos seis comandos
+confirmaram DUAS vezes com o mesmo `ref_`**, a segunda "após 1 leitura(s) e 0s",
+cerca de 45s depois — a cadência do boost da tela.
+
+```
+08:13:35  unlock (ref_3cf916b9) confirmado ... após 3 leitura(s) e 11s
+08:14:17  unlock (ref_3cf916b9) confirmado ... após 1 leitura(s) e  0s
+```
+
+A guarda `_settled_confirmation` da 1.12.74 só valia para o boost **anônimo**,
+porque naquele momento o site descartava o `request_id`. A 1.12.331 devolveu o
+id — e com isso o caso comum virou o **identificado**, que atravessava a guarda,
+caía no `INSERT OR REPLACE` de `_register_confirmation` e reescrevia a linha já
+confirmada com `started_at` novo. Ela reconfirmava na leitura seguinte, porque o
+estado que procura já tinha sido atingido.
+
+Agora a guarda é chaveada pela **identidade**: havendo `request_id`, procura-se o
+veredito daquele id. Com identidade exata isto é seguro — um toque novo no botão
+gera um `request_uuid` novo, logo um `confirmation_id` novo, e não é suprimido.
+
+Duas mutações provam o par: voltar a guarda para "só anônimo" reprova o caso
+novo; ignorar o id de vez reprova o controle negativo
+(`test_an_identified_boost_is_never_suppressed`).

@@ -259,8 +259,38 @@ def test_an_old_verdict_does_not_suppress_a_new_command() -> None:
         )
 
 
+def test_a_repeated_boost_with_the_same_id_does_not_resurrect_the_verdict() -> None:
+    """1.12.75 — o boost repetido COM id ressuscitava a linha já confirmada.
+
+    Medido em campo em 12/08/2026, conta acct_1c8b987d: cinco dos seis comandos
+    confirmaram DUAS vezes com o mesmo `ref_`, a segunda "após 1 leitura(s) e
+    0s", cerca de 45s depois — a cadência do boost da tela. O caminho era o
+    `INSERT OR REPLACE` de `_register_confirmation`, que reescrevia a linha
+    confirmada com `started_at` novo; ela reconfirmava na leitura seguinte,
+    porque o estado que procura já tinha sido atingido.
+
+    Este caso só existe porque o site voltou a enviar o `request_id` (1.12.331):
+    até então o boost chegava anônimo e caía na guarda da 1.12.74.
+    """
+    with Harness() as h:
+        sid = h.subscribe()
+        h.command(sid, "unlock", "req-mesmo")
+        h.settle(sid, "confirmed")
+
+        repetido = h.command(sid, "unlock", "req-mesmo")
+        assert repetido["confirmation_window_reused"] is True
+        assert repetido["pending_confirmations"] == 0, (
+            "o boost repetido ressuscitou uma espera que já tinha veredito"
+        )
+
+
 def test_an_identified_boost_is_never_suppressed() -> None:
-    """A guarda é só para o boost anônimo; com id, quem manda é a 1.12.62."""
+    """Um toque NOVO no botão nunca é suprimido: id novo, espera nova.
+
+    1.12.75 — este é o controle negativo que impede a guarda acima de virar
+    "engole tudo". A identidade vem de `vehicle_commands.request_uuid`, que é
+    gerado por despacho.
+    """
     with Harness() as h:
         sid = h.subscribe()
         h.command(sid, "lock", "req-primeiro")
@@ -389,8 +419,11 @@ def test_the_guard_lives_in_the_boost_path_and_only_for_positive_verdicts() -> N
 
     registro = fonte[fonte.index("def _register_confirmation"):]
     registro = registro[: registro.index("def _prune_confirmations")]
-    assert "if not request_id:" in registro, (
-        "a supressão deixou de depender da ausência de request_id"
+    # 1.12.75 — a supressão deixou de depender da AUSÊNCIA de request_id e
+    # passou a ser chaveada pela IDENTIDADE: havendo id, procura-se o veredito
+    # daquele id. O caso anônimo continua valendo para quem não o traz.
+    assert "AND request_id=?" in corpo, (
+        "a guarda deixou de casar pelo id quando ele existe"
     )
     assert registro.index("_match_pending_confirmation(") < registro.index("_settled_confirmation("), (
         "a espera PENDENTE tem de ser procurada primeiro; senão a adoção da 1.12.62 morre"
