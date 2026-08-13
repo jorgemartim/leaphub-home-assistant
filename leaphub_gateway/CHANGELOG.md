@@ -1,13 +1,15 @@
-## 1.12.80
+## 1.12.81
 
-Retorno rápido restaurado sem desfazer a correção física da climatização C10.
+Resposta rápida completa dos controles sem desfazer a correção física do C10.
 
-A distribuição permanece pré-compilada no GHCR oficial; esta versão preserva o fluxo de publicação em duas fases.
+A distribuição permanece pré-compilada no GHCR oficial e mantém a publicação em duas fases.
 
-- lock, unlock, climate_on, quick_cool e quick_heat param de esperar o polling síncrono de resultado da leapmotor-api 0.3.2;
-- o ACK da escrita remota vira `ack_only`/`confirmation_pending` e a confirmação física continua pela telemetria FAST;
-- o payload AUTO `operate=auto` + `mode=nohotcold` da 1.12.79 permanece;
-- climate_off permanece no fluxo 1.12.79 nesta rodada para não mexer no retry protegido antes de novo teste físico;
-- nenhuma terceira transmissão e nenhum aumento de polling.
+- climate_off entra no ACK-first preservando `ac_switch` + `operate=off`;
+- a verificação protegida do OFF vira uma única leitura curta depois do ACK, sem laço síncrono adicional;
+- se a leitura ainda contradiz o OFF, a segunda e última transmissão repete exatamente o mesmo estado e também usa ACK-first;
+- depois da segunda transmissão a confirmação final fica com a telemetria FAST já existente;
+- lock, unlock, climate_on, quick_cool e quick_heat mantêm o ACK-first da 1.12.80;
+- o anúncio imediato Gateway -> Site da 1.12.78 permanece e agora registra no log se o atalho foi aceito;
+- nenhuma terceira transmissão, nenhum aumento de polling e nenhuma alteração de autenticação/sessão.
 
-Ver RELEASE-1.12.80.md.
+Ver RELEASE-1.12.81.md.

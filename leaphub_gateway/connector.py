@@ -43,7 +43,7 @@ except ImportError:
         _privacy_spec.loader.exec_module(_privacy_module)
         sanitize_log = _privacy_module.sanitize_log
 
-CONNECTOR_VERSION = "1.12.80"
+CONNECTOR_VERSION = "1.12.81"
 MAX_INPUT_BYTES = 1024 * 1024
 logging.getLogger("leapmotor_api").setLevel(logging.WARNING)
 LOGGER = logging.getLogger("leaphub.connector")
@@ -62,9 +62,9 @@ SAFE_STATE_RETRY_COMMANDS = {"climate_on", "climate_off"}
 # 1.12.80 — estes comandos retornam ao Gateway assim que a escrita remota foi
 # aceita. A própria leapmotor-api 0.3.2 faz polling síncrono do remoteCtlId;
 # aqui isso é redundante porque a confirmação física já é feita pela telemetria
-# FAST do Gateway. climate_off fica fora por enquanto para preservar o retry
-# protegido já homologado enquanto medimos a nova latência.
-ACK_FIRST_COMMANDS = {"lock", "unlock", "climate_on", "quick_cool", "quick_heat"}
+# FAST do Gateway. Na 1.12.81 climate_off entra na mesma estratégia,
+# preservando o ac_switch operate=off e o teto de duas transmissões exatas.
+ACK_FIRST_COMMANDS = {"lock", "unlock", "climate_on", "climate_off", "quick_cool", "quick_heat"}
 
 COMMAND_METHODS: dict[str, str] = {
     "lock": "lock_vehicle",
@@ -3966,6 +3966,78 @@ def wait_for_command_state(
         time.sleep(min(4.0, max(0.5, remaining)))
 
 
+def verify_climate_state_once_after_settle(
+    client: Any,
+    resolved_vehicle_id: str,
+    command: str,
+    parameters: dict[str, Any],
+    command_started_at: float,
+    report: Callable[[str, str, dict[str, Any] | None], None],
+    stage: str,
+    vehicles: list[Any] | None = None,
+    settle_seconds: float = 1.0,
+) -> dict[str, Any]:
+    """Faça uma única leitura curta depois do ACK, sem criar novo laço de polling.
+
+    1.12.81 — climate_off precisa continuar podendo usar a segunda transmissão
+    idempotente quando a primeira não aparece no veículo, mas não deve pagar o
+    polling síncrono do remoteCtlId da biblioteca. Damos uma janela curta para
+    o C10 aplicar o OFF, fazemos UMA leitura e devolvemos imediatamente. Se essa
+    leitura ainda contradiz o OFF, a camada de comando pode repetir exatamente
+    o mesmo estado uma única vez. A confirmação final continua na telemetria.
+    """
+    delay = max(0.0, min(2.0, float(settle_seconds or 0.0)))
+    if delay > 0:
+        time.sleep(delay)
+    try:
+        sample = read_command_state(
+            client,
+            resolved_vehicle_id,
+            command,
+            parameters,
+            vehicles,
+        )
+        captured_epoch = float(sample.get("captured_epoch") or 0)
+        fresh = captured_epoch <= 0 or captured_epoch >= command_started_at - 5
+        sample["fresh"] = fresh
+        sample["samples"] = 1
+        sample["last_error"] = ""
+        report(
+            stage,
+            "Veículo respondeu à verificação curta pós-ACK.",
+            {
+                "verification_sample": 1,
+                "state_fresh": fresh,
+                "state_evaluable": bool(sample.get("evaluable")),
+                "single_probe": True,
+            },
+        )
+        return sample
+    except Exception as exc:  # noqa: BLE001
+        cooldown = login_cooldown_seconds(exc)
+        if cooldown > 0:
+            raise ConnectorLoginCooldownError(
+                "A Leapmotor limitou temporariamente novas autenticações. O comando continuará na fila e será retomado automaticamente.",
+                cooldown,
+            ) from exc
+        if is_authentication_error(exc):
+            raise ConnectorAuthenticationError(clean_message(str(exc))) from exc
+        report(
+            stage,
+            "A verificação curta oscilou; a telemetria continuará a confirmação sem aumentar o polling.",
+            {"verification_sample": 1, "state_fresh": False, "state_evaluable": False, "single_probe": True},
+        )
+        return {
+            "matched": False,
+            "evaluable": False,
+            "fresh": False,
+            "state": "verification_unavailable",
+            "captured_epoch": 0.0,
+            "samples": 1,
+            "last_error": clean_message(str(exc)),
+        }
+
+
 def handle_command(
     payload: dict[str, Any],
     progress: Callable[[str, str, dict[str, Any] | None], None] | None = None,
@@ -4084,6 +4156,14 @@ def handle_command(
         started = time.monotonic()
         try:
             return wait_for_command_state(*args, **kwargs)
+        finally:
+            phase_latency_ms["verification_ms"] += int(round((time.monotonic() - started) * 1000))
+
+
+    def timed_single_verification(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        started = time.monotonic()
+        try:
+            return verify_climate_state_once_after_settle(*args, **kwargs)
         finally:
             phase_latency_ms["verification_ms"] += int(round((time.monotonic() - started) * 1000))
 
@@ -4293,17 +4373,33 @@ def handle_command(
 
         if is_climate_state_command and verify_after:
             stage = "vehicle_waking" if stale_snapshot or confirmation_reason == "result_timeout" else "climate_verifying"
-            initial_sample = timed_wait_for_state(
-                client,
-                resolved_vehicle_id,
-                command,
-                parameters,
-                command_started_at,
-                min(wake_timeout, 30),
-                report,
-                stage,
-                resolved_list,
-            )
+            if command == "climate_off" and result_poll_deferred:
+                # 1.12.81 — o OFF C10 não espera o polling interno da biblioteca.
+                # Uma única leitura curta mantém a decisão segura sobre a segunda
+                # transmissão idempotente sem criar um novo laço de polling.
+                initial_sample = timed_single_verification(
+                    client,
+                    resolved_vehicle_id,
+                    command,
+                    parameters,
+                    command_started_at,
+                    report,
+                    stage,
+                    resolved_list,
+                    1.0,
+                )
+            else:
+                initial_sample = timed_wait_for_state(
+                    client,
+                    resolved_vehicle_id,
+                    command,
+                    parameters,
+                    command_started_at,
+                    min(wake_timeout, 30),
+                    report,
+                    stage,
+                    resolved_list,
+                )
             verification_samples += int(initial_sample.get("samples") or 0)
             verification_state = str(initial_sample.get("state") or "unknown")
             if bool(initial_sample.get("matched")):
@@ -4334,47 +4430,68 @@ def handle_command(
                 safe_retry_performed = True
                 retry_error: Exception | None = None
                 try:
-                    result = timed_remote_call(
-                        execute_vehicle_command,
+                    retry_dispatched = timed_remote_call(
+                        execute_vehicle_command_ack_first,
                         method,
                         command,
                         resolved_vehicle_id,
                         parameters,
                         active_climate_profile,
                     )
+                    result, retry_deferred = retry_dispatched
+                    result_poll_deferred = bool(result_poll_deferred or retry_deferred)
                     command_dispatched = True
                     cloud_accepted = True
+                    if retry_deferred:
+                        dispatch_ack = "cloud_accepted_result_pending"
+                        remote_result_status = "ack_only"
+                        remote_result_evidence = "remote_write_returned_result_poll_deferred_to_telemetry"
                 except Exception as exc:  # noqa: BLE001
                     if not classify_accepted_ambiguity(exc):
                         retry_error = exc
 
-                final_sample = timed_wait_for_state(
-                    client,
-                    resolved_vehicle_id,
-                    command,
-                    parameters,
-                    time.time() - 1,
-                    18,
-                    report,
-                    "climate_verifying",
-                    resolved_list,
-                )
-                verification_samples += int(final_sample.get("samples") or 0)
-                verification_state = f"after_wake_retry:{str(final_sample.get('state') or 'unknown')}"
-                if bool(final_sample.get("matched")):
-                    verified_by_gateway = True
-                    confirmation_pending = False
-                    confirmation_reason = None
-                    report("verifying", "Climatização confirmada depois da etapa pós-despertar.", {"verified_by_gateway": True})
-                elif bool(final_sample.get("evaluable")) and bool(final_sample.get("fresh")):
+                if command == "climate_off" and result_poll_deferred:
+                    # A segunda e última transmissão OFF já saiu por ACK-first.
+                    # Não abra outro ciclo síncrono de leitura aqui: a telemetria
+                    # FAST já existente decide o estado físico final.
+                    verification_state = "after_safe_retry:telemetry_pending"
+                    if retry_error is not None:
+                        raise_classified(retry_error)
                     confirmation_pending = True
-                    confirmation_reason = "state_not_applied_after_wake_retry"
-                    execution_warning = "climate_not_applied_after_safe_retry"
-                elif retry_error is not None:
-                    raise_classified(retry_error)
+                    confirmation_reason = "telemetry_pending_after_safe_retry"
+                    report(
+                        "verifying",
+                        "Segundo OFF enviado; confirmação física segue pela telemetria sem novo polling síncrono.",
+                        {"safe_retry": True, "telemetry_confirmation": True},
+                    )
                 else:
-                    confirmation_pending = True
-                    confirmation_reason = confirmation_reason or "telemetry_pending"
+                    final_sample = timed_wait_for_state(
+                        client,
+                        resolved_vehicle_id,
+                        command,
+                        parameters,
+                        time.time() - 1,
+                        18,
+                        report,
+                        "climate_verifying",
+                        resolved_list,
+                    )
+                    verification_samples += int(final_sample.get("samples") or 0)
+                    verification_state = f"after_wake_retry:{str(final_sample.get('state') or 'unknown')}"
+                    if bool(final_sample.get("matched")):
+                        verified_by_gateway = True
+                        confirmation_pending = False
+                        confirmation_reason = None
+                        report("verifying", "Climatização confirmada depois da etapa pós-despertar.", {"verified_by_gateway": True})
+                    elif bool(final_sample.get("evaluable")) and bool(final_sample.get("fresh")):
+                        confirmation_pending = True
+                        confirmation_reason = "state_not_applied_after_wake_retry"
+                        execution_warning = "climate_not_applied_after_safe_retry"
+                    elif retry_error is not None:
+                        raise_classified(retry_error)
+                    else:
+                        confirmation_pending = True
+                        confirmation_reason = confirmation_reason or "telemetry_pending"
             else:
                 confirmation_pending = True
                 if bool(initial_sample.get("evaluable")) and bool(initial_sample.get("fresh")):

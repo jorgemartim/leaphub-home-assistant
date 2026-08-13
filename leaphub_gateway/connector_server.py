@@ -65,7 +65,7 @@ except ModuleNotFoundError:
         _event_transport_spec.loader.exec_module(_event_transport_module)
         EVENT_TRANSPORT = _event_transport_module.EVENT_TRANSPORT
 
-VERSION = "1.12.80"
+VERSION = "1.12.81"
 API_VERSION = 2
 CAPABILITY_SCHEMA_VERSION = 1
 MIN_SUPPORTED_CLIENT_API_VERSION = 1
@@ -556,9 +556,13 @@ def announce_command_result_async(environment: str, request_id: str, payload: di
 
     def _run() -> None:
         try:
-            TELEMETRY.announce_command_result(environment, request_id, payload)
+            announced = TELEMETRY.announce_command_result(environment, request_id, payload)
+            if announced:
+                LOG.info("Resultado do comando %s anunciado imediatamente ao site.", str(request_id)[:12])
+            else:
+                LOG.info("Resultado do comando %s não foi aceito pelo atalho imediato; reconciliação segue pelo ciclo normal.", str(request_id)[:12])
         except Exception as exc:
-            LOG.debug("Anúncio do comando %s falhou: %s", str(request_id)[:12], exc)
+            LOG.info("Anúncio imediato do comando %s falhou; reconciliação segue pelo ciclo normal: %s", str(request_id)[:12], connector.clean_message(str(exc)))
 
     try:
         threading.Thread(target=_run, name="leaphub-command-announce", daemon=True).start()
