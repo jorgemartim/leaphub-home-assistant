@@ -99,6 +99,7 @@ check(not connector.command_permitted_by_vehicle("fuel_heating_on", {110, 170}),
 check(380 in connector.effective_right_codes([], [40]), "Ability 40 deve implicar o direito 380")
 check(connector.CLIMATE_VERIFY_COMMANDS == {"climate_on", "climate_off", "quick_cool", "quick_heat"}, "Conjunto de confirmação climática divergente")
 check(connector.SAFE_STATE_RETRY_COMMANDS == {"climate_on", "climate_off"}, "Retry seguro climático divergente")
+check(connector.ACK_FIRST_COMMANDS == {"lock", "unlock", "climate_on", "quick_cool", "quick_heat"}, "Conjunto ACK-first divergente")
 
 pairs = [
     ("lock", "unlock"),

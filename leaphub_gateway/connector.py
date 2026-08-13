@@ -43,7 +43,7 @@ except ImportError:
         _privacy_spec.loader.exec_module(_privacy_module)
         sanitize_log = _privacy_module.sanitize_log
 
-CONNECTOR_VERSION = "1.12.79"
+CONNECTOR_VERSION = "1.12.80"
 MAX_INPUT_BYTES = 1024 * 1024
 logging.getLogger("leapmotor_api").setLevel(logging.WARNING)
 LOGGER = logging.getLogger("leaphub.connector")
@@ -59,6 +59,12 @@ def connector_log(level: int, message: str, *args: Any) -> None:
 
 CLIMATE_VERIFY_COMMANDS = {"climate_on", "climate_off", "quick_cool", "quick_heat"}
 SAFE_STATE_RETRY_COMMANDS = {"climate_on", "climate_off"}
+# 1.12.80 — estes comandos retornam ao Gateway assim que a escrita remota foi
+# aceita. A própria leapmotor-api 0.3.2 faz polling síncrono do remoteCtlId;
+# aqui isso é redundante porque a confirmação física já é feita pela telemetria
+# FAST do Gateway. climate_off fica fora por enquanto para preservar o retry
+# protegido já homologado enquanto medimos a nova latência.
+ACK_FIRST_COMMANDS = {"lock", "unlock", "climate_on", "quick_cool", "quick_heat"}
 
 COMMAND_METHODS: dict[str, str] = {
     "lock": "lock_vehicle",
@@ -3596,6 +3602,52 @@ def expected_climate_mode(command: str) -> str | None:
     }.get(command)
 
 
+
+def execute_vehicle_command_ack_first(
+    method: Any,
+    command: str,
+    vehicle_id: str,
+    parameters: dict[str, Any],
+    climate_profile: str = "generic",
+) -> tuple[Any, bool]:
+    """Dispatch selected commands without waiting for leapmotor-api result polling.
+
+    leapmotor-api==0.3.2 writes the remote command and then polls the returned
+    ``remoteCtlId`` synchronously before returning. Leap Hub already confirms
+    physical state independently through FAST telemetry, so for the explicitly
+    allow-listed commands we temporarily defer only that internal result poll.
+
+    The client belongs to an account/session operation protected by the Gateway
+    lock. The override is restored in ``finally`` before the lease is released.
+    """
+    if command not in ACK_FIRST_COMMANDS:
+        return execute_vehicle_command(method, command, vehicle_id, parameters, climate_profile), False
+
+    owner = getattr(method, "__self__", None)
+    poll = getattr(owner, "_poll_remote_control_result", None) if owner is not None else None
+    if owner is None or not callable(poll):
+        return execute_vehicle_command(method, command, vehicle_id, parameters, climate_profile), False
+
+    instance_dict = getattr(owner, "__dict__", None)
+    sentinel = object()
+    previous_override = instance_dict.get("_poll_remote_control_result", sentinel) if isinstance(instance_dict, dict) else sentinel
+
+    def deferred_result_poll(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        return {"deferred": True, "confirmation_source": "gateway_fast_telemetry"}
+
+    setattr(owner, "_poll_remote_control_result", deferred_result_poll)
+    try:
+        result = execute_vehicle_command(method, command, vehicle_id, parameters, climate_profile)
+        return result, True
+    finally:
+        if previous_override is sentinel:
+            try:
+                delattr(owner, "_poll_remote_control_result")
+            except AttributeError:
+                pass
+        else:
+            setattr(owner, "_poll_remote_control_result", previous_override)
+
 def fota_task_id(parameters: dict[str, Any]) -> int:
     """Identificador da tarefa de atualização, vindo da listagem FOTA da nuvem.
 
@@ -4012,6 +4064,7 @@ def handle_command(
     remote_result_summary: dict[str, Any] = {"type": "NoneType", "returned": False, "payload": "none"}
     remote_result_signal_value = "unknown"
     remote_result_evidence = "not_dispatched"
+    result_poll_deferred = False
     command_started_at = time.time()
     phase_latency_ms: dict[str, int] = {
         "session_prepare_ms": 0,
@@ -4109,7 +4162,7 @@ def handle_command(
         raise RuntimeError(clean_message(str(exc))) from exc
 
     def dispatch_once(stage: str, message: str, attempt: int) -> Exception | None:
-        nonlocal result, command_attempts, command_dispatched, cloud_accepted, dispatch_ack, remote_result_status, remote_result_summary, remote_result_signal_value, remote_result_evidence
+        nonlocal result, command_attempts, command_dispatched, cloud_accepted, dispatch_ack, remote_result_status, remote_result_summary, remote_result_signal_value, remote_result_evidence, result_poll_deferred, confirmation_pending, confirmation_reason
         report(stage, message, {
             "attempt": attempt,
             "climate_profile": active_climate_profile if command == "climate_off" else None,
@@ -4117,21 +4170,30 @@ def handle_command(
         })
         command_attempts = max(command_attempts, attempt)
         try:
-            result = timed_remote_call(
-                execute_vehicle_command,
+            dispatched = timed_remote_call(
+                execute_vehicle_command_ack_first,
                 method,
                 command,
                 resolved_vehicle_id,
                 parameters,
                 active_climate_profile,
             )
+            result, deferred_now = dispatched
+            result_poll_deferred = bool(deferred_now)
             command_dispatched = True
             cloud_accepted = True
-            dispatch_ack = "library_returned"
-            remote_result_status = "completed"
             remote_result_summary = safe_remote_result_summary(result)
             remote_result_signal_value = remote_result_signal(remote_result_summary)
-            remote_result_evidence = "library_method_completed_without_exception"
+            if result_poll_deferred:
+                confirmation_pending = True
+                confirmation_reason = "result_poll_deferred"
+                dispatch_ack = "cloud_accepted_result_pending"
+                remote_result_status = "ack_only"
+                remote_result_evidence = "remote_write_returned_result_poll_deferred_to_telemetry"
+            else:
+                dispatch_ack = "library_returned"
+                remote_result_status = "completed"
+                remote_result_evidence = "library_method_completed_without_exception"
             return None
         except Exception as exc:  # noqa: BLE001
             if classify_accepted_ambiguity(exc):
@@ -4407,6 +4469,7 @@ def handle_command(
             "remote_result_evidence": remote_result_evidence,
             "remote_result_signal": remote_result_signal_value,
             "remote_result_summary": remote_result_summary if command in SENTRY_COMMANDS else {},
+            "result_poll_deferred": result_poll_deferred,
             "sentry_probe": command in SENTRY_COMMANDS,
             "session_reused": borrowed_client is not None,
             "verified_by_gateway": verified_by_gateway,
