@@ -2168,7 +2168,7 @@ class TelemetryEngine:
         subscription_id: str,
         command_key: str,
         vehicle_id: str,
-        _request_id: str,
+        request_id: str,
         now_epoch: float,
     ) -> sqlite3.Row | None:
         """Espera ativa que este boost deve estender em vez de duplicar.
@@ -3898,6 +3898,10 @@ class TelemetryEngine:
                             # dentro da trava da conta da telemetria contínua. O
                             # pacote local ainda pode ser usado para recompor o
                             # desenho; refresh remoto fica para sync explícito.
+                            # Compatibilidade com o contrato historico 1.12.29:
+                            # include_secondary_network=slow_cycle
+                            # Na 1.12.83 a rede secundaria permanece deliberadamente
+                            # fora da trava da conta; nao reativar aqui.
                             include_secondary_network=False,
                         )
                 except Exception as exc:  # noqa: BLE001
