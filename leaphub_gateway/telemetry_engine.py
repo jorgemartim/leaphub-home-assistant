@@ -55,7 +55,7 @@ except ModuleNotFoundError:
         EVENT_TRANSPORT = _event_transport_module.EVENT_TRANSPORT
 
 LOG = logging.getLogger("leaphub.telemetry")
-ENGINE_VERSION = "1.12.83"  # prioridade manual + confirmações supersedidas
+ENGINE_VERSION = "1.12.84"  # prioridade manual + confirmações supersedidas
 
 # Hospedagem compartilhada (Apache/LiteSpeed) fecha a conexão ociosa em poucos
 # segundos. Reaproveitar depois disso escreve num socket já fechado e devolve
@@ -116,7 +116,7 @@ TELEMETRY_CONFIRMABLE_COMMANDS = frozenset({
     "set_charge_limit",
 })
 
-# 1.12.83 — uma ação de estado mais nova torna semanticamente obsoleta a
+# 1.12.84 — uma ação de estado mais nova torna semanticamente obsoleta a
 # espera oposta anterior. A telemetria não deve continuar por 180s tentando
 # confirmar LOCK depois de um UNLOCK posterior, nem OPEN depois de CLOSE.
 CONFIRMATION_SUPERSESSION_FAMILIES: dict[str, frozenset[str]] = {
@@ -1779,10 +1779,35 @@ class TelemetryEngine:
         same request instead of resetting its samples.
         """
         command = str(payload.get("command") or "").strip().lower()
+        dispatched = bool(result.get("command_dispatched") or result.get("cloud_accepted"))
+        if command in TELEMETRY_CONFIRMABLE_COMMANDS and dispatched:
+            # 1.12.84 — supersessão é consequência da NOVA intenção aceita,
+            # não da necessidade de abrir outra janela. Assim um climate_off
+            # confirmado diretamente também encerra quick_cool/quick_heat
+            # anteriores em vez de deixá-los consumir FAST por ~180s.
+            try:
+                now_epoch = time.time()
+                now_iso = utc_iso()
+                with self.lock, self._db() as db:
+                    self._supersede_pending_confirmations(
+                        db,
+                        subscription_id,
+                        command,
+                        str(payload.get("vehicle_id") or "").strip()[:190],
+                        str(payload.get("request_id") or "").strip()[:96],
+                        now_epoch,
+                        now_iso,
+                    )
+            except Exception as exc:  # noqa: BLE001
+                LOG.warning(
+                    "Comando %s foi aceito, mas a limpeza da confirmação anterior em %s falhou: %s",
+                    command, subscription_id, connector.clean_message(str(exc)),
+                )
+
         if (
             command not in TELEMETRY_CONFIRMABLE_COMMANDS
             or not bool(result.get("confirmation_pending"))
-            or not bool(result.get("command_dispatched") or result.get("cloud_accepted"))
+            or not dispatched
         ):
             result["confirmation_armed_by_gateway"] = False
             return
@@ -3372,6 +3397,7 @@ class TelemetryEngine:
                 vehicle_ids,
                 command_mode=command_mode,
                 manual_should_yield=manual_should_yield,
+                allow_slow_network=not (interactive or command_mode),
             )
         except TelemetryYieldForManual:
             ORCHESTRATOR.record_telemetry_cycle(
@@ -3718,6 +3744,7 @@ class TelemetryEngine:
         vehicle_ids: set[str],
         command_mode: bool = False,
         manual_should_yield: Callable[[], bool] | None = None,
+        allow_slow_network: bool = True,
     ) -> dict[str, Any]:
         # Somente a sessão desta conta fica bloqueada durante a chamada de rede.
         # Outras contas respeitam o limite global do Connector, mas não ficam
@@ -3731,6 +3758,7 @@ class TelemetryEngine:
                 vehicle_ids,
                 command_mode=command_mode,
                 manual_should_yield=manual_should_yield,
+                allow_slow_network=allow_slow_network,
             )
 
     def _collect_with_session_locked(
@@ -3742,6 +3770,7 @@ class TelemetryEngine:
         vehicle_ids: set[str],
         command_mode: bool = False,
         manual_should_yield: Callable[[], bool] | None = None,
+        allow_slow_network: bool = True,
     ) -> dict[str, Any]:
         now_epoch = time.time()
         credential_hash = hashlib.sha256(canonical_json(credentials)).hexdigest()
@@ -3830,7 +3859,8 @@ class TelemetryEngine:
             messages: list[Any] = []
             slow_last_at = float(session.get("slow_last_at") or 0)
             slow_cycle = (
-                not command_mode
+                allow_slow_network
+                and not command_mode
                 and ORCHESTRATOR.secondary_network_allowed(environment, account_id)
                 and now_epoch - slow_last_at >= self.slow_interval_seconds
             )
@@ -3894,14 +3924,14 @@ class TelemetryEngine:
                             messages=messages,
                             allow_unscoped_messages=len(selected) == 1,
                             manual_should_yield=manual_should_yield,
-                            # 1.12.83 — nunca abra metadados/download de imagem
+                            # 1.12.84 — nunca abra metadados/download de imagem
                             # dentro da trava da conta da telemetria contínua. O
                             # pacote local ainda pode ser usado para recompor o
                             # desenho; refresh remoto fica para sync explícito.
-                            # Compatibilidade com o contrato historico 1.12.29:
+                            # Compatibilidade com o contrato histórico 1.12.29:
                             # include_secondary_network=slow_cycle
-                            # Na 1.12.83 a rede secundaria permanece deliberadamente
-                            # fora da trava da conta; nao reativar aqui.
+                            # A rede secundária continua deliberadamente fora
+                            # da trava da conta na telemetria contínua.
                             include_secondary_network=False,
                         )
                 except Exception as exc:  # noqa: BLE001

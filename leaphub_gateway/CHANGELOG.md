@@ -1,13 +1,11 @@
-## 1.12.83
+## 1.12.84
 
-Fila de envio desacoplada da confirmação: o próximo comando de estado pode sair
-assim que a nuvem aceita a escrita, enquanto a telemetria confirma em segundo plano.
+Corrige confirmações antigas que permaneciam ativas depois de um comando posterior já aceito e reduz trabalho secundário da telemetria durante uso interativo.
 
 A distribuição permanece pré-compilada no GHCR oficial e conserva a publicação em duas fases.
 
-- ACK-first ampliado, de forma conservadora, para porta-malas, janelas e cortina;
-- confirmações antigas da mesma família são marcadas `superseded` quando uma intenção oposta posterior é registrada;
-- lock/unlock, clima AUTO/OFF e demais comandos rápidos da 1.12.82 permanecem inalterados;
-- rede secundária de imagem oficial deixa de rodar dentro da trava de conta da telemetria contínua; cache local continua permitido;
-- teto curto de rede automática da 1.12.82 permanece;
+- dispatch ACK-first e payloads da 1.12.83 permanecem inalterados;
+- supersessão de confirmação agora ocorre para toda nova intenção aceita, inclusive quando o comando posterior já retorna `confirmed` diretamente;
+- telemetria interativa/FAST pula a leitura secundária de mensagens e mantém foco no status físico do veículo;
+- leitura secundária continua disponível apenas no ciclo de fundo;
 - nenhuma terceira transmissão, nenhum aumento de polling e nenhuma mudança de autenticação.

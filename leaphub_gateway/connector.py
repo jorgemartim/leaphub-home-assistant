@@ -43,7 +43,7 @@ except ImportError:
         _privacy_spec.loader.exec_module(_privacy_module)
         sanitize_log = _privacy_module.sanitize_log
 
-CONNECTOR_VERSION = "1.12.83"
+CONNECTOR_VERSION = "1.12.84"
 MAX_INPUT_BYTES = 1024 * 1024
 logging.getLogger("leapmotor_api").setLevel(logging.WARNING)
 LOGGER = logging.getLogger("leaphub.connector")
@@ -64,7 +64,7 @@ SAFE_STATE_RETRY_COMMANDS = {"climate_on", "climate_off"}
 # aqui isso é redundante porque a confirmação física já é feita pela telemetria
 # FAST do Gateway. Na 1.12.81 climate_off entra na mesma estratégia,
 # preservando o ac_switch operate=off e o teto de duas transmissões exatas.
-# 1.12.83 — porta-malas, janelas e cortina também são comandos de ESTADO
+# 1.12.84 — porta-malas, janelas e cortina também são comandos de ESTADO
 # confirmáveis pela telemetria. Eles deixam de esperar o polling síncrono do
 # remoteCtlId, mas continuam sem qualquer retry físico adicional.
 ACK_FIRST_COMMANDS = {"lock", "unlock", "climate_on", "climate_off", "quick_cool", "quick_heat", "trunk_open", "trunk_close", "windows_open", "windows_close", "sunshade_open", "sunshade_close"}
@@ -2100,7 +2100,7 @@ def _official_picture_package(
 
     picture_key: str | None = None
     raw: bytes | None = None
-    # 1.12.83 — a telemetria FAST pode recompor a figura usando o pacote já
+    # 1.12.84 — a telemetria FAST pode recompor a figura usando o pacote já
     # salvo, mas nunca abre metadados/download de imagem enquanto possui a conta.
     # O download binário usa timeout por inatividade, não prazo total, e foi o
     # último caminho capaz de manter o account lock por dezenas de segundos.
