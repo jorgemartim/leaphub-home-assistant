@@ -1,11 +1,13 @@
-## 1.12.78
+## 1.12.79
 
 Distribuição pré-compilada preservada, com publicação em duas fases.
 
-Ao concluir um comando, o Gateway avisa o site na hora, em vez de esperar
-que o ciclo do cron venha buscar o resultado. Medido em campo em 12/08/2026:
-carro 3s, worker 6,2s, tela 41-65s — o intervalo inteiro era espera pela
-descoberta. O anúncio é melhor esforço e não segura o worker; um site sem a
-rota continua sendo reconciliado pelo ciclo, como antes.
+Climatização C10/B10/B05 alinhada ao estado físico observado.
 
-Ver RELEASE-1.12.78.md.
+- AUTO usa o payload completo do cmd 170 com `operate=auto` e `mode=nohotcold`.
+- OFF usa `ac_switch` com `operate=off`.
+- A confirmação distingue OFF, AUTO, resfriamento e aquecimento por `climate_mode`.
+- A segunda transmissão protegida repete exatamente o mesmo estado; continuam no máximo duas transmissões.
+- Sem aumento de polling e sem alteração funcional de OCPP, fila ou comandos de movimentação.
+
+Ver RELEASE-1.12.79.md.

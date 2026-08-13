@@ -43,7 +43,7 @@ except ImportError:
         _privacy_spec.loader.exec_module(_privacy_module)
         sanitize_log = _privacy_module.sanitize_log
 
-CONNECTOR_VERSION = "1.12.78"
+CONNECTOR_VERSION = "1.12.79"
 MAX_INPUT_BYTES = 1024 * 1024
 logging.getLogger("leapmotor_api").setLevel(logging.WARNING)
 LOGGER = logging.getLogger("leaphub.connector")
@@ -78,7 +78,7 @@ COMMAND_METHODS: dict[str, str] = {
     # Ver o tratamento em execute_vehicle_command.
     "sunshade_position": "control_sunshade",
     "climate_on": "ac_on",
-    "climate_off": "ac_off",
+    "climate_off": "ac_switch",
     "quick_cool": "quick_cool",
     "quick_heat": "quick_heat",
     "windshield_defrost": "windshield_defrost",
@@ -3318,6 +3318,25 @@ def resolve_command_vehicle(
     return resolved_vin, vehicles, source
 
 
+def climate_auto_parameters(parameters: dict[str, Any]) -> dict[str, str]:
+    """Payload AUTO comprovado para a plataforma C10/B10/B05."""
+    raw_temperature = parameters.get("target_temperature", 24)
+    try:
+        temperature = int(round(float(raw_temperature)))
+    except (TypeError, ValueError):
+        temperature = 24
+    temperature = max(18, min(temperature, 32))
+    return {
+        "circle": "in",
+        "mode": "nohotcold",
+        "operate": "auto",
+        "position": "all",
+        "temperature": str(temperature),
+        "windlevel": "5",
+        "wshld": "0",
+    }
+
+
 def execute_vehicle_command(
     method: Any,
     command: str,
@@ -3325,17 +3344,13 @@ def execute_vehicle_command(
     parameters: dict[str, Any],
     climate_profile: str = "generic",
 ) -> Any:
-    # climate_off is dispatched through ac_switch whenever the installed
-    # library supports it.  The C10 can keep a rapid cooling/heating profile
-    # active when the generic ac_off mapping is used, even though the cloud
-    # acknowledges the request.  Sending operate=close with the active profile
-    # mirrors the current HVAC mode and is still state-idempotent.
+    # 1.12.79 — C10/B10/B05: AUTO é um cmd 170 completo e OFF é ac_switch
+    # operate=off. O parâmetro climate_profile permanece apenas por compatibilidade
+    # de chamada nesta release; ele não participa mais do despacho.
+    if command == "climate_on":
+        return method(vehicle_id, params=climate_auto_parameters(parameters))
     if command == "climate_off":
-        try:
-            return method(vehicle_id, params=climate_close_parameters(climate_profile))
-        except TypeError:
-            # Compatibility with older libraries that expose only ac_off(vin).
-            return method(vehicle_id)
+        return method(vehicle_id, params={"operate": "off"})
     if command == "set_charge_limit":
         value = int(parameters.get("charge_limit_percent", 80))
         if value < 50 or value > 100 or value % 5 != 0:
@@ -3515,24 +3530,23 @@ def _status_capture_epoch(status: Any) -> float:
     return 0.0
 
 
-def climate_profile_from_status(climate: Any) -> str:
-    """Return a non-sensitive HVAC profile used only for state reconciliation.
+def climate_mode_from_status(climate: Any) -> str:
+    """Return the physical HVAC mode used to confirm C10 climate commands."""
+    switch_state = bool_or_none(attribute(climate, "ac_switch"))
+    if switch_state is False:
+        return "off"
+    if switch_state is not True:
+        return "unknown"
 
-    The provider exposes the current rapid mode through more than one field,
-    depending on model/firmware.  Keep the interpretation conservative and
-    fall back to the generic wind profile when no directional evidence exists.
-    """
-    if bool_or_none(attribute(climate, "rapid_cooling")) is True:
-        return "cooling"
-    if bool_or_none(attribute(climate, "rapid_heating")) is True:
-        return "heating"
     if bool_or_none(attribute(climate, "is_windshield_defrost_active")) is True:
-        return "heating"
+        return "defrost"
     windshield = numeric(attribute(climate, "windshield_defrost"))
     if windshield in (1, 2):
-        return "heating"
+        return "defrost"
 
     mode_number = numeric(attribute(climate, "climate_mode"))
+    if mode_number == 0:
+        return "auto"
     if mode_number == 1:
         return "cooling"
     if mode_number == 3:
@@ -3552,11 +3566,34 @@ def climate_profile_from_status(climate: Any) -> str:
             attribute(climate, "ac_operate_mode"),
         )
     )
+    if any(token in text for token in ("auto", "nohotcold", "neutral")):
+        return "auto"
     if any(token in text for token in ("fast_cool", "cool", "cold", "resfri")):
         return "cooling"
     if any(token in text for token in ("fast_heat", "heat", "hot", "aquec")):
         return "heating"
-    return "generic"
+
+    rapid_cooling = bool_or_none(attribute(climate, "rapid_cooling"))
+    rapid_heating = bool_or_none(attribute(climate, "rapid_heating"))
+    if rapid_cooling is True and rapid_heating is not True:
+        return "cooling"
+    if rapid_heating is True and rapid_cooling is not True:
+        return "heating"
+    return "unknown"
+
+
+def climate_profile_from_status(climate: Any) -> str:
+    mode = climate_mode_from_status(climate)
+    return mode if mode in {"cooling", "heating"} else "generic"
+
+
+def expected_climate_mode(command: str) -> str | None:
+    return {
+        "climate_off": "off",
+        "climate_on": "auto",
+        "quick_cool": "cooling",
+        "quick_heat": "heating",
+    }.get(command)
 
 
 def fota_task_id(parameters: dict[str, Any]) -> int:
@@ -3667,8 +3704,8 @@ def prepare_car_parameters(parameters: dict[str, Any]) -> dict[str, Any]:
     nuvem um pacote que ninguém conferiu, então aqui só entram dimensões
     conhecidas, e só as que o proprietário pediu explicitamente.
 
-    O vocabulário de `air_condition` é o mesmo que `climate_close_parameters()`
-    já usa em produção no `ac_switch` (circle/mode/operate/position/temperature/
+    O vocabulário de `air_condition` segue os mesmos campos do payload de clima
+    já usados em produção no `ac_switch` (circle/mode/operate/position/temperature/
     windlevel/wshld), confirmado pelos enums da biblioteca. As outras duas
     dimensões vêm documentadas no agendamento equivalente (361).
 
@@ -3725,24 +3762,6 @@ def prepare_car_parameters(parameters: dict[str, Any]) -> dict[str, Any]:
     return payload
 
 
-def climate_close_parameters(profile: str) -> dict[str, str]:
-    """Build the documented climate-switch close payload for the active mode."""
-    if profile == "cooling":
-        return {
-            "circle": "in", "mode": "cold", "operate": "close",
-            "position": "all", "temperature": "18", "windlevel": "7", "wshld": "0",
-        }
-    if profile == "heating":
-        return {
-            "circle": "in", "mode": "hot", "operate": "close",
-            "position": "all", "temperature": "32", "windlevel": "7", "wshld": "0",
-        }
-    return {
-        "circle": "out", "mode": "wind", "operate": "close",
-        "position": "all", "temperature": "26", "windlevel": "3", "wshld": "0",
-    }
-
-
 def read_command_state(
     client: Any,
     resolved_vehicle_id: str,
@@ -3771,22 +3790,24 @@ def read_command_state(
     status = client.get_vehicle_status(selected)
     captured_epoch = _status_capture_epoch(status)
     climate = attribute(status, "climate")
+    mode = climate_mode_from_status(climate)
     profile = climate_profile_from_status(climate)
-    state = bool_or_none(attribute(climate, "ac_switch"))
-    if state is None:
+    expected_mode = expected_climate_mode(command)
+    if mode == "unknown" or expected_mode is None:
         return {
             "matched": False,
             "evaluable": False,
             "state": "climate_unknown",
+            "climate_mode": mode,
             "climate_profile": profile,
             "captured_epoch": captured_epoch,
             "vehicles": available,
         }
-    expected = command != "climate_off"
     return {
-        "matched": state is expected,
+        "matched": mode == expected_mode,
         "evaluable": True,
-        "state": "climate_on" if state else "climate_off",
+        "state": "climate_" + mode,
+        "climate_mode": mode,
         "climate_profile": profile,
         "captured_epoch": captured_epoch,
         "vehicles": available,
@@ -4044,12 +4065,6 @@ def handle_command(
             resolved_id, vehicles, source = resolve_command_vehicle(client, vehicle_id, vehicle_vin)
         method_name = ALL_COMMAND_METHODS[command]
         selected_method = getattr(client, method_name, None)
-        if command == "climate_off":
-            # Prefer the explicit climate switch endpoint because it accepts a
-            # mode-aware close payload.  Keep ac_off as compatibility fallback.
-            mode_aware_method = getattr(client, "ac_switch", None)
-            if callable(mode_aware_method):
-                selected_method = mode_aware_method
         if not callable(selected_method):
             raise RuntimeError("A versão instalada da biblioteca não possui este comando.")
         if vehicles is not None and callable(getattr(client, "get_vehicle_list", None)):
@@ -4146,17 +4161,22 @@ def handle_command(
         is_climate_state_command = command in CLIMATE_VERIFY_COMMANDS
         can_safe_retry = command in SAFE_STATE_RETRY_COMMANDS
         if command == "climate_off":
-            profile_hint = str(parameters.get("climate_profile") or "").strip().lower()
-            active_climate_profile = profile_hint if profile_hint in {"cooling", "heating", "generic"} else "generic"
-            climate_dispatch_strategy = f"single_mode_aware_close_{active_climate_profile}"
+            climate_dispatch_strategy = "c10_ac_switch_off"
             report(
                 "preparing",
-                "Preparando um único encerramento da climatização sem leitura adicional da nuvem.",
-                {"climate_profile": active_climate_profile, "single_delivery": True},
+                "Preparando o desligamento completo da climatização pelo ac_switch do C10.",
+                {"single_delivery": True},
+            )
+        elif command == "climate_on":
+            climate_dispatch_strategy = "c10_auto_nohotcold"
+            report(
+                "preparing",
+                "Preparando a climatização em AUTO com o setpoint mais recente.",
+                {"single_delivery": True},
             )
         first_error = dispatch_once(
             "executing",
-            "Enviando encerramento compatível com o modo atual da climatização."
+            "Enviando o estado solicitado da climatização."
             if command == "climate_off" else
             "Enviando a ação diretamente ao veículo.",
             1,
@@ -4238,52 +4258,28 @@ def handle_command(
                         "state_evaluable": bool(initial_sample.get("evaluable")),
                     },
                 )
-                active_profile = str(initial_sample.get("climate_profile") or active_climate_profile or "generic")
-                explicit_close = getattr(client, "ac_switch", None) if command == "climate_off" else None
-                use_mode_aware_close = command == "climate_off" and callable(explicit_close)
-                # If the first close used a generic profile and the vehicle is
-                # still on, use the directional state from the fresh sample.
-                # When the cloud still reports generic, cooling is the safest
-                # alternate for the common C10 remote-climate path; every
-                # payload remains operate=close and cannot turn HVAC on.
-                retry_profile = active_profile
-                if use_mode_aware_close and retry_profile == active_climate_profile:
-                    retry_profile = "cooling" if active_profile == "generic" else "generic"
-                safe_retry_strategy = (
-                    f"alternate_mode_close_{retry_profile}" if use_mode_aware_close else "repeat_state_command"
-                )
+                safe_retry_strategy = "repeat_exact_state_command"
                 report(
                     "climate_dispatching",
-                    "Enviando um encerramento compatível com o modo ativo da climatização."
-                    if use_mode_aware_close else
-                    "Enviando a climatização uma segunda e última vez após o despertar.",
+                    "Repetindo uma segunda e última vez o mesmo estado de climatização.",
                     {
                         "safe_retry": True,
                         "attempt": 2,
                         "retry_strategy": safe_retry_strategy,
-                        "climate_profile": active_profile,
-                        "retry_profile": retry_profile if use_mode_aware_close else None,
                     },
                 )
                 command_attempts = 2
                 safe_retry_performed = True
                 retry_error: Exception | None = None
                 try:
-                    if use_mode_aware_close:
-                        result = timed_remote_call(
-                            explicit_close,
-                            resolved_vehicle_id,
-                            params=climate_close_parameters(retry_profile),
-                        )
-                    else:
-                        result = timed_remote_call(
-                            execute_vehicle_command,
-                            method,
-                            command,
-                            resolved_vehicle_id,
-                            parameters,
-                            active_climate_profile,
-                        )
+                    result = timed_remote_call(
+                        execute_vehicle_command,
+                        method,
+                        command,
+                        resolved_vehicle_id,
+                        parameters,
+                        active_climate_profile,
+                    )
                     command_dispatched = True
                     cloud_accepted = True
                 except Exception as exc:  # noqa: BLE001
@@ -4352,7 +4348,7 @@ def handle_command(
             message = (
                 "A nuvem recebeu o comando, mas uma leitura nova confirmou que a climatização continuou ligada."
                 if command == "climate_off" else
-                "A nuvem recebeu o comando, mas uma leitura nova confirmou que a climatização continuou desligada."
+                "A nuvem recebeu o comando, mas uma leitura nova confirmou que o modo de climatização solicitado não foi aplicado."
             )
         elif safe_retry_performed:
             message = "O veículo acordou e a climatização foi enviada na etapa pós-despertar. A telemetria continuará confirmando o estado."
@@ -4421,7 +4417,7 @@ def handle_command(
             "safe_retry_performed": safe_retry_performed,
             "safe_retry_strategy": safe_retry_strategy,
             "climate_dispatch_strategy": climate_dispatch_strategy,
-            "climate_profile_used": active_climate_profile if command == "climate_off" else None,
+            "climate_profile_used": None,
             "verification_state": verification_state,
             "verification_samples": verification_samples,
             "execution_warning": execution_warning,

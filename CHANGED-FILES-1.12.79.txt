@@ -1,0 +1,14 @@
+CHANGED-FILES-1.12.79.txt
+GITHUB-RECOVERY-1.12.79.md
+RELEASE-1.12.79.md
+leaphub_gateway/CHANGELOG.md
+leaphub_gateway/RELEASE-1.12.79.md
+leaphub_gateway/RELEASE_TARGET
+leaphub_gateway/connector.py
+leaphub_gateway/connector_server.py
+leaphub_gateway/gateway_manager.py
+leaphub_gateway/ocpp_gateway.py
+leaphub_gateway/privacy.py
+leaphub_gateway/telemetry_engine.py
+leaphub_gateway/tests/climate_c10_1_12_79_contract.py
+tests/test_remote_command_matrix.py

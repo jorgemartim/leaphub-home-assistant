@@ -53,7 +53,7 @@ mode_pos = connector.find('def climate_mode_from_status(')
 check(mode_pos >= 0, "climate_mode_from_status missing")
 mode_block = connector[mode_pos:mode_pos + 4200] if mode_pos >= 0 else ""
 pos_switch = mode_block.find('ac_switch')
-pos_mode = mode_block.find('climate_mode')
+pos_mode = mode_block.find('attribute(climate, "climate_mode")')
 pos_rapid = mode_block.find('rapid_cooling')
 check(pos_switch >= 0 and pos_mode >= 0 and pos_switch < pos_mode, "climate_on/off truth does not precede mode")
 check('if mode_number == 0:' in mode_block and 'return "auto"' in mode_block, "mode 0 != AUTO")

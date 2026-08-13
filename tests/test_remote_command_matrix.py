@@ -27,7 +27,7 @@ expected_methods = {
     # aceita, mas mandar o extremo com valor confundiria os dois papéis.
     "sunshade_position": "control_sunshade",
     "climate_on": "ac_on",
-    "climate_off": "ac_off",
+    "climate_off": "ac_switch",
     "quick_cool": "quick_cool",
     "quick_heat": "quick_heat",
     "windshield_defrost": "windshield_defrost",
