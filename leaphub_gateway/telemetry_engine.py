@@ -55,7 +55,7 @@ except ModuleNotFoundError:
         EVENT_TRANSPORT = _event_transport_module.EVENT_TRANSPORT
 
 LOG = logging.getLogger("leaphub.telemetry")
-ENGINE_VERSION = "1.12.81"  # contrato C10 AUTO/OFF coordenado com o site
+ENGINE_VERSION = "1.12.82"  # contrato C10 AUTO/OFF coordenado com o site
 
 # Hospedagem compartilhada (Apache/LiteSpeed) fecha a conexão ociosa em poucos
 # segundos. Reaproveitar depois disso escreve num socket já fechado e devolve
@@ -71,6 +71,13 @@ DELIVERY_IDLE_MAX_SECONDS = 30.0
 # somando ~5s. Sem teto, trava presa e leitura lenta são indistinguíveis e o
 # dono fica dois minutos olhando a tela sem resposta.
 ENGINE_LOCK_COMMAND_TIMEOUT_SECONDS = 20.0
+
+# 1.12.82 — uma leitura AUTOMÁTICA nunca pode manter a trava da conta por
+# dezenas de segundos enquanto o dono tenta enviar um comando. O cliente
+# persistente continua com o timeout configurado; somente chamadas feitas pela
+# telemetria emprestam este teto curto. O despacho manual continua usando
+# `_dispatch_timeout`, portanto esta proteção não encurta o comando do usuário.
+TELEMETRY_NETWORK_BLOCK_CEILING_SECONDS = 4.0
 
 # 1.12.78 — o anúncio do fim do comando é melhor esforço, e o teto é curto de
 # propósito. Ele existe para o site não esperar a próxima volta do cron; se
@@ -424,6 +431,11 @@ class TelemetryEngine:
         # atualização compatível com instalações antigas.
         self.slow_interval_seconds = max(600, min(1800, self.message_cache_seconds))
         self.request_timeout_seconds = self._bounded("telemetry_request_timeout_seconds", 15, 10, 30)
+        # Não altera a opção persistida nem o timeout de comandos. É apenas o
+        # teto de uma chamada de rede enquanto a telemetria possui a conta.
+        self.telemetry_network_timeout_seconds = min(
+            float(self.request_timeout_seconds), TELEMETRY_NETWORK_BLOCK_CEILING_SECONDS
+        )
         self._init_db()
         self.storage_healthy = True
         # 1.12.38 — a telemetria já aceita hints de um futuro transporte por
@@ -978,7 +990,12 @@ class TelemetryEngine:
         if account_id < 1:
             return {"managed": False, "account_id": 0, "cooldown": False, "retry_after_seconds": 0}
         now_epoch = time.time()
-        with self.lock, self._db() as db:
+        # 1.12.82 — consulta somente-leitura. WAL/SQLite já fornece snapshot
+        # consistente; segurar `self.lock` aqui fazia um comando esperar uma
+        # escrita/entrega de telemetria antes mesmo de tentar a trava da conta.
+        # Reservas e mutações de autenticação continuam usando BEGIN IMMEDIATE
+        # sob `self.lock` em begin_account_auth/record_*; só a leitura sai do lock.
+        with self._db() as db:
             row = db.execute(
                 "SELECT cooldown_until,attempt_guard_until,block_count,last_origin,last_error,last_attempt_at,last_success_at "
                 "FROM account_auth_state WHERE environment=? AND account_id=? LIMIT 1",
@@ -1385,7 +1402,11 @@ class TelemetryEngine:
                 # a mais de que o despacho precisa são emprestados só a ele, em
                 # `_dispatch_timeout`. A 1.12.70 elevava o cliente inteiro, e
                 # isso alongava a espera de quem manda o comando seguinte.
-                request_timeout_seconds=self.request_timeout_seconds,
+                request_timeout_seconds=(
+                    self.telemetry_network_timeout_seconds
+                    if origin == "telemetry"
+                    else self.request_timeout_seconds
+                ),
             )
             if manual_should_yield is not None and manual_should_yield():
                 raise TelemetryYieldForManual("Operação manual recebeu prioridade antes do login automático.")
@@ -1654,6 +1675,30 @@ class TelemetryEngine:
                 if connector.is_authentication_error(exc):
                     self._close_session_locked(subscription_id)
                 raise
+
+    @contextlib.contextmanager
+    def _telemetry_request_timeout(self, client: Any):
+        """Teto curto somente enquanto uma leitura automática possui a conta.
+
+        O mesmo cliente é reaproveitado por comandos e telemetria. Alterar o
+        timeout permanentemente faria o comando manual herdar um teto pequeno;
+        por isso o valor é emprestado e restaurado no `finally`.
+        """
+        previous = getattr(client, "timeout", None)
+        changed = False
+        if isinstance(previous, (int, float)) and not isinstance(previous, bool):
+            target = max(1.0, min(float(previous), float(self.telemetry_network_timeout_seconds)))
+            if target < float(previous):
+                client.timeout = target
+                changed = True
+        try:
+            yield
+        finally:
+            if changed:
+                try:
+                    client.timeout = previous
+                except Exception:
+                    pass
 
     @contextlib.contextmanager
     def _dispatch_timeout(self, client: Any):
@@ -3676,12 +3721,26 @@ class TelemetryEngine:
                 vehicles = cached_vehicles
             else:
                 try:
-                    vehicles_value = client.get_vehicle_list()
+                    with self._telemetry_request_timeout(client):
+                        vehicles_value = client.get_vehicle_list()
+                    if manual_should_yield is not None and manual_should_yield():
+                        raise TelemetryYieldForManual("Operação manual recebeu prioridade após a leitura da lista de veículos.")
                 except Exception as exc:  # noqa: BLE001
+                    if manual_should_yield is not None and manual_should_yield():
+                        raise TelemetryYieldForManual("Operação manual recebeu prioridade durante a leitura da lista de veículos.") from exc
                     if connector.is_session_expired_error(exc):
-                        if self._try_refresh_client_session(client):
+                        # Refresh da TELEMETRIA também é rede e também ocorre
+                        # enquanto a conta está reservada. Use o mesmo teto curto.
+                        with self._telemetry_request_timeout(client):
+                            refreshed = self._try_refresh_client_session(client)
+                        if manual_should_yield is not None and manual_should_yield():
+                            raise TelemetryYieldForManual("Operação manual recebeu prioridade durante o refresh da sessão.")
+                        if refreshed:
                             LOG.info("Sessão de %s renovada por refresh antes de considerar novo login.", subscription_id)
-                            vehicles_value = client.get_vehicle_list()
+                            if manual_should_yield is not None and manual_should_yield():
+                                raise TelemetryYieldForManual("Operação manual aguardando antes de repetir a lista de veículos.")
+                            with self._telemetry_request_timeout(client):
+                                vehicles_value = client.get_vehicle_list()
                         else:
                             self._close_session_locked(subscription_id)
                             raise connector.ConnectorSessionExpiredError(
@@ -3719,15 +3778,27 @@ class TelemetryEngine:
                     if manual_should_yield is not None and manual_should_yield():
                         raise TelemetryYieldForManual("Operação manual aguardando a conta.")
                     try:
-                        message_page = get_messages(page_no=1, page_size=100)
+                        with self._telemetry_request_timeout(client):
+                            message_page = get_messages(page_no=1, page_size=100)
+                        if manual_should_yield is not None and manual_should_yield():
+                            raise TelemetryYieldForManual("Operação manual recebeu prioridade após a leitura de mensagens.")
                         messages = list(connector.attribute(message_page, "messages", []) or [])
                         session["messages"] = messages
                         session["messages_cached_at"] = time.time()
                     except Exception as exc:  # noqa: BLE001
+                        if manual_should_yield is not None and manual_should_yield():
+                            raise TelemetryYieldForManual("Operação manual recebeu prioridade durante a leitura de mensagens.") from exc
                         if connector.is_session_expired_error(exc):
-                            if self._try_refresh_client_session(client):
+                            with self._telemetry_request_timeout(client):
+                                refreshed = self._try_refresh_client_session(client)
+                            if manual_should_yield is not None and manual_should_yield():
+                                raise TelemetryYieldForManual("Operação manual recebeu prioridade durante o refresh da sessão de mensagens.")
+                            if refreshed:
                                 LOG.info("Sessão de %s renovada por refresh durante a leitura de mensagens.", subscription_id)
-                                message_page = get_messages(page_no=1, page_size=100)
+                                if manual_should_yield is not None and manual_should_yield():
+                                    raise TelemetryYieldForManual("Operação manual aguardando antes de repetir a leitura de mensagens.")
+                                with self._telemetry_request_timeout(client):
+                                    message_page = get_messages(page_no=1, page_size=100)
                                 messages = list(connector.attribute(message_page, "messages", []) or [])
                                 session["messages"] = messages
                                 session["messages_cached_at"] = time.time()
@@ -3742,17 +3813,30 @@ class TelemetryEngine:
             for item in selected:
                 if manual_should_yield is not None and manual_should_yield():
                     raise TelemetryYieldForManual("Operação manual aguardando a conta.")
-                serialized.append(
-                    connector.serialize_vehicle(
-                        item,
-                        include_status=True,
-                        client=client,
-                        messages=messages,
-                        allow_unscoped_messages=len(selected) == 1,
-                        manual_should_yield=manual_should_yield,
-                        include_secondary_network=slow_cycle,
-                    )
-                )
+                try:
+                    # Principal chamada de status do carro. O teto curto vale só
+                    # durante esta coleta automática; ao sair do contexto o
+                    # cliente volta ao timeout normal e o comando manual pode
+                    # emprestar `_dispatch_timeout` como antes.
+                    with self._telemetry_request_timeout(client):
+                        serialized_item = connector.serialize_vehicle(
+                            item,
+                            include_status=True,
+                            client=client,
+                            messages=messages,
+                            allow_unscoped_messages=len(selected) == 1,
+                            manual_should_yield=manual_should_yield,
+                            include_secondary_network=slow_cycle,
+                        )
+                except Exception as exc:  # noqa: BLE001
+                    if manual_should_yield is not None and manual_should_yield():
+                        raise TelemetryYieldForManual(
+                            "Operação manual recebeu prioridade durante a leitura de status do veículo."
+                        ) from exc
+                    raise
+                if manual_should_yield is not None and manual_should_yield():
+                    raise TelemetryYieldForManual("Operação manual recebeu prioridade após a leitura de status do veículo.")
+                serialized.append(serialized_item)
             if not serialized:
                 raise RuntimeError("Nenhum veículo foi encontrado para esta conta.")
             session["last_used_at"] = time.time()

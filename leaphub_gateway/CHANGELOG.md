@@ -1,15 +1,12 @@
-## 1.12.81
+## 1.12.82
 
-Resposta rápida completa dos controles sem desfazer a correção física do C10.
+Prioridade manual real: telemetria não pode mais manter a conta ocupada por dezenas de segundos quando o proprietário envia um comando.
 
-A distribuição permanece pré-compilada no GHCR oficial e mantém a publicação em duas fases.
+A distribuição permanece pré-compilada no GHCR oficial e conserva a publicação em duas fases.
 
-- climate_off entra no ACK-first preservando `ac_switch` + `operate=off`;
-- a verificação protegida do OFF vira uma única leitura curta depois do ACK, sem laço síncrono adicional;
-- se a leitura ainda contradiz o OFF, a segunda e última transmissão repete exatamente o mesmo estado e também usa ACK-first;
-- depois da segunda transmissão a confirmação final fica com a telemetria FAST já existente;
-- lock, unlock, climate_on, quick_cool e quick_heat mantêm o ACK-first da 1.12.80;
-- o anúncio imediato Gateway -> Site da 1.12.78 permanece e agora registra no log se o atalho foi aceito;
-- nenhuma terceira transmissão, nenhum aumento de polling e nenhuma alteração de autenticação/sessão.
-
-Ver RELEASE-1.12.81.md.
+- leituras automáticas de rede recebem teto curto de 4s somente enquanto possuem a trava da conta; o timeout normal do cliente é restaurado imediatamente depois;
+- login criado especificamente pela telemetria também usa o teto curto, enquanto login/dispatch de comando continuam no orçamento normal;
+- se um comando manual aparecer durante uma leitura automática, o ciclo de telemetria cede a conta sem transformar essa preempção em falha de sessão;
+- a consulta somente-leitura de `account_auth_status` deixa de disputar o lock global do motor; reservas e mutações de autenticação continuam transacionais e protegidas;
+- ACK-first, clima AUTO e OFF C10, retry exato de no máximo duas transmissões e anúncio imediato ao site permanecem intactos;
+- nenhuma terceira transmissão e nenhum aumento de polling.
