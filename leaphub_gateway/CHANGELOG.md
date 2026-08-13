@@ -1,12 +1,13 @@
-## 1.12.82
+## 1.12.83
 
-Prioridade manual real: telemetria não pode mais manter a conta ocupada por dezenas de segundos quando o proprietário envia um comando.
+Fila de envio desacoplada da confirmação: o próximo comando de estado pode sair
+assim que a nuvem aceita a escrita, enquanto a telemetria confirma em segundo plano.
 
 A distribuição permanece pré-compilada no GHCR oficial e conserva a publicação em duas fases.
 
-- leituras automáticas de rede recebem teto curto de 4s somente enquanto possuem a trava da conta; o timeout normal do cliente é restaurado imediatamente depois;
-- login criado especificamente pela telemetria também usa o teto curto, enquanto login/dispatch de comando continuam no orçamento normal;
-- se um comando manual aparecer durante uma leitura automática, o ciclo de telemetria cede a conta sem transformar essa preempção em falha de sessão;
-- a consulta somente-leitura de `account_auth_status` deixa de disputar o lock global do motor; reservas e mutações de autenticação continuam transacionais e protegidas;
-- ACK-first, clima AUTO e OFF C10, retry exato de no máximo duas transmissões e anúncio imediato ao site permanecem intactos;
-- nenhuma terceira transmissão e nenhum aumento de polling.
+- ACK-first ampliado, de forma conservadora, para porta-malas, janelas e cortina;
+- confirmações antigas da mesma família são marcadas `superseded` quando uma intenção oposta posterior é registrada;
+- lock/unlock, clima AUTO/OFF e demais comandos rápidos da 1.12.82 permanecem inalterados;
+- rede secundária de imagem oficial deixa de rodar dentro da trava de conta da telemetria contínua; cache local continua permitido;
+- teto curto de rede automática da 1.12.82 permanece;
+- nenhuma terceira transmissão, nenhum aumento de polling e nenhuma mudança de autenticação.

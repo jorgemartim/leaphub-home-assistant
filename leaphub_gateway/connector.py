@@ -43,7 +43,7 @@ except ImportError:
         _privacy_spec.loader.exec_module(_privacy_module)
         sanitize_log = _privacy_module.sanitize_log
 
-CONNECTOR_VERSION = "1.12.82"
+CONNECTOR_VERSION = "1.12.83"
 MAX_INPUT_BYTES = 1024 * 1024
 logging.getLogger("leapmotor_api").setLevel(logging.WARNING)
 LOGGER = logging.getLogger("leaphub.connector")
@@ -64,7 +64,10 @@ SAFE_STATE_RETRY_COMMANDS = {"climate_on", "climate_off"}
 # aqui isso é redundante porque a confirmação física já é feita pela telemetria
 # FAST do Gateway. Na 1.12.81 climate_off entra na mesma estratégia,
 # preservando o ac_switch operate=off e o teto de duas transmissões exatas.
-ACK_FIRST_COMMANDS = {"lock", "unlock", "climate_on", "climate_off", "quick_cool", "quick_heat"}
+# 1.12.83 — porta-malas, janelas e cortina também são comandos de ESTADO
+# confirmáveis pela telemetria. Eles deixam de esperar o polling síncrono do
+# remoteCtlId, mas continuam sem qualquer retry físico adicional.
+ACK_FIRST_COMMANDS = {"lock", "unlock", "climate_on", "climate_off", "quick_cool", "quick_heat", "trunk_open", "trunk_close", "windows_open", "windows_close", "sunshade_open", "sunshade_close"}
 
 COMMAND_METHODS: dict[str, str] = {
     "lock": "lock_vehicle",
@@ -2073,6 +2076,7 @@ def _official_picture_package(
     remote_id: str,
     force_refresh: bool = False,
     manual_should_yield: Callable[[], bool] | None = None,
+    allow_network: bool = True,
 ) -> tuple[Any, str, Path] | None:
     cache_key = hashlib.sha256(remote_id.encode("utf-8", "ignore")).hexdigest()
     cached = _IMAGE_PACKAGE_CACHE.get(cache_key)
@@ -2096,7 +2100,11 @@ def _official_picture_package(
 
     picture_key: str | None = None
     raw: bytes | None = None
-    should_refresh = force_refresh or not package_file.is_file() or now - package_file.stat().st_mtime > 24 * 3600
+    # 1.12.83 — a telemetria FAST pode recompor a figura usando o pacote já
+    # salvo, mas nunca abre metadados/download de imagem enquanto possui a conta.
+    # O download binário usa timeout por inatividade, não prazo total, e foi o
+    # último caminho capaz de manter o account lock por dezenas de segundos.
+    should_refresh = bool(allow_network) and (force_refresh or not package_file.is_file() or now - package_file.stat().st_mtime > 24 * 3600)
     # 1.12.28 — imagem oficial é trabalho secundário. Se um comando manual
     # chegou depois de a leitura de status começar, não abra uma nova chamada
     # de rede para metadados/imagem: use o cache existente e libere a conta.
@@ -2190,6 +2198,7 @@ def official_visual_image_payload(
     force_debug_package: bool = False,
     force_package_refresh: bool = False,
     manual_should_yield: Callable[[], bool] | None = None,
+    allow_network: bool = True,
 ) -> dict[str, Any] | None:
     resolved = _official_picture_package(
         client,
@@ -2197,6 +2206,7 @@ def official_visual_image_payload(
         remote_id,
         force_refresh=force_package_refresh,
         manual_should_yield=manual_should_yield,
+        allow_network=allow_network,
     )
     if resolved is None:
         return None
@@ -2892,6 +2902,7 @@ def serialize_vehicle(
             force_debug_package=force_debug_package,
             force_package_refresh=force_package_refresh,
             manual_should_yield=manual_should_yield,
+            allow_network=include_secondary_network,
         )
         if official_image is not None and visual_signature:
             _IMAGE_LAST_SIGNATURE[visual_key] = visual_signature

@@ -55,7 +55,7 @@ except ModuleNotFoundError:
         EVENT_TRANSPORT = _event_transport_module.EVENT_TRANSPORT
 
 LOG = logging.getLogger("leaphub.telemetry")
-ENGINE_VERSION = "1.12.82"  # contrato C10 AUTO/OFF coordenado com o site
+ENGINE_VERSION = "1.12.83"  # prioridade manual + confirmações supersedidas
 
 # Hospedagem compartilhada (Apache/LiteSpeed) fecha a conexão ociosa em poucos
 # segundos. Reaproveitar depois disso escreve num socket já fechado e devolve
@@ -115,6 +115,26 @@ TELEMETRY_CONFIRMABLE_COMMANDS = frozenset({
     "stop_charging",
     "set_charge_limit",
 })
+
+# 1.12.83 — uma ação de estado mais nova torna semanticamente obsoleta a
+# espera oposta anterior. A telemetria não deve continuar por 180s tentando
+# confirmar LOCK depois de um UNLOCK posterior, nem OPEN depois de CLOSE.
+CONFIRMATION_SUPERSESSION_FAMILIES: dict[str, frozenset[str]] = {
+    "locks": frozenset({"lock", "unlock"}),
+    "climate": frozenset({"climate_on", "climate_off", "quick_cool", "quick_heat", "windshield_defrost"}),
+    "trunk": frozenset({"trunk_open", "trunk_close"}),
+    "windows": frozenset({"windows_open", "windows_close"}),
+    "sunshade": frozenset({"sunshade_open", "sunshade_close"}),
+    "charging": frozenset({"start_charging", "stop_charging"}),
+    "battery_preheat": frozenset({"battery_preheat_on", "battery_preheat_off"}),
+    "steering_heat": frozenset({"steering_wheel_heat_on", "steering_wheel_heat_off"}),
+    "mirror_heat": frozenset({"rearview_mirror_heat_on", "rearview_mirror_heat_off"}),
+}
+CONFIRMATION_SUPERSESSION_GROUP = {
+    command: family
+    for family, commands in CONFIRMATION_SUPERSESSION_FAMILIES.items()
+    for command in commands
+}
 
 
 def utc_iso() -> str:
@@ -2148,7 +2168,7 @@ class TelemetryEngine:
         subscription_id: str,
         command_key: str,
         vehicle_id: str,
-        request_id: str,
+        _request_id: str,
         now_epoch: float,
     ) -> sqlite3.Row | None:
         """Espera ativa que este boost deve estender em vez de duplicar.
@@ -2246,6 +2266,51 @@ class TelemetryEngine:
             tuple(parametros),
         ).fetchone()
 
+    def _supersede_pending_confirmations(
+        self,
+        db: sqlite3.Connection,
+        subscription_id: str,
+        command_key: str,
+        vehicle_id: str,
+        request_id: str,
+        now_epoch: float,
+        now_iso: str,
+    ) -> int:
+        """Encerra esperas antigas que a nova intenção tornou impossíveis.
+
+        Só atua dentro da mesma família e no mesmo veículo. Repetição do mesmo
+        request/comando continua sendo adotada por `_match_pending_confirmation`.
+        """
+        family = CONFIRMATION_SUPERSESSION_GROUP.get(command_key)
+        if not family:
+            return 0
+        commands = CONFIRMATION_SUPERSESSION_FAMILIES.get(family, frozenset())
+        opposites = sorted(item for item in commands if item != command_key)
+        if not opposites:
+            return 0
+        placeholders = ",".join("?" for _ in opposites)
+        sql = (
+            "UPDATE command_confirmations SET status='superseded',resolution=?,resolved_at=?,updated_at=? "
+            "WHERE subscription_id=? AND IFNULL(command_vehicle_id,'')=? AND status='pending' "
+            f"AND command_key IN ({placeholders})"
+        )
+        params: list[Any] = [
+            f"superseded_by:{command_key}",
+            now_epoch,
+            now_iso,
+            subscription_id,
+            vehicle_id,
+            *opposites,
+        ]
+        cursor = db.execute(sql, tuple(params))
+        count = max(0, int(cursor.rowcount or 0))
+        if count:
+            LOG.info(
+                "%s confirmação(ões) antiga(s) de %s foram supersedidas por %s em %s.",
+                count, family, command_key, subscription_id,
+            )
+        return count
+
     def _register_confirmation(
         self,
         db: sqlite3.Connection,
@@ -2258,6 +2323,9 @@ class TelemetryEngine:
         now_epoch: float,
         now_iso: str,
     ) -> tuple[str, bool]:
+        self._supersede_pending_confirmations(
+            db, subscription_id, command_key, vehicle_id, request_id, now_epoch, now_iso
+        )
         existing = self._match_pending_confirmation(
             db, subscription_id, command_key, vehicle_id, request_id, now_epoch
         )
@@ -3826,7 +3894,11 @@ class TelemetryEngine:
                             messages=messages,
                             allow_unscoped_messages=len(selected) == 1,
                             manual_should_yield=manual_should_yield,
-                            include_secondary_network=slow_cycle,
+                            # 1.12.83 — nunca abra metadados/download de imagem
+                            # dentro da trava da conta da telemetria contínua. O
+                            # pacote local ainda pode ser usado para recompor o
+                            # desenho; refresh remoto fica para sync explícito.
+                            include_secondary_network=False,
                         )
                 except Exception as exc:  # noqa: BLE001
                     if manual_should_yield is not None and manual_should_yield():
