@@ -1,0 +1,7 @@
+133016c8a02ba15974501f9a3020b14dbb2b51195643fa55791bf16ee5edf259  ./BASE-GIT-BLOBS.txt
+5928a2052b96e7be0d782b8508d816d9bf4acc6b7ce0f4b45ac12329be15f7ae  ./GATEWAY-1.12.79.patch
+febd0b4fd639f32f322ebdad5c61054aea7e1306c868473fafc5ee5addf25118  ./README.md
+31e21dee449a8ba7db6a63ce8f6295c52c2b01dff728962e3951ef5dab1c1ef5  ./RELEASE-1.12.79.md
+4bae18d046dae57df3beea91a71a2d44a014901a576deceb0ad2e536862f494c  ./leaphub_gateway/tests/__pycache__/climate_c10_1_12_79_contract.cpython-313.pyc
+0e757e379413f92be929b2d55651e082647d5d0efc1d92ff50c6895167f47a30  ./leaphub_gateway/tests/climate_c10_1_12_79_contract.py
+d312564f507a61a6dfa28b2d76ad218e77340c6b55f9f520300f00f3ffe77bc0  ./verificar-base.sh

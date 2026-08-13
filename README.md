@@ -1,56 +1,40 @@
-Repositório oficial do **Leap Hub Gateway** para Home Assistant OS.
+# Gateway 1.12.79 — pacote de revisão
 
-O App reúne em um único container:
+Este pacote **não publica nem instala automaticamente** o Gateway. Ele existe porque a integração de escrita do GitHub foi bloqueada nesta rodada antes de qualquer modificação remota.
 
-- Connector Leapmotor;
-- gateway OCPP Beta;
-- gateway OCPP Produção;
-- Cloudflare Tunnel;
-- painel de diagnóstico protegido pelo Ingress do Home Assistant.
+## Base obrigatória
 
-## Instalação rápida
+Aplique apenas sobre o repositório `jorgemartim/leaphub-home-assistant` cuja árvore corresponda aos Git blobs de `BASE-GIT-BLOBS.txt`.
 
-[![Adicionar repositório ao Home Assistant](https://my.home-assistant.io/badges/supervisor_store.svg)](https://my.home-assistant.io/redirect/supervisor_store/?repository_url=https%3A%2F%2Fgithub.com%2Fjorgemartim%2Fleaphub-home-assistant)
+Validação da base:
 
-Ou adicione manualmente este endereço na Loja de Apps:
-
-```text
-https://github.com/jorgemartim/leaphub-home-assistant
+```bash
+bash verificar-base.sh /caminho/do/leaphub-home-assistant
 ```
 
-Depois instale **Leap Hub Gateway**.
+Se qualquer arquivo aparecer como `DIVERGENTE`, **não aplique o patch**. Primeiro reconcilie a árvore real.
 
-## Instalação rápida e confiável
+## Revisão antes da aplicação
 
-As imagens são compiladas no GitHub Actions e publicadas no GitHub Container Registry. O Home Assistant baixa a imagem pronta, sem compilar Python, Alpine, Cloudflared ou dependências no equipamento do usuário.
+```bash
+cd /caminho/do/leaphub-home-assistant
+git apply --check /caminho/GATEWAY-1.12.79.patch
+```
 
-Arquiteturas disponíveis:
+Somente se o `--check` terminar sem erro:
 
-- `amd64` — notebooks, mini PCs e servidores x86-64;
-- `aarch64` será adicionado depois da validação da versão `amd64`.
+```bash
+git apply /caminho/GATEWAY-1.12.79.patch
+cp /caminho/leaphub_gateway/tests/climate_c10_1_12_79_contract.py leaphub_gateway/tests/
+python3 -m py_compile leaphub_gateway/connector.py
+python3 leaphub_gateway/tests/climate_c10_1_12_79_contract.py
+```
 
-## Documentação
+Depois disso, revise `git diff` e use o workflow existente do repositório para construir/publicar o add-on. Não copie o antigo ZIP de transformação para `leaphub_gateway/`.
 
-- [Instalação](./INSTALL.md)
-- [Documentação do App](./leaphub_gateway/DOCS.md)
-- [Migração dos Apps antigos](./leaphub_gateway/MIGRATION.md)
-- [Publicação de novas versões](./PUBLISHING.md)
-- [Segurança](./SECURITY.md)
-- [Changelog](./leaphub_gateway/CHANGELOG.md)
+## Ordem com o site
 
-## Endereços internos
-
-| Serviço | Porta interna | Origem do Cloudflare Tunnel |
-|---|---:|---|
-| Connector Leapmotor | 8094 | `http://local-leaphub-gateway:8094` |
-| OCPP Beta | 8092 | `http://local-leaphub-gateway:8092` |
-| OCPP Produção | 8093 | `http://local-leaphub-gateway:8093` |
-| Painel Ingress | 8099 | Não publicar |
-
-## Aviso
-
-Este projeto não é um produto oficial da Leapmotor, da Cloudflare ou do Home Assistant. Credenciais, chaves HMAC e tokens nunca devem ser enviados ao GitHub.
-
-## Teste de imagens por veículo
-
-Nas Configurações do Leap Hub, o administrador escolhe um ou mais veículos e solicita o pacote visual. O Gateway atualiza o pacote oficial, envia a composição e uma galeria sanitizada de camadas, sem VIN, token ou credenciais.
+1. Gateway 1.12.79 primeiro.
+2. Confirmar health e operação normal do Gateway.
+3. Site Beta 1.12.352 depois.
+4. Produção continua fora desta rodada.

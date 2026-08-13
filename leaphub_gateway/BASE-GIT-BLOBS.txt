@@ -1,0 +1,10 @@
+# Base esperada antes de aplicar GATEWAY-1.12.79.patch
+# Gerado a partir da leitura do main em 13/08/2026.
+175d86b42054adebc1f9466372126c3991fda8d4  leaphub_gateway/connector.py
+1f41801468c28f45a3e514eb4230235c9feef18a  leaphub_gateway/config.yaml
+7004420411c6e5841617e79f3b820d9662680b62  leaphub_gateway/connector_server.py
+e3e772a6b8b0218f7c815fff8f5f1b83e5aa4c10  leaphub_gateway/telemetry_engine.py
+a8a6731b784dea7e22134ff12b6a294f7c42cad3  leaphub_gateway/gateway_manager.py
+87868e466601f3f81ab5994dfc9fa00b11ba17ff  leaphub_gateway/ocpp_gateway.py
+50454245a1d3b5187f115f5406d323e100693721  leaphub_gateway/privacy.py
+64e86fd394920dc84181856a1b918e7d888d2c6e  leaphub_gateway/RELEASE_TARGET
