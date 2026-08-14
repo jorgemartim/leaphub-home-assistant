@@ -20,10 +20,14 @@ target = (
 
 
 def test_gateway_1_12_87_restores_known_good_runtime():
-    assert target == "1.12.87"
+    # Este contrato nasceu na 1.12.87 para impedir o retorno das
+    # regressões 1.12.85/1.12.86. Ele protege os invariantes da base
+    # conhecida, sem congelar RELEASE_TARGET para sempre em 1.12.87.
+    target_parts = tuple(int(part) for part in target.split("."))
+    assert target_parts >= (1, 12, 87)
 
-    assert 'CONNECTOR_VERSION = "1.12.87"' in connector
-    assert 'ENGINE_VERSION = "1.12.87"' in telemetry
+    assert f'CONNECTOR_VERSION = "{target}"' in connector
+    assert f'ENGINE_VERSION = "{target}"' in telemetry
 
     # Caminho conhecido da 1.12.84.
     assert "TELEMETRY_NETWORK_BLOCK_CEILING_SECONDS = 4.0" in telemetry

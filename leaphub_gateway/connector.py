@@ -43,7 +43,7 @@ except ImportError:
         _privacy_spec.loader.exec_module(_privacy_module)
         sanitize_log = _privacy_module.sanitize_log
 
-CONNECTOR_VERSION = "1.12.87"
+CONNECTOR_VERSION = "1.12.88"
 MAX_INPUT_BYTES = 1024 * 1024
 logging.getLogger("leapmotor_api").setLevel(logging.WARNING)
 LOGGER = logging.getLogger("leaphub.connector")
@@ -2297,6 +2297,7 @@ def serialize_vehicle(
     force_package_refresh: bool = False,
     manual_should_yield: Callable[[], bool] | None = None,
     include_secondary_network: bool = True,
+    status_override: Any | None = None,
 ) -> dict[str, Any]:
     vin = str(attribute(vehicle, "vin", "") or "").strip()
     remote_id = str(attribute(vehicle, "car_id", "") or vin).strip()
@@ -2373,7 +2374,10 @@ def serialize_vehicle(
     if not include_status:
         return result
 
-    status = client.get_vehicle_status(vehicle)
+    # 1.12.88 — a telemetria pode fornecer o VehicleStatus já obtido
+    # por uma chamada one-shot controlada. Todos os demais chamadores
+    # continuam usando o método público exatamente como antes.
+    status = status_override if status_override is not None else client.get_vehicle_status(vehicle)
     result["maintenance"] = serialize_maintenance(vehicle, status, messages or [], allow_unscoped_messages)
     battery = attribute(status, "battery")
     driving = attribute(status, "driving")

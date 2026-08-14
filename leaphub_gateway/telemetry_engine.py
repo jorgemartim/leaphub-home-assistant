@@ -55,7 +55,7 @@ except ModuleNotFoundError:
         EVENT_TRANSPORT = _event_transport_module.EVENT_TRANSPORT
 
 LOG = logging.getLogger("leaphub.telemetry")
-ENGINE_VERSION = "1.12.87"  # prioridade manual + confirmações supersedidas
+ENGINE_VERSION = "1.12.88"  # cooperative status handoff
 
 # Hospedagem compartilhada (Apache/LiteSpeed) fecha a conexão ociosa em poucos
 # segundos. Reaproveitar depois disso escreve num socket já fechado e devolve
@@ -3761,6 +3761,82 @@ class TelemetryEngine:
                 allow_slow_network=allow_slow_network,
             )
 
+    def _telemetry_status_one_shot(
+        self,
+        subscription_id: str,
+        client: Any,
+        vehicle: Any,
+        manual_should_yield: Callable[[], bool] | None = None,
+    ) -> Any:
+        # 1.12.88 — leitura de status cooperativa sem retry invisível.
+        # O mesmo LeapmotorApiClient persistente continua protegido pelas
+        # travas existentes. Não há segundo cliente nem uso concorrente.
+
+        def yield_for_manual(moment: str) -> None:
+            if manual_should_yield is not None and manual_should_yield():
+                raise TelemetryYieldForManual(
+                    f"Operação manual recebeu prioridade {moment} da leitura de status."
+                )
+
+        yield_for_manual("antes")
+
+        if hasattr(client, "token") and not getattr(client, "token", None):
+            self._close_session_locked(subscription_id)
+            raise connector.ConnectorSessionExpiredError(
+                "Sessão Leapmotor sem token; nova autenticação será feita no próximo ciclo protegido."
+            )
+
+        method = getattr(client, "_get_vehicle_status", None)
+        if not callable(method):
+            raise connector.ConnectorTemporaryError(
+                "A versão fixada de leapmotor-api não expõe _get_vehicle_status; "
+                "a telemetria recusou fallback para retry invisível."
+            )
+
+        def call_once() -> Any:
+            with self._telemetry_request_timeout(client):
+                return method(vehicle)
+
+        try:
+            value = call_once()
+        except Exception as exc:  # noqa: BLE001
+            yield_for_manual("depois da primeira tentativa")
+            if not connector.is_session_expired_error(exc):
+                raise
+
+            yield_for_manual("antes do refresh")
+            with self._telemetry_request_timeout(client):
+                refreshed = self._try_refresh_client_session(client)
+            yield_for_manual("depois do refresh")
+
+            if not refreshed:
+                self._close_session_locked(subscription_id)
+                raise connector.ConnectorSessionExpiredError(
+                    "Refresh único não recuperou a sessão; a reconexão ficará para o próximo ciclo protegido."
+                ) from exc
+
+            LOG.info(
+                "Sessão de %s renovada por refresh cooperativo durante status; "
+                "uma única releitura será feita se não houver comando manual.",
+                subscription_id,
+            )
+
+            yield_for_manual("antes da releitura")
+            try:
+                value = call_once()
+            except Exception as retry_exc:  # noqa: BLE001
+                yield_for_manual("depois da releitura")
+                if connector.is_session_expired_error(retry_exc):
+                    self._close_session_locked(subscription_id)
+                    raise connector.ConnectorSessionExpiredError(
+                        "Sessão continuou expirada após um refresh e uma releitura; "
+                        "não haverá terceira chamada neste ciclo."
+                    ) from retry_exc
+                raise
+
+        yield_for_manual("depois")
+        return value
+
     def _collect_with_session_locked(
         self,
         subscription_id: str,
@@ -3912,11 +3988,20 @@ class TelemetryEngine:
                 if manual_should_yield is not None and manual_should_yield():
                     raise TelemetryYieldForManual("Operação manual aguardando a conta.")
                 try:
-                    # Principal chamada de status do carro. O teto curto vale só
-                    # durante esta coleta automática; ao sair do contexto o
-                    # cliente volta ao timeout normal e o comando manual pode
-                    # emprestar `_dispatch_timeout` como antes.
-                    with self._telemetry_request_timeout(client):
+                    private_status = getattr(client, "_get_vehicle_status", None)
+                    client_module = str(getattr(type(client), "__module__", "") or "")
+                    official_leapmotor_client = (
+                        client_module == "leapmotor_api"
+                        or client_module.startswith("leapmotor_api.")
+                    )
+
+                    if callable(private_status):
+                        status_value = self._telemetry_status_one_shot(
+                            subscription_id,
+                            client,
+                            item,
+                            manual_should_yield=manual_should_yield,
+                        )
                         serialized_item = connector.serialize_vehicle(
                             item,
                             include_status=True,
@@ -3924,24 +4009,36 @@ class TelemetryEngine:
                             messages=messages,
                             allow_unscoped_messages=len(selected) == 1,
                             manual_should_yield=manual_should_yield,
-                            # 1.12.84 — nunca abra metadados/download de imagem
-                            # dentro da trava da conta da telemetria contínua. O
-                            # pacote local ainda pode ser usado para recompor o
-                            # desenho; refresh remoto fica para sync explícito.
-                            # Compatibilidade com o contrato histórico 1.12.29:
-                            # include_secondary_network=slow_cycle
-                            # A rede secundária continua deliberadamente fora
-                            # da trava da conta na telemetria contínua.
+                            include_secondary_network=False,
+                            status_override=status_value,
+                        )
+                    elif official_leapmotor_client:
+                        raise connector.ConnectorTemporaryError(
+                            "Cliente Leapmotor real sem _get_vehicle_status; "
+                            "telemetria recusou fallback para retry invisivel."
+                        )
+                    else:
+                        serialized_item = connector.serialize_vehicle(
+                            item,
+                            include_status=True,
+                            client=client,
+                            messages=messages,
+                            allow_unscoped_messages=len(selected) == 1,
+                            manual_should_yield=manual_should_yield,
                             include_secondary_network=False,
                         )
+                except TelemetryYieldForManual:
+                    raise
                 except Exception as exc:  # noqa: BLE001
                     if manual_should_yield is not None and manual_should_yield():
                         raise TelemetryYieldForManual(
-                            "Operação manual recebeu prioridade durante a leitura de status do veículo."
+                            "Operação manual recebeu prioridade durante a leitura/serialização de status do veículo."
                         ) from exc
                     raise
                 if manual_should_yield is not None and manual_should_yield():
-                    raise TelemetryYieldForManual("Operação manual recebeu prioridade após a leitura de status do veículo.")
+                    raise TelemetryYieldForManual(
+                        "Operação manual recebeu prioridade após a leitura de status do veículo."
+                    )
                 serialized.append(serialized_item)
             if not serialized:
                 raise RuntimeError("Nenhum veículo foi encontrado para esta conta.")

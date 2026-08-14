@@ -61,7 +61,10 @@ def test_fast_slow_profiles_and_health_are_wired() -> None:
     assert f'CONNECTOR_VERSION = "{_RELEASE_TARGET}"' in CONNECTOR
     assert f'VERSION = "{_RELEASE_TARGET}"' in SERVER
     assert '"collection_profile": "slow" if slow_cycle else "fast"' in TELEMETRY
-    assert 'include_secondary_network=slow_cycle' in TELEMETRY
+    # Desde 1.12.84, rede secundaria nunca roda dentro da trava
+    # da conta da telemetria continua. O perfil slow permanece
+    # identificado, mas imagem/metadados remotos ficam fora do lock.
+    assert 'include_secondary_network=False' in TELEMETRY
     assert 'ORCHESTRATOR.is_degraded(environment)' in TELEMETRY
     assert '"connection_orchestrator": ORCHESTRATOR.snapshot(environment)' in SERVER
     assert 'connection_orchestrator.py' in DOCKER
