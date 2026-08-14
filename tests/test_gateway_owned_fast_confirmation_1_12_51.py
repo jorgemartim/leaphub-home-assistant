@@ -69,7 +69,18 @@ def command_payload(request_id: str = "request-fast-confirmation-150") -> dict:
     }
 
 
+def wait_for_async_confirmation_arm(engine, timeout: float = 2.0) -> None:
+    """Barrier de teste: espera apenas jobs FIFO ja enfileirados pelo Gateway."""
+    pool = getattr(engine, "_confirmation_arm_pool", None)
+    assert pool is not None
+    pool.submit(lambda: None).result(timeout=timeout)
+
+
 def close_engine(engine) -> None:
+    pool = getattr(engine, "_confirmation_arm_pool", None)
+    engine._confirmation_arm_pool = None
+    if pool is not None:
+        pool.shutdown(wait=True, cancel_futures=False)
     engine.sessions.clear()
     engine.close_storage()
     if engine._instance_lock_handle is not None:
@@ -105,6 +116,7 @@ def test_command_completion_arms_fast_without_site_poll() -> None:
         engine.record_account_auth_success = lambda *_args, **_kwargs: None
         try:
             result = engine.execute_command("staging", command_payload())
+            wait_for_async_confirmation_arm(engine)
             with engine.lock, engine._db() as db:
                 row = db.execute(
                     "SELECT command_key,command_vehicle_id,command_context_json,"
