@@ -1,4 +1,13 @@
-# Contract updated by Gateway 1.12.86.
+"""Contrato 1.12.55 — `engine_precheck_ms` precisa ser quebrável e ter teto.
+
+Um comando de campo mediu `precheck_motor=135718ms` com todas as demais fases
+somando ~5s (`dispatch=4199ms`, `handle_command=5219ms`, `nao_atribuido=1ms`).
+A 1.12.54 nomeou o balde; ele cobre tres coisas distintas e a aquisicao da trava
+global do motor era a unica do arquivo sem limite de espera. Sem quebrar e sem
+teto, a proxima investigacao vira palpite outra vez e o dono continua olhando a
+tela por dois minutos.
+"""
+
 from __future__ import annotations
 
 import ast
@@ -17,6 +26,7 @@ SUBPHASES = ("auth_status_ms", "engine_lock_wait_ms", "subscription_read_ms")
 
 
 def execute_command_body() -> str:
+    """Corpo de `execute_command`, onde a janela do precheck vive."""
     tree = ast.parse(ENGINE)
     for node in ast.walk(tree):
         if isinstance(node, ast.FunctionDef) and node.name == "execute_command":
@@ -29,34 +39,46 @@ def test_engine_publishes_the_three_subphases():
         assert f'phase["{field}"] = {field}' in ENGINE, field
 
 
-def test_auth_status_is_measured_before_subscription_read():
+def test_auth_status_is_measured_before_the_lock():
+    """Se o status vier depois, a fase mede menos do que existe."""
     started = ENGINE.index("engine_started = time.monotonic()")
     auth = ENGINE.index("auth_status_ms = int(round((time.monotonic() - engine_started) * 1000))")
-    read_started = ENGINE.index("subscription_read_started = time.monotonic()", auth)
-    assert started < auth < read_started
+    lock = ENGINE.index("engine_lock_started = time.monotonic()")
+    assert started < auth < lock
 
 
-def test_command_subscription_lookup_is_lock_free():
+def test_engine_lock_acquisition_is_bounded():
+    """O defeito de campo: `with self.lock` sem timeout no caminho do comando."""
     body = execute_command_body()
-    start = body.index("subscription_read_started = time.monotonic()")
-    end = body.index("if row is None:", start)
-    lookup = body[start:end]
-    assert "with self._db() as db:" in lookup
-    assert "self.lock.acquire" not in lookup
-    assert "self.lock.release" not in lookup
-    assert "with self.lock" not in lookup
+    assert "with self.lock" not in body, "a aquisicao voltou a ser sem teto"
+    assert "self.lock.acquire(timeout=ENGINE_LOCK_COMMAND_TIMEOUT_SECONDS)" in body
 
 
-def test_engine_lock_metric_is_retained_as_zero():
+def test_engine_lock_is_released_even_on_failure():
+    """Perder a trava trava o motor inteiro para sempre."""
     body = execute_command_body()
-    assert "engine_lock_wait_ms = 0" in body
-    assert 'phase["engine_lock_wait_ms"] = engine_lock_wait_ms' in body
+    assert "finally:\n            self.lock.release()" in body
 
 
-def test_historical_timeout_constant_remains_sane_for_compatibility():
+def test_timeout_constant_is_sane():
     match = re.search(r"^ENGINE_LOCK_COMMAND_TIMEOUT_SECONDS = ([0-9.]+)$", ENGINE, re.MULTILINE)
-    assert match
+    assert match, "constante do teto ausente"
+    # Curto o bastante para o dono nao esperar, longo o bastante para nao
+    # recusar comando por contencao normal de SQLite.
     assert 5.0 <= float(match.group(1)) <= 30.0
+
+
+def test_timeout_failure_is_temporary_and_did_not_reach_the_vehicle():
+    """503 + temporary faz o site manter na fila; o dispatch vem bem depois."""
+    body = execute_command_body()
+    assert "raise connector.ConnectorTemporaryError(" in body
+    assert "O comando não foi enviado ao veículo e continua na fila." in body
+    # O tipo precisa continuar mapeado para 503 temporario no servidor.
+    assert "except connector.ConnectorTemporaryError as exc:" in SERVER
+    temporary_branch = SERVER[SERVER.index("except connector.ConnectorTemporaryError as exc:"):]
+    temporary_branch = temporary_branch[: temporary_branch.index("except connector.ConnectorAuthenticationError")]
+    assert "self.send_json(503, {" in temporary_branch
+    assert '"temporary": True,' in temporary_branch
 
 
 def test_subphases_reach_the_server_latency():
@@ -65,6 +87,7 @@ def test_subphases_reach_the_server_latency():
 
 
 def test_subphases_do_not_double_count_in_unaccounted():
+    """As tres vivem DENTRO de engine_precheck_ms."""
     unaccounted = SERVER[SERVER.index('"unaccounted_ms": max(0,'):]
     unaccounted = unaccounted[: unaccounted.index("))")]
     for field in SUBPHASES:
@@ -77,6 +100,7 @@ def test_subphases_reach_the_log_line():
 
 
 def test_log_line_placeholders_match_its_arguments():
+    """Um %s a mais derruba o log do comando em producao."""
     tree = ast.parse(SERVER)
     checked = 0
     for node in ast.walk(tree):
@@ -89,7 +113,7 @@ def test_log_line_placeholders_match_its_arguments():
             continue
         checked += 1
         assert first.value.count("%s") == len(node.args) - 1
-    assert checked == 1
+    assert checked == 1, "a linha de log do comando remoto sumiu ou duplicou"
 
 
 def test_version_follows_the_release():
