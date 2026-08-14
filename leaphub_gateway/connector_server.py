@@ -65,7 +65,7 @@ except ModuleNotFoundError:
         _event_transport_spec.loader.exec_module(_event_transport_module)
         EVENT_TRANSPORT = _event_transport_module.EVENT_TRANSPORT
 
-VERSION = "1.12.85"
+VERSION = "1.12.86"
 API_VERSION = 2
 CAPABILITY_SCHEMA_VERSION = 1
 MIN_SUPPORTED_CLIENT_API_VERSION = 1
@@ -607,9 +607,9 @@ def command_journal_wait_auth(request_hash: str | None, request_id: str, retry_a
         LOG.warning("Não foi possível persistir a espera de autenticação: %s", exc)
 
 
-def command_journal_fail(request_hash: str | None, request_id: str, exc: BaseException) -> None:
+def command_journal_fail(request_hash: str | None, request_id: str, exc: BaseException) -> dict[str, Any] | None:
     if not request_hash:
-        return
+        return None
     message = connector.clean_message(str(exc))
     temporary = isinstance(exc, connector.ConnectorTemporaryError) or connector.is_transient_cloud_error(exc)
     response = {
@@ -634,6 +634,7 @@ def command_journal_fail(request_hash: str | None, request_id: str, exc: BaseExc
             db.commit()
     except (OSError, sqlite3.Error) as db_exc:
         LOG.warning("Não foi possível registrar a falha do comando: %s", db_exc)
+    return response
 
 
 def command_journal_status(environment: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -1121,7 +1122,11 @@ def run_command_job(
     except BaseException as exc:  # noqa: BLE001
         if connector.is_transient_cloud_error(exc) or isinstance(exc, connector.ConnectorTemporaryError):
             ORCHESTRATOR.record_cloud_failure(environment, payload.get("account_id") or payload.get("vehicle_id"))
-        command_journal_fail(request_hash, request_id, exc)
+        announce_command_result_async(
+            environment,
+            request_id,
+            command_journal_fail(request_hash, request_id, exc),
+        )
         defer_seconds = 3
         LOG.warning("Comando remoto em segundo plano falhou (%s): %s", type(exc).__name__, connector.clean_message(str(exc)))
     finally:

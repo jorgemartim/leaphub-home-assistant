@@ -55,7 +55,7 @@ except ModuleNotFoundError:
         EVENT_TRANSPORT = _event_transport_module.EVENT_TRANSPORT
 
 LOG = logging.getLogger("leaphub.telemetry")
-ENGINE_VERSION = "1.12.85"  # prioridade manual + confirmações supersedidas
+ENGINE_VERSION = "1.12.86"  # prioridade manual + confirmações supersedidas
 
 # Hospedagem compartilhada (Apache/LiteSpeed) fecha a conexão ociosa em poucos
 # segundos. Reaproveitar depois disso escreve num socket já fechado e devolve
@@ -78,6 +78,12 @@ ENGINE_LOCK_COMMAND_TIMEOUT_SECONDS = 20.0
 # telemetria emprestam este teto curto. O despacho manual continua usando
 # `_dispatch_timeout`, portanto esta proteção não encurta o comando do usuário.
 TELEMETRY_NETWORK_BLOCK_CEILING_SECONDS = 4.0
+
+# 1.12.86 — a telemetria já possui a trava da conta quando entra no lock
+# da sessão. Se outro caminho ainda estiver finalizando essa sessão, uma
+# espera sem teto prende a conta e faz o próximo comando aguardar dezenas
+# de segundos. O loop abaixo verifica prioridade manual a cada 250 ms.
+TELEMETRY_SESSION_LOCK_WAIT_CEILING_SECONDS = 5.0
 
 # 1.12.78 — o anúncio do fim do comando é melhor esforço, e o teto é curto de
 # propósito. Ele existe para o site não esperar a próxima volta do cron; se
@@ -1573,24 +1579,18 @@ class TelemetryEngine:
         # o comando falha rápido como transitório (503, `temporary: true`), o
         # site o mantém na fila e nenhuma ação física chega ao veículo — o
         # dispatch acontece bem depois deste ponto.
-        engine_lock_started = time.monotonic()
-        if not self.lock.acquire(timeout=ENGINE_LOCK_COMMAND_TIMEOUT_SECONDS):
-            raise connector.ConnectorTemporaryError(
-                "O Gateway estava ocupado com outra leitura e não liberou o motor a tempo. "
-                "O comando não foi enviado ao veículo e continua na fila."
-            )
-        engine_lock_wait_ms = int(round((time.monotonic() - engine_lock_started) * 1000))
+        # 1.12.86 — este SELECT é somente leitura e a base já opera em WAL.
+        # Esperar o lock global aqui produziu 11–20 s de `trava_motor` mesmo
+        # depois de a conta estar livre. O diagnóstico continua expondo o campo,
+        # agora zerado, para não quebrar consumidores de métricas.
+        engine_lock_wait_ms = 0
         subscription_read_started = time.monotonic()
-        try:
-            with self._db() as db:
-                row = db.execute(
-                    "SELECT subscription_id,cooldown_until,status FROM subscriptions "
-                    "WHERE environment=? AND account_id=? AND enabled=1 "
-                    "ORDER BY updated_at DESC LIMIT 1",
-                    (str(environment or ""), account_id),
-                ).fetchone()
-        finally:
-            self.lock.release()
+        with self._db() as db:
+            row = db.execute(
+                "SELECT subscription_id,cooldown_until,status FROM subscriptions "
+                "WHERE environment=? AND account_id=? AND enabled=1 ORDER BY updated_at DESC LIMIT 1",
+                (environment, account_id),
+            ).fetchone()
         subscription_read_ms = int(round((time.monotonic() - subscription_read_started) * 1000))
         if row is None:
             return self._execute_isolated_command(environment, payload, account_id, progress)
@@ -3463,7 +3463,11 @@ class TelemetryEngine:
             if not transient or failures >= 3:
                 self._close_session(sid)
             if isinstance(exc, connector.ConnectorSessionExpiredError):
-                delay = 20
+                # 1.12.86 — em confirmação de comando, a 1.12.85 podia ficar
+                # 20s sem nova amostra depois de uma expiração one-shot.
+                # Reconecta cedo FORA da leitura atual; qualquer novo manual
+                # continua preemptando antes do login.
+                delay = 3 if command_mode else 20
                 self._reschedule(
                     sid,
                     delay,
@@ -3471,7 +3475,12 @@ class TelemetryEngine:
                     "Sessão expirada; uma única reconexão protegida foi agendada.",
                     failed=False,
                 )
-                LOG.info("Sessão de %s expirou; uma reconexão coordenada ocorrerá em %ss.", sid, delay)
+                LOG.info(
+                    "Sessão de %s expirou; reconexão coordenada em %ss (%s).",
+                    sid,
+                    delay,
+                    "confirmacao" if command_mode else "telemetria",
+                )
                 return
             if isinstance(exc, connector.ConnectorLoginCooldownError):
                 delay = max(30, min(self.login_cooldown_max_seconds, int(exc.retry_after_seconds or 300)))
@@ -3784,9 +3793,22 @@ class TelemetryEngine:
         allow_slow_network: bool = True,
     ) -> dict[str, Any]:
         # Somente a sessão desta conta fica bloqueada durante a chamada de rede.
-        # Outras contas respeitam o limite global do Connector, mas não ficam
-        # paradas atrás de uma autenticação lenta ou de um veículo offline.
-        with self._session_operation_lock(subscription_id):
+        # 1.12.86 — como o poller já possui a trava da conta neste ponto, nunca
+        # espere indefinidamente por este lock interno. Se um comando manual
+        # chegar, ceda em até 250 ms; sem comando, um lock interno anormalmente
+        # longo vira falha temporária e a conta é liberada pelo finally externo.
+        session_lock = self._session_operation_lock(subscription_id)
+        session_lock_deadline = time.monotonic() + TELEMETRY_SESSION_LOCK_WAIT_CEILING_SECONDS
+        if manual_should_yield is not None and manual_should_yield():
+            raise TelemetryYieldForManual("Operação manual aguardando antes da trava da sessão.")
+        while not session_lock.acquire(timeout=0.25):
+            if manual_should_yield is not None and manual_should_yield():
+                raise TelemetryYieldForManual("Operação manual recebeu prioridade enquanto a sessão estava ocupada.")
+            if time.monotonic() >= session_lock_deadline:
+                raise connector.ConnectorTemporaryError(
+                    "A sessão interna permaneceu ocupada; a telemetria liberou a conta sem iniciar outra leitura."
+                )
+        try:
             return self._collect_with_session_locked(
                 subscription_id,
                 environment,
@@ -3797,6 +3819,8 @@ class TelemetryEngine:
                 manual_should_yield=manual_should_yield,
                 allow_slow_network=allow_slow_network,
             )
+        finally:
+            session_lock.release()
 
     def _collect_with_session_locked(
         self,
@@ -3950,40 +3974,78 @@ class TelemetryEngine:
                         else:
                             messages = cached_messages
             serialized: list[dict[str, Any]] = []
+
+            def serialize_status_one_shot(item: Any) -> dict[str, Any]:
+                # Uma leitura física de status, sem retry/login escondido na biblioteca.
+                with self._telemetry_request_timeout(client):
+                    return connector.serialize_vehicle(
+                        item,
+                        include_status=True,
+                        client=telemetry_client,
+                        messages=messages,
+                        allow_unscoped_messages=len(selected) == 1,
+                        manual_should_yield=manual_should_yield,
+                        include_secondary_network=False,
+                    )
+
             for item in selected:
                 if manual_should_yield is not None and manual_should_yield():
                     raise TelemetryYieldForManual("Operação manual aguardando a conta.")
                 try:
-                    # Principal chamada de status do carro. O teto curto vale só
-                    # durante esta coleta automática; ao sair do contexto o
-                    # cliente volta ao timeout normal e o comando manual pode
-                    # emprestar `_dispatch_timeout` como antes.
-                    with self._telemetry_request_timeout(client):
-                        serialized_item = connector.serialize_vehicle(
-                            item,
-                            include_status=True,
-                            client=telemetry_client,
-                            messages=messages,
-                            allow_unscoped_messages=len(selected) == 1,
-                            manual_should_yield=manual_should_yield,
-                            # 1.12.84 — nunca abra metadados/download de imagem
-                            # dentro da trava da conta da telemetria contínua. O
-                            # pacote local ainda pode ser usado para recompor o
-                            # desenho; refresh remoto fica para sync explícito.
-                            # Compatibilidade com o contrato histórico 1.12.29:
-                            # include_secondary_network=slow_cycle
-                            # A rede secundária continua deliberadamente fora
-                            # da trava da conta na telemetria contínua.
-                            include_secondary_network=False,
-                        )
+                    serialized_item = serialize_status_one_shot(item)
                 except Exception as exc:  # noqa: BLE001
+                    # 1.12.86 — a 1.12.85 tornou o status one-shot, mas esqueceu
+                    # de reproduzir de forma COOPERATIVA o refresh que o wrapper
+                    # público fazia. Agora: status -> refresh -> um único status,
+                    # sempre com ponto de entrega ao manual entre as etapas.
                     if manual_should_yield is not None and manual_should_yield():
                         raise TelemetryYieldForManual(
                             "Operação manual recebeu prioridade durante a leitura de status do veículo."
                         ) from exc
-                    raise
+                    if not connector.is_session_expired_error(exc):
+                        raise
+
+                    with self._telemetry_request_timeout(client):
+                        refreshed = self._try_refresh_client_session(client)
+
+                    if manual_should_yield is not None and manual_should_yield():
+                        raise TelemetryYieldForManual(
+                            "Operação manual recebeu prioridade após o refresh do status."
+                        ) from exc
+
+                    if not refreshed:
+                        self._close_session_locked(subscription_id)
+                        raise connector.ConnectorSessionExpiredError(
+                            "A sessão expirou durante a confirmação; uma reconexão coordenada será feita fora desta leitura."
+                        ) from exc
+
+                    LOG.info(
+                        "Sessão de %s renovada por refresh durante status; repetindo uma única leitura one-shot.",
+                        subscription_id,
+                    )
+                    if manual_should_yield is not None and manual_should_yield():
+                        raise TelemetryYieldForManual(
+                            "Operação manual aguardando antes da única releitura de status."
+                        ) from exc
+
+                    try:
+                        serialized_item = serialize_status_one_shot(item)
+                    except Exception as retry_exc:  # noqa: BLE001
+                        if manual_should_yield is not None and manual_should_yield():
+                            raise TelemetryYieldForManual(
+                                "Operação manual recebeu prioridade durante a releitura de status."
+                            ) from retry_exc
+                        if connector.is_session_expired_error(retry_exc):
+                            self._close_session_locked(subscription_id)
+                            raise connector.ConnectorSessionExpiredError(
+                                "A sessão continuou expirada após um único refresh; a próxima autenticação será coordenada."
+                            ) from retry_exc
+                        raise
+
                 if manual_should_yield is not None and manual_should_yield():
-                    raise TelemetryYieldForManual("Operação manual recebeu prioridade após a leitura de status do veículo.")
+                    raise TelemetryYieldForManual(
+                        "Operação manual recebeu prioridade após a leitura de status do veículo."
+                    )
                 serialized.append(serialized_item)
             if not serialized:
                 raise RuntimeError("Nenhum veículo foi encontrado para esta conta.")
