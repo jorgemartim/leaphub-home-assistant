@@ -1,17 +1,15 @@
-## 1.12.88
+## 1.12.89
 
-Entrega o handoff cooperativo que a antiga 1.12.85 deveria ter feito, mantendo a 1.12.87/restauração 1.12.84 como base estável.
+Corrige a última retenção longa da trava de conta observada em campo na 1.12.88.
 
 A distribuição permanece pré-compilada no GHCR oficial e conserva a publicação em duas fases.
 
-- somente a leitura automática principal de status deixa de usar o retry invisível de `get_vehicle_status()` da leapmotor-api 0.3.2;
-- o mesmo `LeapmotorApiClient` persistente continua sendo usado;
-- nenhum segundo cliente e nenhum uso concorrente do mesmo cliente;
-- cada status automático faz uma chamada one-shot por etapa;
-- token expirado permite no máximo um refresh e uma releitura;
-- prioridade manual é verificada antes/depois da leitura, refresh e releitura;
-- lista de veículos, mensagens, caminho manual e payloads permanecem como na 1.12.87;
-- ACK-first, supersessão e anúncio imediato Gateway→Site permanecem;
-- `climate_off` continua limitado a no máximo duas transmissões idênticas;
-- nenhuma terceira transmissão, wake artificial ou aumento de polling;
-- Site permanece em 1.12.358 e não faz parte desta release.
+- status continua one-shot cooperativo como na 1.12.88;
+- lista de veículos da telemetria agora usa `_get_vehicle_list` diretamente, sem o retry invisível do wrapper público;
+- mensagens SLOW agora usam `_get_message_list` diretamente pelo mesmo motivo;
+- em expiração de sessão, cada leitura automática permite no máximo um refresh e uma releitura;
+- se um comando manual chegar durante a primeira chamada, ele vence antes de refresh/retry;
+- nenhum full login é executado dentro desses helpers de leitura;
+- nenhum segundo `LeapmotorApiClient` é criado e o mesmo cliente nunca é usado concorrentemente;
+- ACK-first, supersessão, C10 AUTO/OFF, `climate_off` com no máximo duas transmissões e polling permanecem inalterados;
+- Site 1.12.358 não faz parte desta release.

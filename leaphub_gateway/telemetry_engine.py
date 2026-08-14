@@ -55,7 +55,7 @@ except ModuleNotFoundError:
         EVENT_TRANSPORT = _event_transport_module.EVENT_TRANSPORT
 
 LOG = logging.getLogger("leaphub.telemetry")
-ENGINE_VERSION = "1.12.88"  # cooperative status handoff
+ENGINE_VERSION = "1.12.89"  # cooperative telemetry cloud reads
 
 # Hospedagem compartilhada (Apache/LiteSpeed) fecha a conexão ociosa em poucos
 # segundos. Reaproveitar depois disso escreve num socket já fechado e devolve
@@ -3761,6 +3761,169 @@ class TelemetryEngine:
                 allow_slow_network=allow_slow_network,
             )
 
+    def _telemetry_vehicle_list_one_shot(
+        self,
+        subscription_id: str,
+        client: Any,
+        manual_should_yield: Callable[[], bool] | None = None,
+    ) -> list[Any]:
+        """Read the vehicle list without leapmotor-api's hidden auth retry chain.
+
+        1.12.89 — field logs from 1.12.88 proved the remaining long account
+        hold was before status: a confirmation poll could enter the public
+        ``get_vehicle_list()`` wrapper, which may perform status/list -> token
+        refresh -> full login -> retry while the account lock remains held.
+        Only the pinned private request is used here. A token-expiry path gets
+        at most one refresh and one second list request, with manual priority
+        checked between every network step. No full login occurs inside this
+        helper and no second client is created.
+        """
+
+        def yield_for_manual(moment: str) -> None:
+            if manual_should_yield is not None and manual_should_yield():
+                raise TelemetryYieldForManual(
+                    f"Operação manual recebeu prioridade {moment} da lista de veículos."
+                )
+
+        yield_for_manual("antes")
+
+        if hasattr(client, "token") and not getattr(client, "token", None):
+            self._close_session_locked(subscription_id)
+            raise connector.ConnectorSessionExpiredError(
+                "Sessão Leapmotor sem token antes da lista; nova autenticação ficará para o próximo ciclo protegido."
+            )
+
+        method = getattr(client, "_get_vehicle_list", None)
+        if not callable(method):
+            raise connector.ConnectorTemporaryError(
+                "A versão fixada de leapmotor-api não expõe _get_vehicle_list; "
+                "a telemetria recusou fallback para retry invisível."
+            )
+
+        def call_once() -> list[Any]:
+            with self._telemetry_request_timeout(client):
+                value = method()
+            return value if isinstance(value, list) else list(value or [])
+
+        try:
+            value = call_once()
+        except Exception as exc:  # noqa: BLE001
+            yield_for_manual("depois da primeira tentativa")
+            if not connector.is_session_expired_error(exc):
+                raise
+
+            yield_for_manual("antes do refresh")
+            with self._telemetry_request_timeout(client):
+                refreshed = self._try_refresh_client_session(client)
+            yield_for_manual("depois do refresh")
+
+            if not refreshed:
+                self._close_session_locked(subscription_id)
+                raise connector.ConnectorSessionExpiredError(
+                    "Refresh único não recuperou a lista; a reconexão ficará para o próximo ciclo protegido."
+                ) from exc
+
+            LOG.info(
+                "Sessão de %s renovada por refresh cooperativo durante lista de veículos; "
+                "uma única releitura será feita se não houver comando manual.",
+                subscription_id,
+            )
+
+            yield_for_manual("antes da releitura")
+            try:
+                value = call_once()
+            except Exception as retry_exc:  # noqa: BLE001
+                yield_for_manual("depois da releitura")
+                if connector.is_session_expired_error(retry_exc):
+                    self._close_session_locked(subscription_id)
+                    raise connector.ConnectorSessionExpiredError(
+                        "Lista continuou com sessão expirada após um refresh e uma releitura; "
+                        "não haverá terceira chamada neste ciclo."
+                    ) from retry_exc
+                raise
+
+        yield_for_manual("depois")
+        return value
+
+    def _telemetry_message_list_one_shot(
+        self,
+        subscription_id: str,
+        client: Any,
+        manual_should_yield: Callable[[], bool] | None = None,
+    ) -> Any:
+        """Read one message page without the public hidden token retry chain.
+
+        Messages run only on the slow background profile, but a manual command
+        may arrive while that call already owns the account. 1.12.89 applies
+        the same bounded cooperative rule as vehicle list/status so no automatic
+        read can hide refresh+login+retry behind one public library method.
+        """
+
+        def yield_for_manual(moment: str) -> None:
+            if manual_should_yield is not None and manual_should_yield():
+                raise TelemetryYieldForManual(
+                    f"Operação manual recebeu prioridade {moment} da leitura de mensagens."
+                )
+
+        yield_for_manual("antes")
+
+        if hasattr(client, "token") and not getattr(client, "token", None):
+            self._close_session_locked(subscription_id)
+            raise connector.ConnectorSessionExpiredError(
+                "Sessão Leapmotor sem token antes das mensagens; nova autenticação ficará para o próximo ciclo protegido."
+            )
+
+        method = getattr(client, "_get_message_list", None)
+        if not callable(method):
+            raise connector.ConnectorTemporaryError(
+                "A versão fixada de leapmotor-api não expõe _get_message_list; "
+                "a telemetria recusou fallback para retry invisível."
+            )
+
+        def call_once() -> Any:
+            with self._telemetry_request_timeout(client):
+                return method(page_no=1, page_size=100)
+
+        try:
+            value = call_once()
+        except Exception as exc:  # noqa: BLE001
+            yield_for_manual("depois da primeira tentativa")
+            if not connector.is_session_expired_error(exc):
+                raise
+
+            yield_for_manual("antes do refresh")
+            with self._telemetry_request_timeout(client):
+                refreshed = self._try_refresh_client_session(client)
+            yield_for_manual("depois do refresh")
+
+            if not refreshed:
+                self._close_session_locked(subscription_id)
+                raise connector.ConnectorSessionExpiredError(
+                    "Refresh único não recuperou mensagens; a reconexão ficará para o próximo ciclo protegido."
+                ) from exc
+
+            LOG.info(
+                "Sessão de %s renovada por refresh durante a leitura de mensagens (cooperativo); "
+                "uma única releitura será feita se não houver comando manual.",
+                subscription_id,
+            )
+
+            yield_for_manual("antes da releitura")
+            try:
+                value = call_once()
+            except Exception as retry_exc:  # noqa: BLE001
+                yield_for_manual("depois da releitura")
+                if connector.is_session_expired_error(retry_exc):
+                    self._close_session_locked(subscription_id)
+                    raise connector.ConnectorSessionExpiredError(
+                        "Mensagens continuaram com sessão expirada após um refresh e uma releitura; "
+                        "não haverá terceira chamada neste ciclo."
+                    ) from retry_exc
+                raise
+
+        yield_for_manual("depois")
+        return value
+
     def _telemetry_status_one_shot(
         self,
         subscription_id: str,
@@ -3893,35 +4056,29 @@ class TelemetryEngine:
             if cache_fresh and selected_ids_present:
                 vehicles = cached_vehicles
             else:
-                try:
+                private_vehicle_list = getattr(client, "_get_vehicle_list", None)
+                client_module = str(getattr(type(client), "__module__", "") or "")
+                official_leapmotor_client = (
+                    client_module == "leapmotor_api"
+                    or client_module.startswith("leapmotor_api.")
+                )
+                if callable(private_vehicle_list):
+                    vehicles = self._telemetry_vehicle_list_one_shot(
+                        subscription_id,
+                        client,
+                        manual_should_yield=manual_should_yield,
+                    )
+                elif official_leapmotor_client:
+                    raise connector.ConnectorTemporaryError(
+                        "Cliente Leapmotor real sem _get_vehicle_list; "
+                        "telemetria recusou fallback para retry invisível."
+                    )
+                else:
+                    # Compatibilidade apenas com fakes/contratos históricos.
+                    # Cliente real da biblioteca pinada nunca passa por este ramo.
                     with self._telemetry_request_timeout(client):
                         vehicles_value = client.get_vehicle_list()
-                    if manual_should_yield is not None and manual_should_yield():
-                        raise TelemetryYieldForManual("Operação manual recebeu prioridade após a leitura da lista de veículos.")
-                except Exception as exc:  # noqa: BLE001
-                    if manual_should_yield is not None and manual_should_yield():
-                        raise TelemetryYieldForManual("Operação manual recebeu prioridade durante a leitura da lista de veículos.") from exc
-                    if connector.is_session_expired_error(exc):
-                        # Refresh da TELEMETRIA também é rede e também ocorre
-                        # enquanto a conta está reservada. Use o mesmo teto curto.
-                        with self._telemetry_request_timeout(client):
-                            refreshed = self._try_refresh_client_session(client)
-                        if manual_should_yield is not None and manual_should_yield():
-                            raise TelemetryYieldForManual("Operação manual recebeu prioridade durante o refresh da sessão.")
-                        if refreshed:
-                            LOG.info("Sessão de %s renovada por refresh antes de considerar novo login.", subscription_id)
-                            if manual_should_yield is not None and manual_should_yield():
-                                raise TelemetryYieldForManual("Operação manual aguardando antes de repetir a lista de veículos.")
-                            with self._telemetry_request_timeout(client):
-                                vehicles_value = client.get_vehicle_list()
-                        else:
-                            self._close_session_locked(subscription_id)
-                            raise connector.ConnectorSessionExpiredError(
-                                "A sessão Leapmotor expirou e será recriada uma única vez no próximo ciclo protegido."
-                            ) from exc
-                    else:
-                        raise
-                vehicles = vehicles_value if isinstance(vehicles_value, list) else list(vehicles_value or [])
+                    vehicles = vehicles_value if isinstance(vehicles_value, list) else list(vehicles_value or [])
                 session["vehicles"] = vehicles
                 session["vehicles_cached_at"] = time.time()
             if manual_should_yield is not None and manual_should_yield():
@@ -3951,38 +4108,37 @@ class TelemetryEngine:
                 else:
                     if manual_should_yield is not None and manual_should_yield():
                         raise TelemetryYieldForManual("Operação manual aguardando a conta.")
+                    private_message_list = getattr(client, "_get_message_list", None)
+                    client_module = str(getattr(type(client), "__module__", "") or "")
+                    official_leapmotor_client = (
+                        client_module == "leapmotor_api"
+                        or client_module.startswith("leapmotor_api.")
+                    )
                     try:
-                        with self._telemetry_request_timeout(client):
-                            message_page = get_messages(page_no=1, page_size=100)
-                        if manual_should_yield is not None and manual_should_yield():
-                            raise TelemetryYieldForManual("Operação manual recebeu prioridade após a leitura de mensagens.")
+                        if callable(private_message_list):
+                            message_page = self._telemetry_message_list_one_shot(
+                                subscription_id,
+                                client,
+                                manual_should_yield=manual_should_yield,
+                            )
+                        elif official_leapmotor_client:
+                            raise connector.ConnectorTemporaryError(
+                                "Cliente Leapmotor real sem _get_message_list; "
+                                "telemetria recusou fallback para retry invisível."
+                            )
+                        else:
+                            # Compatibilidade apenas com clientes sintéticos dos testes.
+                            with self._telemetry_request_timeout(client):
+                                message_page = get_messages(page_no=1, page_size=100)
                         messages = list(connector.attribute(message_page, "messages", []) or [])
                         session["messages"] = messages
                         session["messages_cached_at"] = time.time()
-                    except Exception as exc:  # noqa: BLE001
-                        if manual_should_yield is not None and manual_should_yield():
-                            raise TelemetryYieldForManual("Operação manual recebeu prioridade durante a leitura de mensagens.") from exc
-                        if connector.is_session_expired_error(exc):
-                            with self._telemetry_request_timeout(client):
-                                refreshed = self._try_refresh_client_session(client)
-                            if manual_should_yield is not None and manual_should_yield():
-                                raise TelemetryYieldForManual("Operação manual recebeu prioridade durante o refresh da sessão de mensagens.")
-                            if refreshed:
-                                LOG.info("Sessão de %s renovada por refresh durante a leitura de mensagens.", subscription_id)
-                                if manual_should_yield is not None and manual_should_yield():
-                                    raise TelemetryYieldForManual("Operação manual aguardando antes de repetir a leitura de mensagens.")
-                                with self._telemetry_request_timeout(client):
-                                    message_page = get_messages(page_no=1, page_size=100)
-                                messages = list(connector.attribute(message_page, "messages", []) or [])
-                                session["messages"] = messages
-                                session["messages_cached_at"] = time.time()
-                            else:
-                                self._close_session_locked(subscription_id)
-                                raise connector.ConnectorSessionExpiredError(
-                                    "A sessão Leapmotor expirou durante a leitura de mensagens."
-                                ) from exc
-                        else:
-                            messages = cached_messages
+                    except TelemetryYieldForManual:
+                        raise
+                    except Exception:
+                        # Mensagens são enriquecimento SLOW. Uma falha não derruba
+                        # status/controles nem autoriza outra sequência de retry.
+                        messages = cached_messages
             serialized: list[dict[str, Any]] = []
             for item in selected:
                 if manual_should_yield is not None and manual_should_yield():

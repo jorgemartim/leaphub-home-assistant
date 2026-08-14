@@ -8,9 +8,11 @@ checks = []
 def check(value, label):
     assert value, label
     checks.append(label)
-check('CONNECTOR_VERSION = "1.12.88"' in connector, "connector_version")
-check('ENGINE_VERSION = "1.12.88"' in telemetry, "engine_version")
-check((APP / "RELEASE_TARGET").read_text(encoding="utf-8").strip() == "1.12.88", "target")
+target = (APP / "RELEASE_TARGET").read_text(encoding="utf-8").strip()
+target_parts = tuple(int(part) for part in target.split("."))
+check(target_parts >= (1, 12, 88), "target_floor")
+check(f'CONNECTOR_VERSION = "{target}"' in connector, "connector_version")
+check(f'ENGINE_VERSION = "{target}"' in telemetry, "engine_version")
 check("_TelemetryOneShotClient" not in telemetry, "no_proxy")
 check("def _telemetry_status_one_shot(" in telemetry, "helper")
 check('getattr(client, "_get_vehicle_status", None)' in telemetry, "private_status")
@@ -31,4 +33,4 @@ check("self._supersede_pending_confirmations(" in telemetry, "supersession")
 check("announce_command_result_async(" in server, "announce")
 expected = 'ACK_FIRST_COMMANDS = {"lock", "unlock", "climate_on", "climate_off", "quick_cool", "quick_heat", "trunk_open", "trunk_close", "windows_open", "windows_close", "sunshade_open", "sunshade_close"}'
 check(expected in connector, "ack_first")
-print({"ok": True, "checks": len(checks), "version": "1.12.88"})
+print({"ok": True, "checks": len(checks), "version": target})
