@@ -55,7 +55,7 @@ except ModuleNotFoundError:
         EVENT_TRANSPORT = _event_transport_module.EVENT_TRANSPORT
 
 LOG = logging.getLogger("leaphub.telemetry")
-ENGINE_VERSION = "1.12.89"  # cooperative telemetry cloud reads
+ENGINE_VERSION = "1.12.90"  # cooperative telemetry cloud reads
 
 # Hospedagem compartilhada (Apache/LiteSpeed) fecha a conexão ociosa em poucos
 # segundos. Reaproveitar depois disso escreve num socket já fechado e devolve
@@ -4507,10 +4507,14 @@ class TelemetryEngine:
     COMMAND_CONFIRMATION_FIELDS: dict[str, tuple[str, ...]] = {
         "lock": ("locked",),
         "unlock": ("locked",),
-        "climate_on": ("climate_on",),
+        # 1.12.90 — ligar/desligar continua exigindo o switch, mas modos
+        # específicos também precisam dos detalhes do HVAC. `climate_details`
+        # é um objeto porque diferentes modelos/firmwares podem preencher
+        # `mode`, `operate_mode` ou `cooling_and_heating`.
+        "climate_on": ("climate_on", "climate_details"),
         "climate_off": ("climate_on",),
-        "quick_cool": ("climate_on",),
-        "quick_heat": ("climate_on",),
+        "quick_cool": ("climate_on", "climate_details"),
+        "quick_heat": ("climate_on", "climate_details"),
         "windshield_defrost": ("climate_details.windshield_defrost",),
         "battery_preheat_on": ("climate_details.battery_preheat",),
         "battery_preheat_off": ("climate_details.battery_preheat",),
@@ -4556,6 +4560,65 @@ class TelemetryEngine:
                 gaps.append(path + "=vazio")
         return gaps
 
+    @classmethod
+    def _command_climate_mode(cls, telemetry: dict[str, Any]) -> tuple[str | None, bool]:
+        """Normaliza o modo físico do HVAC sem assumir um modelo específico.
+
+        OFF é comprovado pelo switch. Para AUTO/COOL/HEAT, a confirmação exige
+        um sinal explícito de modo. Valores conhecidos do C10 (0/1/3) são
+        aceitos, mas também há fallback textual para B10 e modelos futuros.
+        Se o veículo não publicar um modo reconhecível, a resposta é
+        inconclusiva — nunca confirma HEAT apenas porque o ar está ligado.
+        """
+        switch_state = cls._command_bool(telemetry.get("climate_on"))
+        if switch_state is False:
+            return "off", True
+        if switch_state is not True:
+            return None, False
+
+        details = telemetry.get("climate_details")
+        if not isinstance(details, dict):
+            return None, False
+
+        numeric_map = {0: "auto", 1: "cooling", 3: "heating"}
+        for key in ("mode",):
+            raw = details.get(key)
+            if raw is None:
+                continue
+            try:
+                number = int(float(str(raw).strip()))
+            except (TypeError, ValueError):
+                number = None
+            if number in numeric_map:
+                return numeric_map[number], True
+
+        tokens: list[str] = []
+        for key in ("mode", "operate_mode", "cooling_and_heating"):
+            raw = details.get(key)
+            if raw is None:
+                continue
+            if isinstance(raw, dict):
+                for nested in ("value", "name", "label", "description"):
+                    value = raw.get(nested)
+                    if value is not None:
+                        tokens.append(str(value).strip().lower())
+            else:
+                tokens.append(str(raw).strip().lower())
+
+        text = " ".join(token for token in tokens if token)
+        # AUTO precisa ser testado antes de "hot"/"cold": o valor conhecido
+        # `nohotcold` contém ambas as palavras e não pode virar HEAT/COOL por
+        # simples substring.
+        if any(token in text for token in ("nohotcold", "neutral", "auto", "automatic", "wind")):
+            return "auto", True
+        if any(token in text for token in ("cooling", "quick_cool", "quick cool", "cold", "cool")):
+            return "cooling", True
+        if any(token in text for token in ("heating", "quick_heat", "quick heat", "hot", "heat")):
+            return "heating", True
+        if any(token in text for token in ("off", "closed", "close", "disabled")):
+            return "off", True
+        return None, False
+
     def _command_confirmation(
         self,
         command_key: str,
@@ -4567,10 +4630,23 @@ class TelemetryEngine:
         if command in {"lock", "unlock"}:
             state = self._command_bool(telemetry.get("locked"))
             return (state is (command == "lock"), state is not None)
-        if command in {"climate_on", "climate_off", "quick_cool", "quick_heat"}:
+        if command == "climate_off":
             state = self._command_bool(telemetry.get("climate_on"))
-            expected = command != "climate_off"
-            return (state is expected, state is not None)
+            return (state is False, state is not None)
+        if command in {"climate_on", "quick_cool", "quick_heat"}:
+            # 1.12.90 — `climate_on=true` prova somente que o HVAC está ligado.
+            # Não prova AUTO, COOL ou HEAT. Isso evitou um falso positivo de campo
+            # onde `quick_heat` foi dado como confirmado enquanto o app oficial
+            # ainda mostrava resfriamento.
+            mode, evaluable = self._command_climate_mode(telemetry)
+            if not evaluable:
+                return False, False
+            expected_mode = {
+                "climate_on": "auto",
+                "quick_cool": "cooling",
+                "quick_heat": "heating",
+            }[command]
+            return mode == expected_mode, True
         if command == "windshield_defrost":
             details = telemetry.get("climate_details") if isinstance(telemetry.get("climate_details"), dict) else {}
             state = self._command_bool(details.get("windshield_defrost"))

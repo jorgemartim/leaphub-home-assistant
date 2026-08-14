@@ -43,7 +43,7 @@ except ImportError:
         _privacy_spec.loader.exec_module(_privacy_module)
         sanitize_log = _privacy_module.sanitize_log
 
-CONNECTOR_VERSION = "1.12.89"
+CONNECTOR_VERSION = "1.12.90"
 MAX_INPUT_BYTES = 1024 * 1024
 logging.getLogger("leapmotor_api").setLevel(logging.WARNING)
 LOGGER = logging.getLogger("leaphub.connector")
@@ -2528,6 +2528,9 @@ def serialize_vehicle(
         "fan_level": first_numeric(attribute(climate, "ac_air_volume"), attribute(climate, "ac_air_volume_setting")),
         "mode": enum_or_value(attribute(climate, "climate_mode")),
         "operate_mode": enum_or_value(attribute(climate, "ac_operate_mode")),
+        # 1.12.90 — sinal térmico alternativo presente em alguns modelos/firmwares.
+        # Não cria nova chamada: apenas serializa o que já veio no mesmo status.
+        "cooling_and_heating": enum_or_value(attribute(climate, "ac_cooling_and_heating")),
         "recirculation": enum_or_value(attribute(climate, "recirculation_mode")),
         "windshield_defrost": first_bool(attribute(climate, "is_windshield_defrost_active"), attribute(climate, "windshield_defrost")),
         "rear_window_heating": first_bool(attribute(climate, "rear_window_heating")),

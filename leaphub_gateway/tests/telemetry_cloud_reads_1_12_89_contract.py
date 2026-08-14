@@ -3,10 +3,11 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 telemetry = (ROOT / "leaphub_gateway" / "telemetry_engine.py").read_text(encoding="utf-8")
 target = (ROOT / "leaphub_gateway" / "RELEASE_TARGET").read_text(encoding="utf-8").strip()
+target_parts = tuple(int(part) for part in target.split("."))
 
 checks = {
-    "target_189": target == "1.12.89",
-    "engine_189": 'ENGINE_VERSION = "1.12.89"' in telemetry,
+    "target_floor_189": target_parts >= (1, 12, 89),
+    "engine_matches_target": f'ENGINE_VERSION = "{target}"' in telemetry,
     "vehicle_list_helper": "def _telemetry_vehicle_list_one_shot(" in telemetry,
     "message_list_helper": "def _telemetry_message_list_one_shot(" in telemetry,
     "status_helper_preserved": "def _telemetry_status_one_shot(" in telemetry,
