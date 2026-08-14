@@ -2,6 +2,8 @@
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
+target = (ROOT / "leaphub_gateway" / "RELEASE_TARGET").read_text(encoding="utf-8").strip()
+target_parts = tuple(int(part) for part in target.split("."))
 T = (ROOT / "leaphub_gateway" / "telemetry_engine.py").read_text(encoding="utf-8")
 C = (ROOT / "leaphub_gateway" / "connector.py").read_text(encoding="utf-8")
 
@@ -11,8 +13,9 @@ def ok(name, condition):
         raise AssertionError(name)
     checks.append(name)
 
-ok("engine-version", 'ENGINE_VERSION = "1.12.94"' in T)
-ok("connector-version", 'CONNECTOR_VERSION = "1.12.94"' in C)
+ok("target-194", target_parts >= (1, 12, 94))
+ok("engine-version", f'ENGINE_VERSION = "{target}"' in T)
+ok("connector-version", f'CONNECTOR_VERSION = "{target}"' in C)
 ok("visual-single-worker", 'thread_name_prefix="leaphub-visual"' in T)
 ok("telemetry-no-image", T.count("include_official_image=False") == 2)
 ok("state-before-visual", T.index("queued = self._queue_event(") < T.index("self._queue_visual_render("))
@@ -34,4 +37,4 @@ ok("confirmation-fifo", 'thread_name_prefix="leaphub-confirm-arm"' in T)
 H193 = (ROOT / "leaphub_gateway" / "tests" / "confirmation_arm_queue_1_12_93_contract.py").read_text(encoding="utf-8")
 ok("193-contract-cumulative", 'target_parts >= (1, 12, 93)' in H193 and 'target == "1.12.93"' not in H193)
 ok("no-second-client", "_TelemetryOneShotClient" not in T)
-print({"ok": True, "checks": len(checks), "version": "1.12.94"})
+print({"ok": True, "checks": len(checks), "version": target})

@@ -55,7 +55,7 @@ except ModuleNotFoundError:
         EVENT_TRANSPORT = _event_transport_module.EVENT_TRANSPORT
 
 LOG = logging.getLogger("leaphub.telemetry")
-ENGINE_VERSION = "1.12.94"  # isolate control, telemetry and local visual rendering
+ENGINE_VERSION = "1.12.95"  # fast local image path; control/telemetry remain isolated
 
 # Hospedagem compartilhada (Apache/LiteSpeed) fecha a conexão ociosa em poucos
 # segundos. Reaproveitar depois disso escreve num socket já fechado e devolve
@@ -350,8 +350,11 @@ class TelemetryEngine:
         # 1.12.94 — imagem tem fila própria e recebe somente snapshot JSON.
         # Nunca recebe cliente/token/credenciais e nunca usa account_lock,
         # operation_semaphore ou _session_operation_lock.
+        # 1.12.95 — dois workers LOCAIS impedem uma conta de esperar a fila
+        # visual de outra. Nenhum deles recebe cliente Leapmotor ou trava da conta.
+        self.visual_render_workers = 2
         self._visual_render_pool: ThreadPoolExecutor | None = ThreadPoolExecutor(
-            max_workers=1,
+            max_workers=self.visual_render_workers,
             thread_name_prefix="leaphub-visual",
         )
         self._visual_render_guard = threading.RLock()
@@ -3045,6 +3048,7 @@ class TelemetryEngine:
             "workers_saturated": in_flight >= int(self.poll_workers),
             "delivery_connection_reused": self._delivery_connection is not None,
             "visual_jobs_pending": int(self._visual_jobs_pending),
+            "visual_workers": int(self.visual_render_workers),
             "visual_worker_isolated": True,
             "journal_mode": self.storage_journal_mode,
         }

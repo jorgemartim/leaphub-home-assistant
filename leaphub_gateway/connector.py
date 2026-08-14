@@ -19,6 +19,7 @@ import re
 import shutil
 import sys
 import tempfile
+import threading
 import time
 import zipfile
 from dataclasses import asdict, is_dataclass
@@ -43,7 +44,7 @@ except ImportError:
         _privacy_spec.loader.exec_module(_privacy_module)
         sanitize_log = _privacy_module.sanitize_log
 
-CONNECTOR_VERSION = "1.12.94"
+CONNECTOR_VERSION = "1.12.95"
 MAX_INPUT_BYTES = 1024 * 1024
 logging.getLogger("leapmotor_api").setLevel(logging.WARNING)
 LOGGER = logging.getLogger("leaphub.connector")
@@ -1415,6 +1416,127 @@ _IMAGE_DEBUG_LAST_HASH: dict[str, str] = {}
 _IMAGE_LAST_SIGNATURE: dict[str, str] = {}
 
 
+# 1.12.95 — a figura final continua lossless, mas o compressor não precisa
+# gastar vários segundos procurando a menor representação possível.
+IMAGE_WEBP_METHOD = 0
+IMAGE_RENDER_CONTRACT_VERSION = 16
+
+
+class _LazyOfficialImagePackage:
+    """Indexa o ZIP agora e decodifica cada camada somente quando usada."""
+
+    def __init__(self, zip_bytes: bytes) -> None:
+        self._zip_bytes = bytes(zip_bytes)
+        self._entries: dict[str, str] = {}
+        self._decoded: dict[str, Any] = {}
+        self._lock = threading.RLock()
+        with zipfile.ZipFile(io.BytesIO(self._zip_bytes), "r") as archive:
+            for info in archive.infolist():
+                if info.is_dir():
+                    continue
+                lower = info.filename.lower()
+                if not lower.endswith((".png", ".jpg", ".jpeg", ".webp")):
+                    continue
+                basename = info.filename.rsplit("/", 1)[-1]
+                self._entries[basename] = info.filename
+        if "carpic_body.png" not in self._entries:
+            raise ValueError("Package missing carpic_body.png")
+
+    @classmethod
+    def from_zip(cls, zip_bytes: bytes) -> "_LazyOfficialImagePackage":
+        return cls(zip_bytes)
+
+    @property
+    def layer_names(self) -> list[str]:
+        return sorted(self._entries)
+
+    @property
+    def decoded_layer_count(self) -> int:
+        with self._lock:
+            return len(self._decoded)
+
+    def _image(self, name: str) -> Any | None:
+        with self._lock:
+            cached = self._decoded.get(name)
+            entry = self._entries.get(name)
+        if cached is not None:
+            return cached
+        if not entry:
+            return None
+        from PIL import Image
+        with zipfile.ZipFile(io.BytesIO(self._zip_bytes), "r") as archive:
+            raw = archive.read(entry)
+        image = Image.open(io.BytesIO(raw)).convert("RGBA")
+        image.load()
+        with self._lock:
+            existing = self._decoded.get(name)
+            if existing is not None:
+                return existing
+            self._decoded[name] = image
+        return image
+
+    def get_tripsum(self) -> Any | None:
+        return self._image("carpic_for_tripsum.png")
+
+    def _composite_layers(self, layer_names: list[str]) -> Any:
+        from PIL import Image
+        body = self._image("carpic_body.png")
+        if body is None:
+            raise ValueError("Package missing carpic_body.png")
+        canvas = Image.new("RGBA", body.size, (0, 0, 0, 0))
+        for name in layer_names:
+            layer = self._image(name)
+            if layer is not None:
+                canvas = Image.alpha_composite(canvas, layer)
+        return canvas
+
+    @staticmethod
+    def _export(canvas: Any, fmt: str = "PNG") -> bytes:
+        from PIL import Image
+        buffer = io.BytesIO()
+        if fmt.upper() == "JPEG":
+            rgb = Image.new("RGB", canvas.size, (0, 0, 0))
+            rgb.paste(canvas, mask=canvas.split()[3])
+            rgb.save(buffer, format="JPEG", quality=90)
+        elif fmt.upper() == "PNG":
+            canvas.save(buffer, format="PNG", compress_level=1)
+        else:
+            canvas.save(buffer, format=fmt.upper())
+        return buffer.getvalue()
+
+    def compose(self, status: Any = None, *, charge_frame: int = 2, format: str = "PNG") -> bytes:
+        stack = _layer_stack_from_status(status, charge_frame)
+        return self._export(self._composite_layers(stack), format)
+
+    def compose_animated(self, status: Any = None, *, frame_duration: int = 200) -> tuple[bytes, str]:
+        from PIL import Image
+        battery = getattr(status, "battery", None) if status is not None else None
+        charging = bool(
+            getattr(battery, "is_charging", False)
+            or (getattr(status, "is_charging", False) if status is not None else False)
+        )
+        if not charging:
+            return self.compose(status), "image/png"
+        stack = _layer_stack_from_status(status, 2)
+        base_layers = [
+            name for name in stack
+            if not name.startswith("carpic_charge") or name == "carpic_charge_open.png"
+        ]
+        base_canvas = self._composite_layers(base_layers)
+        frames: list[Any] = []
+        for frame_number in range(2, 16):
+            charge_layer = self._image(f"carpic_charge{frame_number}.png")
+            frame = Image.alpha_composite(base_canvas, charge_layer) if charge_layer is not None else base_canvas.copy()
+            frames.append(frame)
+        buffer = io.BytesIO()
+        frames[0].save(
+            buffer, format="WEBP", save_all=True, append_images=frames[1:],
+            duration=frame_duration, loop=0, lossless=True, quality=100,
+            method=IMAGE_WEBP_METHOD,
+        )
+        return buffer.getvalue(), "image/webp"
+
+
 def should_defer_official_image(
     *,
     include_secondary_network: bool,
@@ -1730,7 +1852,7 @@ def _encode_official_composite(raw_image: bytes, media_type: str = "image/png") 
     else:
         rgba = image.convert("RGBA")
         buffer = io.BytesIO()
-        rgba.save(buffer, format="WEBP", lossless=True, quality=100, method=6)
+        rgba.save(buffer, format="WEBP", lossless=True, quality=100, method=IMAGE_WEBP_METHOD)
         output = buffer.getvalue()
         output_format = "webp-lossless-rgba-official"
         frame_count = 1
@@ -1790,7 +1912,8 @@ def _compose_official_output(package: Any, visual_status: Any, render_state: str
                 duration=180,
                 loop=0,
                 lossless=True,
-                method=6,
+                quality=100,
+                method=IMAGE_WEBP_METHOD,
             )
             raw = buffer.getvalue()
             media_type = "image/webp"
@@ -2143,8 +2266,7 @@ def _official_picture_package(
     try:
         raw = package_file.read_bytes()
         _validate_picture_zip(raw)
-        from leapmotor_api.image import CarImagePackage
-        package = CarImagePackage.from_zip(raw)
+        package = _LazyOfficialImagePackage.from_zip(raw)
         key_hash = str(old_meta.get("picture_key_hash") or "")
         if picture_key:
             key_hash = hashlib.sha256(picture_key.encode("utf-8")).hexdigest()
@@ -2160,7 +2282,7 @@ def _official_render_cache_key(remote_id: str, picture_key_hash: str, render_lay
         str(remote_id or "").strip(),
         str(picture_key_hash or "").strip().lower(),
         str(render_layer_signature or "parked").strip().lower(),
-        "contract-15",
+        f"contract-{IMAGE_RENDER_CONTRACT_VERSION}",
     ])
     return hashlib.sha256(source.encode("utf-8")).hexdigest()
 
@@ -2201,6 +2323,10 @@ def official_visual_image_payload(
     manual_should_yield: Callable[[], bool] | None = None,
     allow_network: bool = True,
 ) -> dict[str, Any] | None:
+    total_started = time.monotonic()
+    package_started = total_started
+    package_cache_key = hashlib.sha256(str(remote_id or "").encode("utf-8", "ignore")).hexdigest()
+    package_cache_hit = package_cache_key in _IMAGE_PACKAGE_CACHE
     resolved = _official_picture_package(
         client,
         vehicle,
@@ -2212,6 +2338,7 @@ def official_visual_image_payload(
     if resolved is None:
         return None
     package, picture_key_hash, package_file = resolved
+    package_ms = int(round((time.monotonic() - package_started) * 1000))
     try:
         render_state, render_components, render_layer_signature = _official_render_contract(
             visual_components,
@@ -2221,12 +2348,14 @@ def official_visual_image_payload(
         cached_render = None if force_package_refresh else _official_render_cache_get(cache_key)
         state_cache_hit = cached_render is not None
         visual_status = _official_visual_status(render_components, render_state)
+        render_started = time.monotonic()
         if cached_render is not None:
             image_bytes, sha256, cleanup = cached_render
         else:
             image_bytes, output_mime, cleanup = _compose_official_output(package, visual_status, render_state)
             sha256 = hashlib.sha256(image_bytes).hexdigest()
             _official_render_cache_put(cache_key, image_bytes, sha256, cleanup)
+        render_ms = int(round((time.monotonic() - render_started) * 1000))
         changed = force_visual_bytes or _IMAGE_LAST_HASH.get(remote_id) != sha256
         _IMAGE_LAST_HASH[remote_id] = sha256
         rendered_components = sorted({
@@ -2259,7 +2388,7 @@ def official_visual_image_payload(
             "rendered_layer_signature": render_layer_signature,
             "rendered_layer_components": render_components,
             "image_cleanup": cleanup,
-            "render_contract_version": 15,
+            "render_contract_version": IMAGE_RENDER_CONTRACT_VERSION,
             "visual_image_state_key": cache_key,
             "state_cache_hit": state_cache_hit,
             "consistency_hash": hashlib.sha256(consistency_source.encode("utf-8")).hexdigest(),
@@ -2269,8 +2398,10 @@ def official_visual_image_payload(
         # Reenvia os bytes apenas quando a composição mudou. Os metadados ficam
         # disponíveis em todos os ciclos, sem transformar uma imagem já salva
         # em "indisponível" só porque ela foi deduplicada.
+        base64_started = time.monotonic()
         if changed:
             payload["data_base64"] = base64.b64encode(image_bytes).decode("ascii")
+        base64_ms = int(round((time.monotonic() - base64_started) * 1000))
         # 1.12.94 — a galeria de diagnóstico é pesada: ela recompõe a figura
         # e converte várias camadas para WebP. Telemetria normal nunca precisa
         # desse material; só uma solicitação explícita de diagnóstico o gera.
@@ -2282,6 +2413,20 @@ def official_visual_image_payload(
             )
             if debug_payload is not None:
                 payload["debug_package"] = debug_payload
+        total_ms = int(round((time.monotonic() - total_started) * 1000))
+        if total_ms >= 100:
+            connector_log(
+                logging.INFO,
+                "Imagem local de %s: pacote=%sms cache_pacote=%s render=%sms cache_estado=%s base64=%sms total=%sms camadas_decodificadas=%s.",
+                str(remote_id or "")[-5:],
+                package_ms,
+                package_cache_hit,
+                render_ms,
+                state_cache_hit,
+                base64_ms,
+                total_ms,
+                int(getattr(package, "decoded_layer_count", 0) or 0),
+            )
         return payload
     except Exception as exc:
         print(f"Leap Hub: composição da imagem oficial falhou ({type(exc).__name__}).", file=sys.stderr)
@@ -2976,7 +3121,7 @@ def serialize_vehicle(
                 "visual_fingerprint": visual_fingerprint_value,
                 "rendered_primary_state": visual_primary_state,
                 "rendered_signature": visual_signature,
-                "render_contract_version": 15,
+                "render_contract_version": IMAGE_RENDER_CONTRACT_VERSION,
             })
         result["telemetry"] = telemetry
         return result
@@ -3033,7 +3178,7 @@ def serialize_vehicle(
             "visual_fingerprint": visual_fingerprint_value,
             "rendered_primary_state": visual_primary_state,
             "rendered_signature": visual_signature,
-            "render_contract_version": 15,
+            "render_contract_version": IMAGE_RENDER_CONTRACT_VERSION,
         })
     result["telemetry"] = telemetry
     return result
