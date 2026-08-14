@@ -55,7 +55,7 @@ except ModuleNotFoundError:
         EVENT_TRANSPORT = _event_transport_module.EVENT_TRANSPORT
 
 LOG = logging.getLogger("leaphub.telemetry")
-ENGINE_VERSION = "1.12.92"  # fast post-dispatch return + telemetry stage tracing
+ENGINE_VERSION = "1.12.93"  # defer local confirmation arm after accepted dispatch
 
 # Hospedagem compartilhada (Apache/LiteSpeed) fecha a conexão ociosa em poucos
 # segundos. Reaproveitar depois disso escreve num socket já fechado e devolve
@@ -340,6 +340,13 @@ class TelemetryEngine:
         # do Connector; isto apenas deixa de serializar tudo antes dele.
         self.poll_workers = self._bounded("telemetry_poll_workers", 3, 1, 6)
         self._poll_pool: ThreadPoolExecutor | None = None
+        # 1.12.93 — o envio físico não espera mais o bookkeeping SQLite da
+        # confirmação. Um ÚNICO worker FIFO mantém a ordem das intenções
+        # (abrir->fechar, lock->unlock) sem tocar no cliente Leapmotor.
+        self._confirmation_arm_pool: ThreadPoolExecutor | None = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="leaphub-confirm-arm",
+        )
         self._inflight: set[str] = set()
         self._inflight_guard = threading.RLock()
         self.delivery_event = threading.Event()
@@ -1678,14 +1685,18 @@ class TelemetryEngine:
                 session["last_used_at"] = time.time()
                 result["session_retained_for_fast_confirmation"] = True
                 post_dispatch_local_ms = int(round((time.monotonic() - post_dispatch_started) * 1000))
+                # 1.12.93 — o comando já foi aceito pela nuvem. O arme da
+                # confirmação é bookkeeping LOCAL e não pode reter a trava da
+                # conta/sessão por 7–23s. Só enfileiramos uma cópia imutável; o
+                # worker FIFO persiste supersessão/janela logo depois.
                 arm_started = time.monotonic()
                 try:
-                    self._arm_command_confirmation(subscription_id, payload, result)
+                    self._queue_command_confirmation_arm(subscription_id, payload, result)
                 finally:
                     confirmation_arm_ms = int(round((time.monotonic() - arm_started) * 1000))
-                # As fases só entram depois do arme: assim `handle_command_ms` e
-                # `confirmation_arm_ms` fecham a soma com remote_execute_ms e o
-                # que sobrar de não atribuído fica realmente sem candidato.
+                # `confirmation_arm_ms` passa a medir somente o custo de ENFILEIRAR
+                # no caminho crítico. A duração real do SQLite é registrada pelo
+                # worker assíncrono e nunca entra em `remote_execute_ms`.
                 phase = result.get("phase_latency_ms")
                 if isinstance(phase, dict):
                     phase["session_wait_ms"] = session_wait_ms
@@ -1747,7 +1758,9 @@ class TelemetryEngine:
                     recovered["session_recovered"] = True
                     recovered["session_reused"] = True
                     recovered["session_retained_for_fast_confirmation"] = True
-                    self._arm_command_confirmation(subscription_id, payload, recovered)
+                    # Mesma regra da sessão normal: depois de uma ação aceita,
+                    # nenhuma gravação local segura a sessão/comando.
+                    self._queue_command_confirmation_arm(subscription_id, payload, recovered)
                     return recovered
                 if isinstance(exc, connector.ConnectorLoginCooldownError):
                     self._set_account_login_cooldown(environment, account_id, exc.retry_after_seconds, str(exc))
@@ -1822,6 +1835,134 @@ class TelemetryEngine:
                     client.timeout = previous
                 except Exception:  # noqa: BLE001
                     pass
+
+    def _queue_command_confirmation_arm(
+        self,
+        subscription_id: str,
+        payload: dict[str, Any],
+        result: dict[str, Any],
+    ) -> bool:
+        """Queue local confirmation bookkeeping without delaying a sent command.
+
+        Only immutable command metadata is copied. No Leapmotor client, session,
+        credential, callback or physical-command function enters this queue.
+        With one worker, jobs execute in the exact order in which accepted
+        commands leave the protected dispatch path.
+        """
+        command = str(payload.get("command") or "").strip().lower()
+        dispatched = bool(result.get("command_dispatched") or result.get("cloud_accepted"))
+        if command not in TELEMETRY_CONFIRMABLE_COMMANDS or not dispatched:
+            result["confirmation_arm_queued"] = False
+            result["confirmation_arm_state"] = "not_required"
+            result["confirmation_armed_by_gateway"] = False
+            return False
+
+        parameters = payload.get("parameters") if isinstance(payload.get("parameters"), dict) else {}
+        payload_snapshot = {
+            "command": command,
+            "vehicle_id": str(payload.get("vehicle_id") or "").strip()[:190],
+            "request_id": str(payload.get("request_id") or "").strip()[:96],
+            # JSON round-trip prevents a mutable nested dict from changing after
+            # the command result has already been returned to connector_server.
+            "parameters": json.loads(json.dumps(parameters, ensure_ascii=False, default=connector.json_default)),
+        }
+        result_snapshot = {
+            "command_dispatched": bool(result.get("command_dispatched")),
+            "cloud_accepted": bool(result.get("cloud_accepted")),
+            "confirmation_pending": bool(result.get("confirmation_pending")),
+        }
+
+        pool = getattr(self, "_confirmation_arm_pool", None)
+        if pool is None:
+            result["confirmation_arm_queued"] = False
+            result["confirmation_arm_state"] = "site_recovery"
+            result["confirmation_armed_by_gateway"] = False
+            LOG.warning(
+                "Comando %s foi aceito, mas o worker local de confirmação está encerrado; "
+                "o boost do site fará a recuperação sem reenviar a ação física.",
+                command,
+            )
+            return False
+
+        try:
+            pool.submit(
+                self._arm_command_confirmation_background,
+                subscription_id,
+                payload_snapshot,
+                result_snapshot,
+            )
+        except RuntimeError as exc:
+            # Executor em shutdown: a ação física já aconteceu e jamais é
+            # repetida por causa de falha local de bookkeeping.
+            result["confirmation_arm_queued"] = False
+            result["confirmation_arm_state"] = "site_recovery"
+            result["confirmation_armed_by_gateway"] = False
+            LOG.warning(
+                "Comando %s foi aceito, mas o arme local não pôde ser enfileirado: %s. "
+                "Nenhum reenvio físico será feito.",
+                command,
+                connector.clean_message(str(exc)),
+            )
+            return False
+
+        result["confirmation_arm_queued"] = True
+        result["confirmation_arm_state"] = "queued"
+        # Compatibilidade: para uma confirmação pendente, o Gateway assumiu a
+        # responsabilidade assim que o job FIFO foi aceito. O worker registra a
+        # janela logo em seguida; o site continua tendo seu boost idempotente
+        # como rede de segurança em caso de reinício do processo.
+        result["confirmation_armed_by_gateway"] = bool(result.get("confirmation_pending"))
+        result["confirmation_window_reused"] = False
+        return True
+
+    def _arm_command_confirmation_background(
+        self,
+        subscription_id: str,
+        payload_snapshot: dict[str, Any],
+        result_snapshot: dict[str, Any],
+    ) -> None:
+        """Persist one queued confirmation job; never dispatch a vehicle action."""
+        started = time.monotonic()
+        command = str(payload_snapshot.get("command") or "").strip().lower()
+        request_id = str(payload_snapshot.get("request_id") or "").strip()[:96]
+        local_result = dict(result_snapshot)
+        try:
+            self._arm_command_confirmation(subscription_id, payload_snapshot, local_result)
+        except BaseException as exc:  # noqa: BLE001
+            # Defesa final. `_arm_command_confirmation` já é best-effort, mas
+            # nenhuma exceção desta thread pode autorizar retry físico.
+            elapsed_ms = int(round((time.monotonic() - started) * 1000))
+            LOG.warning(
+                "Arme assíncrono de %s (%s) falhou em %sms: %s. "
+                "A ação física não será repetida.",
+                command or "desconhecido",
+                request_id or "sem request_id",
+                elapsed_ms,
+                connector.clean_message(str(exc)),
+            )
+            return
+
+        elapsed_ms = int(round((time.monotonic() - started) * 1000))
+        armed = bool(local_result.get("confirmation_armed_by_gateway"))
+        reused = bool(local_result.get("confirmation_window_reused"))
+        pending = bool(result_snapshot.get("confirmation_pending"))
+        if pending and not armed:
+            LOG.warning(
+                "Arme assíncrono de %s (%s) terminou em %sms sem janela local; "
+                "o site poderá recuperar pelo boost idempotente.",
+                command or "desconhecido",
+                request_id or "sem request_id",
+                elapsed_ms,
+            )
+        else:
+            LOG.info(
+                "Arme assíncrono de %s (%s) concluído em %sms; armada=%s reutilizada=%s.",
+                command or "desconhecido",
+                request_id or "sem request_id",
+                elapsed_ms,
+                armed,
+                reused,
+            )
 
     def _arm_command_confirmation(
         self,
@@ -1960,6 +2101,12 @@ class TelemetryEngine:
         pool, self._poll_pool = self._poll_pool, None
         if pool is not None:
             pool.shutdown(wait=True, cancel_futures=True)
+        # 1.12.93 — jobs de confirmação são locais e pequenos, mas podem estar
+        # aguardando self.lock/SQLite. Não cancelar: preservar FIFO/supersessão
+        # e terminar o bookkeeping aceito antes de fechar o storage.
+        confirmation_pool, self._confirmation_arm_pool = self._confirmation_arm_pool, None
+        if confirmation_pool is not None:
+            confirmation_pool.shutdown(wait=True, cancel_futures=False)
         self._close_all_sessions()
         self.close_storage()
         self._close_delivery_connection()

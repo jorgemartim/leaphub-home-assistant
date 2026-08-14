@@ -24,7 +24,8 @@ def test_reused_session_does_not_run_auth_success_after_dispatch() -> None:
     assert 'record_account_auth_success(environment, account_id, "command_recovery_session")' not in body
     assert 'with self._dispatch_timeout(session["client"]):' in body
     assert "post_dispatch_local_ms" in body
-    assert body.index("post_dispatch_local_ms") < body.index("self._arm_command_confirmation(")
+    assert body.index("post_dispatch_local_ms") < body.index("self._queue_command_confirmation_arm(")
+    assert "self._arm_command_confirmation(subscription_id, payload, result)" not in body
 
 
 def test_real_login_still_records_authentication_success() -> None:

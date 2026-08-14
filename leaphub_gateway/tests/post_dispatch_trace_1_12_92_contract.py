@@ -18,7 +18,7 @@ for node in ast.walk(tree):
         session_create = ast.get_source_segment(telemetry, node) or ""
 
 checks = {
-    "target_192": target == "1.12.92",
+    "target_floor_192": tuple(int(part) for part in target.split(".")) >= (1, 12, 92),
     "engine_192": f'ENGINE_VERSION = "{target}"' in telemetry,
     "server_192": f'VERSION = "{target}"' in server,
     "connector_192": f'CONNECTOR_VERSION = "{target}"' in connector,
@@ -26,6 +26,7 @@ checks = {
     "no_recovery_auth_success": '"command_recovery_session"' not in execute,
     "login_success_preserved": "client.login()" in session_create and "self.record_account_auth_success(environment, account_id, origin)" in session_create,
     "post_dispatch_phase": "post_dispatch_local_ms" in execute and "post_dispatch_local_ms" in server,
+    "confirmation_not_sync_after_dispatch": "_queue_command_confirmation_arm" in execute and "self._arm_command_confirmation(subscription_id, payload, result)" not in execute,
     "post_dispatch_log": "pos_dispatch_local=%sms" in server,
     "trace_threshold": "TELEMETRY_STAGE_LOG_THRESHOLD_MS = 750" in telemetry,
     "trace_login": '"session_login"' in telemetry,
