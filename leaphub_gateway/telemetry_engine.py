@@ -55,7 +55,7 @@ except ModuleNotFoundError:
         EVENT_TRANSPORT = _event_transport_module.EVENT_TRANSPORT
 
 LOG = logging.getLogger("leaphub.telemetry")
-ENGINE_VERSION = "1.12.84"  # prioridade manual + confirmações supersedidas
+ENGINE_VERSION = "1.12.85"  # prioridade manual + confirmações supersedidas
 
 # Hospedagem compartilhada (Apache/LiteSpeed) fecha a conexão ociosa em poucos
 # segundos. Reaproveitar depois disso escreve num socket já fechado e devolve
@@ -177,6 +177,43 @@ def semantic_snapshot(value: Any, parent_key: str = "") -> Any:
 
 class TelemetryYieldForManual(RuntimeError):
     """A coleta automática cedeu a conta para uma operação manual."""
+
+
+class _TelemetryOneShotClient:
+    """Read-only cooperative view used only by automatic telemetry.
+
+    leapmotor-api 0.3.2 public read methods can hide token refresh, full login
+    and a second request inside one Python call. Automatic telemetry must keep
+    those recovery stages visible to TelemetryEngine so a pending manual
+    command can receive the account between stages.
+
+    This adapter deliberately fails closed if the pinned one-shot method is not
+    available. The manual command path never uses this adapter.
+    """
+
+    def __init__(self, client: Any) -> None:
+        self._client = client
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._client, name)
+
+    def _one_shot(self, private_name: str, *args: Any, **kwargs: Any) -> Any:
+        method = getattr(self._client, private_name, None)
+        if not callable(method):
+            raise connector.ConnectorTemporaryError(
+                "Pinned leapmotor-api does not expose telemetry one-shot method "
+                f"{private_name}; automatic telemetry stopped before hidden retry."
+            )
+        return method(*args, **kwargs)
+
+    def get_vehicle_list(self) -> Any:
+        return self._one_shot("_get_vehicle_list")
+
+    def get_vehicle_status(self, vehicle: Any) -> Any:
+        return self._one_shot("_get_vehicle_status", vehicle)
+
+    def get_message_list(self, *, page_no: int = 1, page_size: int = 10) -> Any:
+        return self._one_shot("_get_message_list", page_no=page_no, page_size=page_size)
 
 
 class TelemetryEngine:
@@ -3801,6 +3838,11 @@ class TelemetryEngine:
             )
 
         client = session["client"]
+        # 1.12.85 — a telemetria não entrega à leapmotor-api o direito de fazer
+        # refresh/login/retry invisível dentro de uma única leitura. O cliente
+        # original continua sendo usado pelo comando; somente estas leituras
+        # cooperativas passam pela visão one-shot.
+        telemetry_client = _TelemetryOneShotClient(client)
         try:
             if manual_should_yield is not None and manual_should_yield():
                 raise TelemetryYieldForManual("Operação manual aguardando a conta.")
@@ -3819,7 +3861,7 @@ class TelemetryEngine:
             else:
                 try:
                     with self._telemetry_request_timeout(client):
-                        vehicles_value = client.get_vehicle_list()
+                        vehicles_value = telemetry_client.get_vehicle_list()
                     if manual_should_yield is not None and manual_should_yield():
                         raise TelemetryYieldForManual("Operação manual recebeu prioridade após a leitura da lista de veículos.")
                 except Exception as exc:  # noqa: BLE001
@@ -3837,7 +3879,7 @@ class TelemetryEngine:
                             if manual_should_yield is not None and manual_should_yield():
                                 raise TelemetryYieldForManual("Operação manual aguardando antes de repetir a lista de veículos.")
                             with self._telemetry_request_timeout(client):
-                                vehicles_value = client.get_vehicle_list()
+                                vehicles_value = telemetry_client.get_vehicle_list()
                         else:
                             self._close_session_locked(subscription_id)
                             raise connector.ConnectorSessionExpiredError(
@@ -3864,7 +3906,7 @@ class TelemetryEngine:
                 and ORCHESTRATOR.secondary_network_allowed(environment, account_id)
                 and now_epoch - slow_last_at >= self.slow_interval_seconds
             )
-            get_messages = getattr(client, "get_message_list", None)
+            get_messages = getattr(telemetry_client, "get_message_list", None)
             if manual_should_yield is not None and manual_should_yield():
                 raise TelemetryYieldForManual("Operação manual aguardando a conta.")
             if slow_cycle and callable(get_messages):
@@ -3920,7 +3962,7 @@ class TelemetryEngine:
                         serialized_item = connector.serialize_vehicle(
                             item,
                             include_status=True,
-                            client=client,
+                            client=telemetry_client,
                             messages=messages,
                             allow_unscoped_messages=len(selected) == 1,
                             manual_should_yield=manual_should_yield,
