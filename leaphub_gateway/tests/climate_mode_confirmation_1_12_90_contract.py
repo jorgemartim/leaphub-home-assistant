@@ -7,9 +7,9 @@ telemetry = (APP / "telemetry_engine.py").read_text(encoding="utf-8")
 target = (APP / "RELEASE_TARGET").read_text(encoding="utf-8").strip()
 
 checks = {
-    "target_190": target == "1.12.90",
-    "connector_190": 'CONNECTOR_VERSION = "1.12.90"' in connector,
-    "engine_190": 'ENGINE_VERSION = "1.12.90"' in telemetry,
+    "target_floor_190": tuple(int(part) for part in target.split(".")) >= (1, 12, 90),
+    "connector_matches_target": f'CONNECTOR_VERSION = "{target}"' in connector,
+    "engine_matches_target": f'ENGINE_VERSION = "{target}"' in telemetry,
     "mode_helper": "def _command_climate_mode(" in telemetry,
     "heat_not_switch_only": 'if command in {"climate_on", "quick_cool", "quick_heat"}:' in telemetry,
     "off_switch_generic": 'if command == "climate_off":' in telemetry,

@@ -55,7 +55,7 @@ except ModuleNotFoundError:
         EVENT_TRANSPORT = _event_transport_module.EVENT_TRANSPORT
 
 LOG = logging.getLogger("leaphub.telemetry")
-ENGINE_VERSION = "1.12.90"  # cooperative telemetry cloud reads
+ENGINE_VERSION = "1.12.91"  # command precheck no longer waits on global telemetry lock
 
 # Hospedagem compartilhada (Apache/LiteSpeed) fecha a conexão ociosa em poucos
 # segundos. Reaproveitar depois disso escreve num socket já fechado e devolve
@@ -64,13 +64,13 @@ DELIVERY_IDLE_DEFAULT_SECONDS = 5.0
 DELIVERY_IDLE_MIN_SECONDS = 2.0
 DELIVERY_IDLE_MAX_SECONDS = 30.0
 
-# 1.12.56 — teto para o comando esperar a trava global do motor. `with self.lock`
-# no caminho do comando era a única aquisição sem limite do arquivo; compare com
-# `self.lock.acquire(timeout=0.15)` e `account_lock.acquire(timeout=...)`. Um
-# comando de campo mediu precheck_motor=135718ms com todas as demais fases
-# somando ~5s. Sem teto, trava presa e leitura lenta são indistinguíveis e o
-# dono fica dois minutos olhando a tela sem resposta.
-ENGINE_LOCK_COMMAND_TIMEOUT_SECONDS = 20.0
+# 1.12.91 — o precheck do comando lê apenas a assinatura local. Essa leitura
+# não pode depender de `self.lock`: em campo um quick_heat ficou 12.292s só
+# esperando a trava GLOBAL, apesar de `latência_conta=1ms` e `dispatch=612ms`;
+# em duas tentativas anteriores o mesmo gargalo atingiu o teto de 20s e o
+# comando nem chegou ao veículo. SQLite/WAL já dá snapshot consistente para
+# SELECT; em fallback sem WAL, a própria leitura recebe um teto curto.
+COMMAND_SUBSCRIPTION_READ_TIMEOUT_SECONDS = 0.75
 
 # 1.12.82 — uma leitura AUTOMÁTICA nunca pode manter a trava da conta por
 # dezenas de segundos enquanto o dono tenta enviar um comando. O cliente
@@ -1530,30 +1530,30 @@ class TelemetryEngine:
         self.assert_account_cloud_allowed(environment, account_id, "command")
         auth_status_ms = int(round((time.monotonic() - engine_started) * 1000))
 
-        # 1.12.56 — `engine_precheck_ms` virou um balde de 135s em campo, e ele
-        # cobre três coisas distintas. Sem separar, a próxima investigação vira
-        # palpite outra vez. A aquisição também ganha teto: se a trava não sair,
-        # o comando falha rápido como transitório (503, `temporary: true`), o
-        # site o mantém na fila e nenhuma ação física chega ao veículo — o
-        # dispatch acontece bem depois deste ponto.
-        engine_lock_started = time.monotonic()
-        if not self.lock.acquire(timeout=ENGINE_LOCK_COMMAND_TIMEOUT_SECONDS):
-            raise connector.ConnectorTemporaryError(
-                "O Gateway estava ocupado com outra leitura e não liberou o motor a tempo. "
-                "O comando não foi enviado ao veículo e continua na fila."
-            )
-        engine_lock_wait_ms = int(round((time.monotonic() - engine_lock_started) * 1000))
+        # 1.12.91 — este SELECT é somente-leitura e não participa das mutações
+        # protegidas por `self.lock`. A trava global fazia qualquer conta bloquear
+        # qualquer outra: o log de campo mediu 12.292s em `trava_motor`, enquanto
+        # a trava da conta levou 1ms e o dispatch 612ms. `account_auth_status` já
+        # usa o mesmo princípio desde 1.12.82. Mantemos `engine_lock_wait_ms=0`
+        # para compatibilidade do diagnóstico e damos teto próprio ao SQLite.
+        engine_lock_wait_ms = 0
         subscription_read_started = time.monotonic()
         try:
-            with self._db() as db:
+            with self._db(timeout_seconds=COMMAND_SUBSCRIPTION_READ_TIMEOUT_SECONDS) as db:
                 row = db.execute(
                     "SELECT subscription_id,cooldown_until,status FROM subscriptions "
                     "WHERE environment=? AND account_id=? AND enabled=1 "
                     "ORDER BY updated_at DESC LIMIT 1",
                     (str(environment or ""), account_id),
                 ).fetchone()
-        finally:
-            self.lock.release()
+        except sqlite3.OperationalError as exc:
+            message = str(exc).lower()
+            if "locked" in message or "busy" in message:
+                raise connector.ConnectorTemporaryError(
+                    "A fila local de telemetria não liberou a leitura de assinatura a tempo. "
+                    "O comando não foi enviado ao veículo e continua na fila."
+                ) from exc
+            raise
         subscription_read_ms = int(round((time.monotonic() - subscription_read_started) * 1000))
         if row is None:
             return self._execute_isolated_command(environment, payload, account_id, progress)

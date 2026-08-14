@@ -1,11 +1,11 @@
-## 1.12.90
+## 1.12.91
 
 A distribuição permanece pré-compilada no GHCR oficial e conserva a publicação em duas fases.
 
-- confirmação física de AUTO/COOL/HEAT passa a exigir o modo HVAC, não apenas `climate_on=true`;
-- `quick_heat` não pode mais ser marcado como confirmado enquanto a telemetria ainda informa resfriamento;
-- normalização aceita os modos numéricos validados no C10 e sinais textuais alternativos para outros modelos;
-- modo desconhecido em veículo futuro fica inconclusivo em vez de produzir confirmação falsa;
-- `climate_off` continua confirmado pelo switch desligado;
-- `climate_details` passa a transportar também `ac_cooling_and_heating` sem nova chamada de rede;
-- dispatch, payload C10, ACK-first, duas tentativas máximas de OFF, polling, sessão persistente e bounded reads permanecem inalterados.
+- o precheck do comando manual não adquire mais a trava global `TelemetryEngine.lock` para ler a assinatura local;
+- `engine_lock_wait_ms` permanece no diagnóstico com valor zero, preservando o formato dos logs;
+- a leitura da assinatura usa SQLite diretamente com teto de 0,75s; em `locked/busy`, falha como temporária antes de qualquer dispatch;
+- trava por conta, `_session_operation_lock`, cliente Leapmotor persistente e serialização por conta permanecem inalterados;
+- confirmação mode-aware de AUTO/COOL/HEAT da 1.12.90 permanece ativa e testada;
+- bounded reads, ACK-first, payload C10, máximo de duas transmissões OFF e polling permanecem inalterados;
+- nenhum segundo cliente Leapmotor e nenhuma nova chamada de rede foram adicionados.

@@ -71,7 +71,7 @@ def test_command_session_is_reused_by_next_manual_operation() -> None:
     engine.begin_account_auth = lambda *_args: {}
     engine.record_account_auth_success = lambda *_args: None
     engine.record_account_auth_failure = lambda *_args, **_kwargs: 60
-    engine._db = contextlib.contextmanager(lambda: (yield _Database()))
+    engine._db = contextlib.contextmanager(lambda timeout_seconds=30.0: (yield _Database()))
     engine._session_operation_lock = lambda _sid: contextlib.nullcontext()
 
     clients: list[_Client] = []
