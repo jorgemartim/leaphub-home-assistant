@@ -4,6 +4,7 @@ import ast
 ROOT = Path(__file__).resolve().parents[2]
 APP = ROOT / "leaphub_gateway"
 target = (APP / "RELEASE_TARGET").read_text(encoding="utf-8").strip()
+target_parts = tuple(int(part) for part in target.split("."))
 telemetry = (APP / "telemetry_engine.py").read_text(encoding="utf-8")
 server = (APP / "connector_server.py").read_text(encoding="utf-8")
 connector = (APP / "connector.py").read_text(encoding="utf-8")
@@ -20,7 +21,7 @@ worker = funcs["_arm_command_confirmation_background"]
 stop = funcs["stop"]
 
 checks = {
-    "target_193": target == "1.12.93",
+    "target_193": target_parts >= (1, 12, 93),
     "versions": all(marker in source for marker, source in (
         (f'ENGINE_VERSION = "{target}"', telemetry),
         (f'VERSION = "{target}"', server),

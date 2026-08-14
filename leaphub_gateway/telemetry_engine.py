@@ -55,7 +55,7 @@ except ModuleNotFoundError:
         EVENT_TRANSPORT = _event_transport_module.EVENT_TRANSPORT
 
 LOG = logging.getLogger("leaphub.telemetry")
-ENGINE_VERSION = "1.12.93"  # defer local confirmation arm after accepted dispatch
+ENGINE_VERSION = "1.12.94"  # isolate control, telemetry and local visual rendering
 
 # Hospedagem compartilhada (Apache/LiteSpeed) fecha a conexão ociosa em poucos
 # segundos. Reaproveitar depois disso escreve num socket já fechado e devolve
@@ -347,6 +347,17 @@ class TelemetryEngine:
             max_workers=1,
             thread_name_prefix="leaphub-confirm-arm",
         )
+        # 1.12.94 — imagem tem fila própria e recebe somente snapshot JSON.
+        # Nunca recebe cliente/token/credenciais e nunca usa account_lock,
+        # operation_semaphore ou _session_operation_lock.
+        self._visual_render_pool: ThreadPoolExecutor | None = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="leaphub-visual",
+        )
+        self._visual_render_guard = threading.RLock()
+        self._visual_render_generation: dict[str, int] = {}
+        self._visual_render_signature: dict[str, str] = {}
+        self._visual_jobs_pending = 0
         self._inflight: set[str] = set()
         self._inflight_guard = threading.RLock()
         self.delivery_event = threading.Event()
@@ -2107,6 +2118,11 @@ class TelemetryEngine:
         confirmation_pool, self._confirmation_arm_pool = self._confirmation_arm_pool, None
         if confirmation_pool is not None:
             confirmation_pool.shutdown(wait=True, cancel_futures=False)
+        # Pollers já pararam, então nenhum render novo pode nascer. O worker
+        # visual é local e termina antes do SQLite ser fechado.
+        visual_pool, self._visual_render_pool = self._visual_render_pool, None
+        if visual_pool is not None:
+            visual_pool.shutdown(wait=True, cancel_futures=False)
         self._close_all_sessions()
         self.close_storage()
         self._close_delivery_connection()
@@ -3028,6 +3044,8 @@ class TelemetryEngine:
             "polls_in_flight": in_flight,
             "workers_saturated": in_flight >= int(self.poll_workers),
             "delivery_connection_reused": self._delivery_connection is not None,
+            "visual_jobs_pending": int(self._visual_jobs_pending),
+            "visual_worker_isolated": True,
             "journal_mode": self.storage_journal_mode,
         }
 
@@ -3760,6 +3778,15 @@ class TelemetryEngine:
                 queued_events += 1
             else:
                 skipped_events += 1
+            # A telemetria já foi persistida e, neste ponto, o finally da coleta
+            # já liberou vaga global + account lock. Só agora a imagem é pedida.
+            self._queue_visual_render(
+                subscription,
+                vehicle,
+                source_at,
+                state,
+                interactive=fast_mode,
+            )
 
         previous_state = str(subscription["last_state"] or "")
         current_command_poll = int(subscription["command_poll_count"] or 0)
@@ -3937,6 +3964,122 @@ class TelemetryEngine:
                 " (confirmação adaptativa)" if effective_command_mode else "",
             )
         self.wake_event.set()
+
+    def _queue_visual_render(
+        self,
+        subscription: Any,
+        vehicle: dict[str, Any],
+        source_at: str,
+        state: str,
+        *,
+        interactive: bool,
+    ) -> bool:
+        """Queue a local render only after the state event has been persisted."""
+        telemetry = vehicle.get("telemetry") if isinstance(vehicle.get("telemetry"), dict) else {}
+        signature = str(telemetry.get("visual_signature") or "").strip()
+        remote_id = str(vehicle.get("remote_id") or "").strip()[:190]
+        if not signature or not remote_id:
+            return False
+        pool = self._visual_render_pool
+        if pool is None:
+            return False
+
+        subscription_snapshot = {
+            "environment": str(subscription["environment"]),
+            "account_id": int(subscription["account_id"]),
+            "subscription_id": str(subscription["subscription_id"]),
+        }
+        vehicle_snapshot = json.loads(canonical_json(vehicle).decode("utf-8"))
+        key = "|".join([
+            subscription_snapshot["environment"],
+            subscription_snapshot["subscription_id"],
+            remote_id,
+        ])
+        with self._visual_render_guard:
+            # Mesmo estado visual já solicitado/concluído não ocupa a fila.
+            if self._visual_render_signature.get(key) == signature:
+                return False
+            generation = int(self._visual_render_generation.get(key, 0)) + 1
+            self._visual_render_generation[key] = generation
+            self._visual_render_signature[key] = signature
+            self._visual_jobs_pending += 1
+        try:
+            pool.submit(
+                self._render_visual_background,
+                subscription_snapshot,
+                vehicle_snapshot,
+                str(source_at or utc_iso()),
+                str(state or "parked"),
+                bool(interactive),
+                key,
+                generation,
+                signature,
+            )
+        except RuntimeError:
+            with self._visual_render_guard:
+                self._visual_jobs_pending = max(0, self._visual_jobs_pending - 1)
+                if self._visual_render_generation.get(key) == generation:
+                    self._visual_render_signature.pop(key, None)
+            return False
+        return True
+
+    def _render_visual_background(
+        self,
+        subscription_snapshot: dict[str, Any],
+        vehicle_snapshot: dict[str, Any],
+        source_at: str,
+        state: str,
+        interactive: bool,
+        key: str,
+        generation: int,
+        signature: str,
+    ) -> None:
+        """Render from local ZIP only; stale visual generations are discarded."""
+        started = time.monotonic()
+        try:
+            with self._visual_render_guard:
+                if self._visual_render_generation.get(key) != generation:
+                    return
+            rendered = connector.render_official_visual_snapshot(vehicle_snapshot)
+            if rendered is None:
+                with self._visual_render_guard:
+                    if self._visual_render_generation.get(key) == generation:
+                        self._visual_render_signature.pop(key, None)
+                return
+            with self._visual_render_guard:
+                if (
+                    self._visual_render_generation.get(key) != generation
+                    or self._visual_render_signature.get(key) != signature
+                ):
+                    return
+            queued = self._queue_event(
+                subscription_snapshot,
+                rendered,
+                source_at,
+                state,
+                interactive=interactive,
+                force_delivery=False,
+            )
+            elapsed_ms = int(round((time.monotonic() - started) * 1000))
+            if elapsed_ms >= 250:
+                LOG.info(
+                    "Imagem local de %s renderizada fora da conta em %sms; evento_visual=%s.",
+                    str(vehicle_snapshot.get("remote_id") or "")[:32],
+                    elapsed_ms,
+                    bool(queued.get("queued")),
+                )
+        except Exception as exc:  # noqa: BLE001
+            with self._visual_render_guard:
+                if self._visual_render_generation.get(key) == generation:
+                    self._visual_render_signature.pop(key, None)
+            LOG.warning(
+                "Render visual local falhou sem afetar telemetria/controle: %s",
+                connector.clean_message(str(exc)),
+            )
+        finally:
+            with self._visual_render_guard:
+                self._visual_jobs_pending = max(0, self._visual_jobs_pending - 1)
+            self.delivery_event.set()
 
     def _session_operation_lock(self, subscription_id: str) -> threading.RLock:
         key = str(subscription_id or "").strip()
@@ -4407,6 +4550,7 @@ class TelemetryEngine:
                                 manual_should_yield=manual_should_yield,
                                 include_secondary_network=False,
                                 status_override=status_value,
+                                include_official_image=False,
                             )
                         finally:
                             log_slow_telemetry_stage(subscription_id, "serialize_vehicle", serialize_started)
@@ -4424,6 +4568,7 @@ class TelemetryEngine:
                             allow_unscoped_messages=len(selected) == 1,
                             manual_should_yield=manual_should_yield,
                             include_secondary_network=False,
+                            include_official_image=False,
                         )
                 except TelemetryYieldForManual:
                     raise

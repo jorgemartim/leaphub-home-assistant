@@ -43,7 +43,7 @@ except ImportError:
         _privacy_spec.loader.exec_module(_privacy_module)
         sanitize_log = _privacy_module.sanitize_log
 
-CONNECTOR_VERSION = "1.12.93"
+CONNECTOR_VERSION = "1.12.94"
 MAX_INPUT_BYTES = 1024 * 1024
 logging.getLogger("leapmotor_api").setLevel(logging.WARNING)
 LOGGER = logging.getLogger("leaphub.connector")
@@ -1407,6 +1407,7 @@ def safe_https_url(value: Any) -> str | None:
 _IMAGE_LAST_HASH: dict[str, str] = {}
 _IMAGE_PACKAGE_CACHE: dict[str, tuple[float, Any, str, Path]] = {}
 _IMAGE_RENDER_CACHE: dict[str, tuple[float, bytes, str, dict[str, Any]]] = {}
+_IMAGE_METADATA_CACHE: dict[str, dict[str, Any]] = {}
 _IMAGE_DEBUG_LAST_HASH: dict[str, str] = {}
 # 1.12.40 — última assinatura visual cujos BYTES já foram entregues ao site.
 # `_IMAGE_LAST_HASH` guarda o hash da imagem; este guarda o ESTADO que ela
@@ -2270,17 +2271,95 @@ def official_visual_image_payload(
         # em "indisponível" só porque ela foi deduplicada.
         if changed:
             payload["data_base64"] = base64.b64encode(image_bytes).decode("ascii")
-        debug_payload = _official_debug_payload(
-            remote_id, package_file, package, visual_status, picture_key_hash,
-            render_layer_signature, render_components, captured_at,
-            force=force_debug_package,
-        )
-        if debug_payload is not None:
-            payload["debug_package"] = debug_payload
+        # 1.12.94 — a galeria de diagnóstico é pesada: ela recompõe a figura
+        # e converte várias camadas para WebP. Telemetria normal nunca precisa
+        # desse material; só uma solicitação explícita de diagnóstico o gera.
+        if force_debug_package:
+            debug_payload = _official_debug_payload(
+                remote_id, package_file, package, visual_status, picture_key_hash,
+                render_layer_signature, render_components, captured_at,
+                force=True,
+            )
+            if debug_payload is not None:
+                payload["debug_package"] = debug_payload
         return payload
     except Exception as exc:
         print(f"Leap Hub: composição da imagem oficial falhou ({type(exc).__name__}).", file=sys.stderr)
         return None
+
+
+def _remember_official_visual_metadata(remote_id: str, payload: dict[str, Any]) -> None:
+    """Cache only safe render metadata for later state-only telemetry."""
+    key = str(remote_id or "").strip()
+    signature = str(payload.get("rendered_signature") or payload.get("visual_signature") or "").strip()
+    if not key or not signature:
+        return
+    metadata = {
+        name: value
+        for name, value in payload.items()
+        if name not in {"data_base64", "debug_package"}
+    }
+    metadata["_cache_signature"] = signature
+    _IMAGE_METADATA_CACHE[key] = metadata
+    if len(_IMAGE_METADATA_CACHE) > 64:
+        for stale_key in list(_IMAGE_METADATA_CACHE)[:-48]:
+            _IMAGE_METADATA_CACHE.pop(stale_key, None)
+
+
+def cached_official_visual_metadata(remote_id: str, visual_signature: str) -> dict[str, Any] | None:
+    """Return metadata only when it still represents the same visual state."""
+    key = str(remote_id or "").strip()
+    signature = str(visual_signature or "").strip()
+    cached = _IMAGE_METADATA_CACHE.get(key)
+    if not isinstance(cached, dict) or cached.get("_cache_signature") != signature:
+        return None
+    return {name: value for name, value in cached.items() if name != "_cache_signature"}
+
+
+def render_official_visual_snapshot(vehicle_snapshot: dict[str, Any]) -> dict[str, Any] | None:
+    """Render from immutable telemetry + local ZIP, with no cloud capability.
+
+    This API intentionally accepts no Leapmotor client, token, credentials,
+    session, command callback or dispatch function. `allow_network=False` is a
+    structural guard: a slow image can never own the vehicle account.
+    """
+    if not isinstance(vehicle_snapshot, dict):
+        return None
+    rendered = json.loads(json.dumps(vehicle_snapshot, ensure_ascii=False, default=json_default))
+    telemetry = rendered.get("telemetry") if isinstance(rendered.get("telemetry"), dict) else {}
+    remote_id = str(rendered.get("remote_id") or "").strip()
+    visual_signature = str(telemetry.get("visual_signature") or "").strip()
+    if not remote_id or not visual_signature:
+        return None
+
+    image = official_visual_image_payload(
+        None,
+        None,
+        None,
+        remote_id,
+        str(telemetry.get("visual_fingerprint") or ""),
+        visual_signature,
+        str(telemetry.get("visual_primary_state") or "parked"),
+        list(telemetry.get("visual_components") or []),
+        dict(telemetry.get("charging_evidence") or {}),
+        str(telemetry.get("captured_at") or datetime.utcnow().isoformat() + "Z"),
+        force_visual_bytes=True,
+        force_debug_package=False,
+        force_package_refresh=False,
+        manual_should_yield=None,
+        allow_network=False,
+    )
+    if image is None:
+        return None
+
+    telemetry["visual_image"] = image
+    telemetry["official_visual_image"] = {
+        name: value for name, value in image.items() if name != "data_base64"
+    }
+    rendered["telemetry"] = telemetry
+    _remember_official_visual_metadata(remote_id, image)
+    _IMAGE_LAST_SIGNATURE[remote_id] = visual_signature
+    return rendered
 
 
 def charging_label(status: Any) -> str:
@@ -2298,6 +2377,7 @@ def serialize_vehicle(
     manual_should_yield: Callable[[], bool] | None = None,
     include_secondary_network: bool = True,
     status_override: Any | None = None,
+    include_official_image: bool = True,
 ) -> dict[str, Any]:
     vin = str(attribute(vehicle, "vin", "") or "").strip()
     remote_id = str(attribute(vehicle, "car_id", "") or vin).strip()
@@ -2878,6 +2958,29 @@ def serialize_vehicle(
     # de estado, não por leitura, e `_official_render_cache_key()` já evita
     # recompor estado repetido.
     visual_key = remote_id or vin
+
+    # 1.12.94 — a telemetria essencial termina antes de Pillow/ZIP/WebP.
+    # Se a figura já foi renderizada para a MESMA assinatura, reaproveitamos
+    # só os metadados baratos para manter deduplicação estável. Se mudou, o
+    # worker visual anexará os bytes depois, já fora de qualquer trava cloud.
+    if not include_official_image:
+        cached_visual = cached_official_visual_metadata(visual_key, visual_signature)
+        if cached_visual is not None:
+            telemetry["visual_image"] = dict(cached_visual)
+            telemetry["official_visual_image"] = dict(cached_visual)
+        else:
+            telemetry["official_visual_image"] = compact_mapping({
+                "source": "leapmotor-picture-package",
+                "available": False,
+                "deferred_local_render": True,
+                "visual_fingerprint": visual_fingerprint_value,
+                "rendered_primary_state": visual_primary_state,
+                "rendered_signature": visual_signature,
+                "render_contract_version": 15,
+            })
+        result["telemetry"] = telemetry
+        return result
+
     try:
         manual_waiting = bool(manual_should_yield and manual_should_yield())
     except Exception:
