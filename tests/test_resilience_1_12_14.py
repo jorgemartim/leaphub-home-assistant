@@ -116,11 +116,11 @@ with tempfile.TemporaryDirectory(prefix="leaphub-resilience-") as tmp:
             self.message_calls = 0
             self.closed = 0
 
-        def get_vehicle_list(self):
+        def _get_vehicle_list(self):
             self.vehicle_calls += 1
             return [Vehicle()]
 
-        def get_message_list(self, page_no=1, page_size=100):
+        def _get_message_list(self, page_no=1, page_size=100):
             self.message_calls += 1
             return MessagePage()
 
@@ -160,7 +160,7 @@ with tempfile.TemporaryDirectory(prefix="leaphub-resilience-") as tmp:
     check(nonlocal_holder[0] == 2, "Estado do veículo deixou de ser serializado em cada coleta")
 
     class ExpiredClient(CachedClient):
-        def get_vehicle_list(self):
+        def _get_vehicle_list(self):
             raise RuntimeError("invalid token: session expired")
 
     expired = ExpiredClient()
