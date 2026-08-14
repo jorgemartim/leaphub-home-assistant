@@ -55,7 +55,7 @@ except ModuleNotFoundError:
         EVENT_TRANSPORT = _event_transport_module.EVENT_TRANSPORT
 
 LOG = logging.getLogger("leaphub.telemetry")
-ENGINE_VERSION = "1.12.91"  # command precheck no longer waits on global telemetry lock
+ENGINE_VERSION = "1.12.92"  # fast post-dispatch return + telemetry stage tracing
 
 # Hospedagem compartilhada (Apache/LiteSpeed) fecha a conexão ociosa em poucos
 # segundos. Reaproveitar depois disso escreve num socket já fechado e devolve
@@ -78,6 +78,12 @@ COMMAND_SUBSCRIPTION_READ_TIMEOUT_SECONDS = 0.75
 # telemetria emprestam este teto curto. O despacho manual continua usando
 # `_dispatch_timeout`, portanto esta proteção não encurta o comando do usuário.
 TELEMETRY_NETWORK_BLOCK_CEILING_SECONDS = 4.0
+
+# 1.12.92 — diagnóstico somente. Não altera timeout, polling nem quantidade de
+# chamadas. Etapas que segurarem a conta por tempo perceptível ganham uma linha
+# própria para que o próximo ajuste seja feito sobre a causa medida, não por
+# aproximação.
+TELEMETRY_STAGE_LOG_THRESHOLD_MS = 750
 
 # 1.12.78 — o anúncio do fim do comando é melhor esforço, e o teto é curto de
 # propósito. Ele existe para o site não esperar a próxima volta do cron; se
@@ -139,6 +145,20 @@ CONFIRMATION_SUPERSESSION_GROUP = {
 
 def utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def log_slow_telemetry_stage(subscription_id: str, stage: str, started_at: float, *, origin: str = "telemetry") -> int:
+    """Log only slow local/cloud stages; never changes control flow or retries."""
+    elapsed_ms = int(round((time.monotonic() - started_at) * 1000))
+    if elapsed_ms >= TELEMETRY_STAGE_LOG_THRESHOLD_MS:
+        LOG.info(
+            "Telemetria %s etapa=%s demorou=%sms origem=%s.",
+            str(subscription_id or "")[:96],
+            str(stage or "unknown")[:64],
+            elapsed_ms,
+            str(origin or "telemetry")[:40],
+        )
+    return elapsed_ms
 
 
 def canonical_json(value: Any) -> bytes:
@@ -1413,37 +1433,65 @@ class TelemetryEngine:
         temp_dir = connector.secure_temp_directory()
         client = None
         try:
-            client = connector.create_client(
-                credentials,
-                temp_dir,
-                None,
+            create_client_started = time.monotonic()
+            try:
+                client = connector.create_client(
+                    credentials,
+                    temp_dir,
+                    None,
                 # 1.12.71 — o cliente nasce com o tempo limite da TELEMETRIA, que
                 # é quem segura a trava da conta durante a chamada. Os segundos
                 # a mais de que o despacho precisa são emprestados só a ele, em
                 # `_dispatch_timeout`. A 1.12.70 elevava o cliente inteiro, e
                 # isso alongava a espera de quem manda o comando seguinte.
-                request_timeout_seconds=(
-                    self.telemetry_network_timeout_seconds
-                    if origin == "telemetry"
-                    else self.request_timeout_seconds
-                ),
-            )
+                    request_timeout_seconds=(
+                        self.telemetry_network_timeout_seconds
+                        if origin == "telemetry"
+                        else self.request_timeout_seconds
+                    ),
+                )
+            finally:
+                log_slow_telemetry_stage(subscription_id, "session_create_client", create_client_started, origin=origin)
             if manual_should_yield is not None and manual_should_yield():
                 raise TelemetryYieldForManual("Operação manual recebeu prioridade antes do login automático.")
 
-            self.begin_account_auth(environment, account_id, origin)
-            with self.lock, self._db() as db:
-                db.execute(
-                    "UPDATE subscriptions SET last_auth_attempt_at=?,updated_at=? WHERE subscription_id=?",
-                    (time.time(), utc_iso(), subscription_id),
-                )
-            client.login()
-            self.record_account_auth_success(environment, account_id, origin)
-            with self.lock, self._db() as db:
-                db.execute(
-                    "UPDATE subscriptions SET last_auth_success_at=?,cooldown_reason=NULL,updated_at=? WHERE subscription_id=?",
-                    (time.time(), utc_iso(), subscription_id),
-                )
+            auth_reservation_started = time.monotonic()
+            try:
+                self.begin_account_auth(environment, account_id, origin)
+            finally:
+                log_slow_telemetry_stage(subscription_id, "session_auth_reservation", auth_reservation_started, origin=origin)
+
+            auth_attempt_write_started = time.monotonic()
+            try:
+                with self.lock, self._db() as db:
+                    db.execute(
+                        "UPDATE subscriptions SET last_auth_attempt_at=?,updated_at=? WHERE subscription_id=?",
+                        (time.time(), utc_iso(), subscription_id),
+                    )
+            finally:
+                log_slow_telemetry_stage(subscription_id, "session_auth_attempt_write", auth_attempt_write_started, origin=origin)
+
+            login_started = time.monotonic()
+            try:
+                client.login()
+            finally:
+                log_slow_telemetry_stage(subscription_id, "session_login", login_started, origin=origin)
+
+            auth_success_started = time.monotonic()
+            try:
+                self.record_account_auth_success(environment, account_id, origin)
+            finally:
+                log_slow_telemetry_stage(subscription_id, "session_auth_success_bookkeeping", auth_success_started, origin=origin)
+
+            auth_success_write_started = time.monotonic()
+            try:
+                with self.lock, self._db() as db:
+                    db.execute(
+                        "UPDATE subscriptions SET last_auth_success_at=?,cooldown_reason=NULL,updated_at=? WHERE subscription_id=?",
+                        (time.time(), utc_iso(), subscription_id),
+                    )
+            finally:
+                log_slow_telemetry_stage(subscription_id, "session_auth_success_write", auth_success_write_started, origin=origin)
         except Exception as exc:
             if client is not None:
                 try:
@@ -1620,9 +1668,16 @@ class TelemetryEngine:
                         )
                 finally:
                     handle_command_ms = int(round((time.monotonic() - handle_started) * 1000))
+                # 1.12.92 — `handle_command()` já terminou aqui. Em sessão
+                # reutilizada não ocorreu autenticação, portanto não há estado de
+                # autenticação para "confirmar". A chamada antiga a
+                # record_account_auth_success() adquiria a trava global duas vezes
+                # (incluindo limpeza de cooldown) e, em campo, reteve o retorno
+                # por 11–37s DEPOIS de o carro já receber o comando.
+                post_dispatch_started = time.monotonic()
                 session["last_used_at"] = time.time()
-                self.record_account_auth_success(environment, account_id, "command_session")
                 result["session_retained_for_fast_confirmation"] = True
+                post_dispatch_local_ms = int(round((time.monotonic() - post_dispatch_started) * 1000))
                 arm_started = time.monotonic()
                 try:
                     self._arm_command_confirmation(subscription_id, payload, result)
@@ -1641,6 +1696,7 @@ class TelemetryEngine:
                     phase["engine_lock_wait_ms"] = engine_lock_wait_ms
                     phase["subscription_read_ms"] = subscription_read_ms
                     phase["handle_command_ms"] = handle_command_ms
+                    phase["post_dispatch_local_ms"] = post_dispatch_local_ms
                     phase["confirmation_arm_ms"] = confirmation_arm_ms
                 return result
             except Exception as exc:
@@ -1684,7 +1740,10 @@ class TelemetryEngine:
                             self._close_session_locked(subscription_id)
                         raise
                     recovered_session["last_used_at"] = time.time()
-                    self.record_account_auth_success(environment, account_id, "command_recovery_session")
+                    # A sessão de recuperação acabou de ser autenticada por
+                    # _create_persistent_session_locked(), que já registrou o
+                    # sucesso real do login. Não repetir bookkeeping após o
+                    # dispatch aceito.
                     recovered["session_recovered"] = True
                     recovered["session_reused"] = True
                     recovered["session_retained_for_fast_confirmation"] = True
@@ -3399,6 +3458,12 @@ class TelemetryEngine:
                 manual_should_yield=manual_should_yield,
                 allow_slow_network=not (interactive or command_mode),
             )
+            log_slow_telemetry_stage(
+                sid,
+                "collection_total",
+                collection_started_at,
+                origin="confirmation" if command_mode else ("interactive" if interactive else "background"),
+            )
         except TelemetryYieldForManual:
             ORCHESTRATOR.record_telemetry_cycle(
                 environment,
@@ -3749,7 +3814,9 @@ class TelemetryEngine:
         # Somente a sessão desta conta fica bloqueada durante a chamada de rede.
         # Outras contas respeitam o limite global do Connector, mas não ficam
         # paradas atrás de uma autenticação lenta ou de um veículo offline.
+        session_lock_started = time.monotonic()
         with self._session_operation_lock(subscription_id):
+            log_slow_telemetry_stage(subscription_id, "session_operation_lock_wait", session_lock_started)
             return self._collect_with_session_locked(
                 subscription_id,
                 environment,
@@ -3801,8 +3868,12 @@ class TelemetryEngine:
             )
 
         def call_once() -> list[Any]:
-            with self._telemetry_request_timeout(client):
-                value = method()
+            request_started = time.monotonic()
+            try:
+                with self._telemetry_request_timeout(client):
+                    value = method()
+            finally:
+                log_slow_telemetry_stage(subscription_id, "vehicle_list_request", request_started)
             return value if isinstance(value, list) else list(value or [])
 
         try:
@@ -3813,8 +3884,12 @@ class TelemetryEngine:
                 raise
 
             yield_for_manual("antes do refresh")
-            with self._telemetry_request_timeout(client):
-                refreshed = self._try_refresh_client_session(client)
+            refresh_started = time.monotonic()
+            try:
+                with self._telemetry_request_timeout(client):
+                    refreshed = self._try_refresh_client_session(client)
+            finally:
+                log_slow_telemetry_stage(subscription_id, "vehicle_list_refresh", refresh_started)
             yield_for_manual("depois do refresh")
 
             if not refreshed:
@@ -3881,8 +3956,12 @@ class TelemetryEngine:
             )
 
         def call_once() -> Any:
-            with self._telemetry_request_timeout(client):
-                return method(page_no=1, page_size=100)
+            request_started = time.monotonic()
+            try:
+                with self._telemetry_request_timeout(client):
+                    return method(page_no=1, page_size=100)
+            finally:
+                log_slow_telemetry_stage(subscription_id, "message_list_request", request_started)
 
         try:
             value = call_once()
@@ -3892,8 +3971,12 @@ class TelemetryEngine:
                 raise
 
             yield_for_manual("antes do refresh")
-            with self._telemetry_request_timeout(client):
-                refreshed = self._try_refresh_client_session(client)
+            refresh_started = time.monotonic()
+            try:
+                with self._telemetry_request_timeout(client):
+                    refreshed = self._try_refresh_client_session(client)
+            finally:
+                log_slow_telemetry_stage(subscription_id, "message_list_refresh", refresh_started)
             yield_for_manual("depois do refresh")
 
             if not refreshed:
@@ -3957,8 +4040,12 @@ class TelemetryEngine:
             )
 
         def call_once() -> Any:
-            with self._telemetry_request_timeout(client):
-                return method(vehicle)
+            request_started = time.monotonic()
+            try:
+                with self._telemetry_request_timeout(client):
+                    return method(vehicle)
+            finally:
+                log_slow_telemetry_stage(subscription_id, "status_request", request_started)
 
         try:
             value = call_once()
@@ -3968,8 +4055,12 @@ class TelemetryEngine:
                 raise
 
             yield_for_manual("antes do refresh")
-            with self._telemetry_request_timeout(client):
-                refreshed = self._try_refresh_client_session(client)
+            refresh_started = time.monotonic()
+            try:
+                with self._telemetry_request_timeout(client):
+                    refreshed = self._try_refresh_client_session(client)
+            finally:
+                log_slow_telemetry_stage(subscription_id, "status_refresh", refresh_started)
             yield_for_manual("depois do refresh")
 
             if not refreshed:
@@ -4158,16 +4249,20 @@ class TelemetryEngine:
                             item,
                             manual_should_yield=manual_should_yield,
                         )
-                        serialized_item = connector.serialize_vehicle(
-                            item,
-                            include_status=True,
-                            client=client,
-                            messages=messages,
-                            allow_unscoped_messages=len(selected) == 1,
-                            manual_should_yield=manual_should_yield,
-                            include_secondary_network=False,
-                            status_override=status_value,
-                        )
+                        serialize_started = time.monotonic()
+                        try:
+                            serialized_item = connector.serialize_vehicle(
+                                item,
+                                include_status=True,
+                                client=client,
+                                messages=messages,
+                                allow_unscoped_messages=len(selected) == 1,
+                                manual_should_yield=manual_should_yield,
+                                include_secondary_network=False,
+                                status_override=status_value,
+                            )
+                        finally:
+                            log_slow_telemetry_stage(subscription_id, "serialize_vehicle", serialize_started)
                     elif official_leapmotor_client:
                         raise connector.ConnectorTemporaryError(
                             "Cliente Leapmotor real sem _get_vehicle_status; "

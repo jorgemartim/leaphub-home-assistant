@@ -6,7 +6,7 @@ tree=ast.parse(telemetry); body=""
 for node in ast.walk(tree):
     if isinstance(node,ast.FunctionDef) and node.name=="execute_command": body=ast.get_source_segment(telemetry,node) or ""; break
 checks={
-"target_191":target=="1.12.91","engine_191":'ENGINE_VERSION = "1.12.91"' in telemetry,"connector_191":'CONNECTOR_VERSION = "1.12.91"' in connector,
+"target_floor_191":tuple(int(part) for part in target.split("."))>=(1,12,91),"engine_matches_target":f'ENGINE_VERSION = "{target}"' in telemetry,"connector_matches_target":f'CONNECTOR_VERSION = "{target}"' in connector,
 "no_global_acquire":"self.lock.acquire(" not in body,"no_global_with":"with self.lock" not in body,"metric_zero":"engine_lock_wait_ms = 0" in body,
 "bounded_db":"self._db(timeout_seconds=COMMAND_SUBSCRIPTION_READ_TIMEOUT_SECONDS)" in body,"short_timeout":bool(re.search(r"^COMMAND_SUBSCRIPTION_READ_TIMEOUT_SECONDS = 0\.75$",telemetry,re.MULTILINE)),
 "busy_temporary":"A fila local de telemetria não liberou a leitura de assinatura a tempo." in body,"session_lock_preserved":"with self._session_operation_lock(subscription_id):" in body,

@@ -1,0 +1,16 @@
+CHANGED-FILES-1.12.92.txt
+GITHUB-RECOVERY-1.12.92.md
+RELEASE-1.12.92.md
+leaphub_gateway/CHANGELOG.md
+leaphub_gateway/RELEASE-1.12.92.md
+leaphub_gateway/RELEASE_TARGET
+leaphub_gateway/connector.py
+leaphub_gateway/connector_server.py
+leaphub_gateway/gateway_manager.py
+leaphub_gateway/ocpp_gateway.py
+leaphub_gateway/privacy.py
+leaphub_gateway/telemetry_engine.py
+leaphub_gateway/tests/command_precheck_no_global_lock_1_12_91_contract.py
+leaphub_gateway/tests/post_dispatch_trace_1_12_92_contract.py
+tests/test_post_dispatch_ack_1_12_92.py
+tests/test_telemetry_stage_trace_1_12_92.py
