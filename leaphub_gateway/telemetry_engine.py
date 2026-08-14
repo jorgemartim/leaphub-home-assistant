@@ -3985,6 +3985,10 @@ class TelemetryEngine:
                         messages=messages,
                         allow_unscoped_messages=len(selected) == 1,
                         manual_should_yield=manual_should_yield,
+                        # Compatibilidade com o contrato histórico 1.12.29:
+                            # include_secondary_network=slow_cycle
+                        # A rede secundária continua deliberadamente fora
+                        # da trava da conta na telemetria contínua.
                         include_secondary_network=False,
                     )
 
