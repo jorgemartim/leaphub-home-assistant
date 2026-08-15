@@ -44,6 +44,7 @@ modules = {
     'privacy.py': 'leaphub_privacy.py',
     'connection_orchestrator.py': 'leaphub_connection_orchestrator.py',
     'event_transport.py': 'leaphub_event_transport.py',
+    'official_trip_probe.py': 'leaphub_official_trip_probe.py',
 }
 for source_name, target_name in modules.items():
     source = base / source_name
@@ -65,7 +66,7 @@ import leaphub_telemetry_engine
 import leaphub_privacy
 import leaphub_connection_orchestrator
 import leaphub_event_transport
-import official_trip_probe
+import leaphub_official_trip_probe
 from leaphub_telemetry_engine import TelemetryEngine
 assert Path('/app/connector.py').is_file()
 assert Path('/app/telemetry_engine.py').is_file()
@@ -74,7 +75,7 @@ assert leaphub_telemetry_engine.ENGINE_VERSION
 assert leaphub_privacy.PRIVACY_VERSION
 assert leaphub_connection_orchestrator.ORCHESTRATOR is not None
 assert leaphub_event_transport.EVENT_TRANSPORT is not None
-assert official_trip_probe.PROBE_VERSION == "1.12.96"
+assert leaphub_official_trip_probe.PROBE_VERSION == "1.12.97"
 assert TelemetryEngine is not None
 import os
 import sqlite3

@@ -71,3 +71,24 @@
 - Escopo do veículo é revalidado por `vehicle_ids_json`; resposta é somente shape redigido e nenhum `official_*` é promovido antes do teste real do C10.
 - `config.yaml` fica 1.12.95 no commit funcional; promoção para 1.12.96 continua exclusiva da automação após GHCR público.
 - Próximo campo: publicar 1.12.96, instalar no HA, medir confirmação e coletar evidência redigida do drivingRecord; só depois preparar Site Beta 1.12.360.
+
+
+## Hotfix Gateway 1.12.97 — runtime Official
+
+- Base: 1.12.96 publicada (`215c4215d58ce3e2439c1bb2dcec0041995414c4`).
+- Homologação física 1.12.96: comandos, telemetria, imagem e isolamento sem regressão detectada.
+- Falha nova isolada à sonda Official: primeira chamada real retornou HTTP 500 em ~0,12s.
+- Traceback: `ModuleNotFoundError: No module named 'official_trip_probe'` ao entrar em `execute_driving_record_probe`; nenhuma chamada Official chegou à Leapmotor.
+- Causa: Dockerfile copiava `official_trip_probe.py` para `/app`, mas não o instalava com nome interno em `site-packages`, ao contrário dos demais módulos runtime.
+- 1.12.97: instalar como `leaphub_official_trip_probe.py`, importar esse nome primeiro e manter fallback local.
+- Congelados: ACK-first, payloads C10, climate_off máx. 2 transmissões, sem retry trunk/sunshade, cadência pós-comando 5/5/8, estrutural/interativa 6s, telemetria, imagem 1.12.95, HMAC, OCPP e Produção.
+- Próximo passo: publicar 1.12.97, instalar somente após Actions + `[gateway-published]`, repetir UMA sonda read-only e analisar apenas shape redigido.
+
+
+### Pré-validação integral da 1.12.97 — contratos históricos
+
+- O primeiro teste de campo da 1.12.96 encontrou `ModuleNotFoundError: official_trip_probe` antes de qualquer chamada Official à Leapmotor.
+- A 1.12.97 permanece um hotfix de empacotamento/import; nenhuma lógica de controle físico foi reaberta.
+- Falhas anteriores dos publishers 1.12.97 ocorreram antes de commit/push: quoting do WSL, leitura de caminho do Git, `wslpath` de `%TEMP%` e CRLF no stdin.
+- A pré-validação final inclui scanner dos contratos históricos, artefatos root/add-on/recovery do alvo, smoke isolado de `site-packages`, regressões direcionadas e validator oficial completo repetido três vezes.
+- `config.yaml` permanece 1.12.96 até a promoção automática após imagem GHCR pública.

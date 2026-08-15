@@ -55,7 +55,7 @@ except ModuleNotFoundError:
         EVENT_TRANSPORT = _event_transport_module.EVENT_TRANSPORT
 
 LOG = logging.getLogger("leaphub.telemetry")
-ENGINE_VERSION = "1.12.96"  # post-command cadence + low-priority official probe; visual/control isolation preserved
+ENGINE_VERSION = "1.12.97"  # runtime packaging hotfix for Official probe; command/visual cadence preserved
 
 # Hospedagem compartilhada (Apache/LiteSpeed) fecha a conexão ociosa em poucos
 # segundos. Reaproveitar depois disso escreve num socket já fechado e devolve
@@ -1274,7 +1274,10 @@ class TelemetryEngine:
         telemetry/modern command architecture: account -> global slot -> session.
         A manual command is rechecked at every boundary and wins before network.
         """
-        from official_trip_probe import normalize_window, probe_windowed_mileage_energy
+        try:
+            from leaphub_official_trip_probe import normalize_window, probe_windowed_mileage_energy
+        except ModuleNotFoundError:
+            from official_trip_probe import normalize_window, probe_windowed_mileage_energy
 
         overall_started = time.monotonic()
         account_id = self._account_id(payload)
