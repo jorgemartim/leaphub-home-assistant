@@ -55,7 +55,7 @@ except ModuleNotFoundError:
         EVENT_TRANSPORT = _event_transport_module.EVENT_TRANSPORT
 
 LOG = logging.getLogger("leaphub.telemetry")
-ENGINE_VERSION = "1.12.95"  # fast local image path; control/telemetry remain isolated
+ENGINE_VERSION = "1.12.96"  # post-command cadence + low-priority official probe; visual/control isolation preserved
 
 # Hospedagem compartilhada (Apache/LiteSpeed) fecha a conexão ociosa em poucos
 # segundos. Reaproveitar depois disso escreve num socket já fechado e devolve
@@ -266,6 +266,7 @@ class TelemetryEngine:
     # COMMAND_WINDOW_CEILING_SECONDS —, mas o comentário ficou para trás,
     # contradizendo o código logo abaixo dele.
     COMMAND_FIRST_POLL_CEILING_SECONDS = 6
+    COMMAND_POST_DISPATCH_EARLY_CADENCE = (5, 5, 8)  # 1.12.96: somente janela pós-despacho
 
     # 1.12.77 — teto da cadência com a tela aberta.
     #
@@ -416,7 +417,7 @@ class TelemetryEngine:
         # O piso agora é DERIVADO, não escolhido: é quantas leituras cabem na
         # janela cheia com o menor degrau da escada. Elevá-lo não cria requisição
         # nenhuma — quem marca o ritmo é a cadência; o teto só trunca.
-        first_step = max(1, min(self.command_seconds, self.COMMAND_FIRST_POLL_CEILING_SECONDS))
+        first_step = max(1, min(self.command_seconds, self.COMMAND_POST_DISPATCH_EARLY_CADENCE[0]))
         derived_floor = -(-self.COMMAND_WINDOW_CEILING_SECONDS // first_step) + 1
         polls_floor = max(self.COMMAND_MAX_POLLS_FLOOR, derived_floor)
         self.command_max_polls = self._bounded(
@@ -441,6 +442,10 @@ class TelemetryEngine:
             45,
             60,
             90,
+        )
+        self.command_effective_cadence = (
+            *self.COMMAND_POST_DISPATCH_EARLY_CADENCE,
+            *self.command_cadence[len(self.COMMAND_POST_DISPATCH_EARLY_CADENCE):],
         )
         self.charging_seconds = self._bounded("telemetry_charging_seconds", 25, 15, 600)
         self.parked_seconds = self._bounded("telemetry_parked_seconds", 90, 60, 3600)
@@ -1257,6 +1262,265 @@ class TelemetryEngine:
                 return True
         return False
 
+    def execute_driving_record_probe(
+        self,
+        environment: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Run one low-priority Official read on an already-open account session.
+
+        This path never creates/login/refreshes a client and never retries the
+        cloud request. Discovery is read-only and bounded; lock order follows the
+        telemetry/modern command architecture: account -> global slot -> session.
+        A manual command is rechecked at every boundary and wins before network.
+        """
+        from official_trip_probe import normalize_window, probe_windowed_mileage_energy
+
+        overall_started = time.monotonic()
+        account_id = self._account_id(payload)
+        if account_id < 1:
+            raise ValueError("Conta inválida para a sonda de histórico.")
+        begin_ms, end_ms = normalize_window(payload)
+        vehicle_id = str(payload.get("vehicle_id") or "").strip()[:190]
+        direct_vin = str(payload.get("vehicle_vin") or "").strip().upper()
+        if direct_vin and (len(direct_vin) != 17 or not direct_vin.isalnum()):
+            raise ValueError("Identificador VIN inválido para a sonda de histórico.")
+
+        operation_payload: dict[str, Any] = {"account_id": account_id}
+        if vehicle_id:
+            operation_payload["vehicle_id"] = vehicle_id
+
+        def deferred(reason: str, retry: int = 5, **extra: Any) -> dict[str, Any]:
+            result = {
+                "ok": False, "temporary": True, "low_priority": True, "reason": reason,
+                "retry_after_seconds": max(2, min(30, int(retry))),
+                "message": "A leitura oficial cedeu prioridade ao fluxo principal e poderá ser tentada depois.",
+                "engine_version": ENGINE_VERSION, "connector_version": connector.CONNECTOR_VERSION,
+                "library_version": connector.package_version(), "raw_values_included": False, "mapped_fields": [],
+                "total_ms": int(round((time.monotonic() - overall_started) * 1000)),
+            }
+            result.update(extra)
+            return result
+
+        manual = self.manual_pending_provider
+        if manual is not None and manual(environment, operation_payload):
+            return deferred("manual_priority")
+
+        # Do not use self._db here: on a new request thread its persistent
+        # connection starts with a 30s busy timeout before _db can shorten it.
+        # Official uses an independent read-only connection whose timeout is
+        # bounded from the moment it is opened, then closes it immediately.
+        probe_db = None
+        try:
+            probe_uri = self.db_path.resolve().as_uri() + "?mode=ro"
+            probe_db = sqlite3.connect(probe_uri, uri=True, timeout=0.15)
+            probe_db.row_factory = sqlite3.Row
+            probe_db.execute("PRAGMA busy_timeout=150")
+            probe_db.execute("PRAGMA query_only=ON")
+            auth_row = probe_db.execute(
+                "SELECT cooldown_until,attempt_guard_until FROM account_auth_state "
+                "WHERE environment=? AND account_id=? LIMIT 1",
+                (str(environment or ""), account_id),
+            ).fetchone()
+            rows = list(probe_db.execute(
+                "SELECT subscription_id,vehicle_ids_json FROM subscriptions "
+                "WHERE environment=? AND account_id=? AND enabled=1 ORDER BY updated_at DESC LIMIT 32",
+                (str(environment or ""), account_id),
+            ).fetchall())
+        except (OSError, sqlite3.Error):
+            return deferred("subscription_store_busy", 5)
+        finally:
+            if probe_db is not None:
+                probe_db.close()
+
+        now_epoch = time.time()
+        if auth_row is not None:
+            blocked_until = max(float(auth_row["cooldown_until"] or 0), float(auth_row["attempt_guard_until"] or 0))
+            if blocked_until > now_epoch:
+                return deferred("account_cooldown", max(2, min(30, int(blocked_until - now_epoch))))
+        if not rows:
+            return deferred("subscription_not_ready", 15)
+
+        target: tuple[str, Any, Any, str, str, set[str]] | None = None
+        implicit_targets: dict[tuple[str, str], tuple[str, Any, Any, str, str, set[str]]] = {}
+        vehicle_id_authorized = False
+        ready_sessions = 0
+        for row in rows:
+            subscription_id = str(row["subscription_id"] or "")
+            try:
+                decoded_ids = json.loads(str(row["vehicle_ids_json"] or "[]"))
+                authorized_ids = {str(item).strip()[:190] for item in decoded_ids if str(item).strip()} if isinstance(decoded_ids, list) else set()
+            except (TypeError, ValueError, json.JSONDecodeError):
+                authorized_ids = set()
+            if vehicle_id and vehicle_id in authorized_ids:
+                vehicle_id_authorized = True
+            with self.session_lock:
+                session = self.sessions.get(subscription_id)
+            if not isinstance(session, dict) or session.get("client") is None:
+                continue
+            ready_sessions += 1
+            client = session["client"]
+            vehicles = session.get("vehicles") if isinstance(session.get("vehicles"), list) else []
+            candidates: list[tuple[Any, str, str]] = []
+            for item in vehicles:
+                remote_id = str(connector.attribute(item, "car_id", "") or connector.attribute(item, "vin", "") or "").strip()[:190]
+                vin = str(connector.attribute(item, "vin", "") or "").strip().upper()
+                if not remote_id or remote_id not in authorized_ids:
+                    continue
+                if len(vin) != 17 or not vin.isalnum():
+                    continue
+                if vehicle_id and remote_id != vehicle_id:
+                    continue
+                if direct_vin and vin != direct_vin:
+                    continue
+                candidates.append((item, remote_id, vin))
+            if vehicle_id or direct_vin:
+                if len(candidates) == 1:
+                    _item, remote_id, vin = candidates[0]
+                    target = (subscription_id, session, client, remote_id, vin, authorized_ids)
+                    break
+                if len(candidates) > 1:
+                    raise ValueError("A sessão retornou mais de um alvo para os identificadores informados.")
+            else:
+                for _item, remote_id, vin in candidates:
+                    implicit_targets.setdefault(
+                        (remote_id, vin),
+                        (subscription_id, session, client, remote_id, vin, authorized_ids),
+                    )
+
+        if target is None and not vehicle_id and not direct_vin:
+            if len(implicit_targets) == 1:
+                target = next(iter(implicit_targets.values()))
+            elif len(implicit_targets) > 1:
+                raise ValueError("Informe o veículo para uma conta com mais de um veículo autorizado.")
+
+        if target is None:
+            if vehicle_id and not vehicle_id_authorized:
+                raise ValueError("O veículo informado não pertence ao escopo autorizado desta assinatura.")
+            return deferred("session_not_ready" if ready_sessions == 0 else "vehicle_not_cached", 15)
+
+        subscription_id, expected_session, client, remote_id, vin, authorized_ids = target
+        if self.account_lock_provider is None:
+            return deferred("account_lock_unavailable", 15)
+
+        account_lock: Any | None = None
+        account_acquired = False
+        slot_acquired = False
+        session_acquired = False
+        account_wait_ms = 0
+        slot_wait_ms = 0
+        session_wait_ms = 0
+        session_operation_lock = self._session_operation_lock(subscription_id)
+        try:
+            account_lock = self.account_lock_provider(environment, operation_payload)
+            wait_started = time.monotonic()
+            account_acquired = account_lock.acquire(timeout=0.10)
+            account_wait_ms = int(round((time.monotonic() - wait_started) * 1000))
+            if not account_acquired:
+                return deferred("account_busy", 5, account_wait_ms=account_wait_ms)
+            if manual is not None and manual(environment, operation_payload):
+                return deferred("manual_priority", account_wait_ms=account_wait_ms)
+
+            wait_started = time.monotonic()
+            slot_acquired = self.operation_semaphore.acquire(timeout=0.10)
+            slot_wait_ms = int(round((time.monotonic() - wait_started) * 1000))
+            if not slot_acquired:
+                return deferred("connector_busy", 5, account_wait_ms=account_wait_ms, connector_slot_ms=slot_wait_ms)
+            if manual is not None and manual(environment, operation_payload):
+                return deferred("manual_priority", account_wait_ms=account_wait_ms, connector_slot_ms=slot_wait_ms)
+
+            wait_started = time.monotonic()
+            session_acquired = session_operation_lock.acquire(timeout=0.10)
+            session_wait_ms = int(round((time.monotonic() - wait_started) * 1000))
+            if not session_acquired:
+                return deferred(
+                    "session_busy", 5, account_wait_ms=account_wait_ms,
+                    connector_slot_ms=slot_wait_ms, session_wait_ms=session_wait_ms,
+                )
+            if manual is not None and manual(environment, operation_payload):
+                return deferred(
+                    "manual_priority", account_wait_ms=account_wait_ms,
+                    connector_slot_ms=slot_wait_ms, session_wait_ms=session_wait_ms,
+                )
+
+            # TOCTOU guard: the exact session/client and authorization must still
+            # be current after all locks were acquired but before network I/O.
+            with self.session_lock:
+                current = self.sessions.get(subscription_id)
+            if not isinstance(current, dict) or current is not expected_session or current.get("client") is not client:
+                return deferred("session_changed", 5)
+            current_vehicles = current.get("vehicles") if isinstance(current.get("vehicles"), list) else []
+            target_still_cached = any(
+                str(connector.attribute(item, "car_id", "") or connector.attribute(item, "vin", "") or "").strip()[:190] == remote_id
+                and str(connector.attribute(item, "vin", "") or "").strip().upper() == vin
+                for item in current_vehicles
+            )
+            if not target_still_cached:
+                return deferred("vehicle_cache_changed", 5)
+            live_db = None
+            try:
+                live_uri = self.db_path.resolve().as_uri() + "?mode=ro"
+                live_db = sqlite3.connect(live_uri, uri=True, timeout=0.10)
+                live_db.row_factory = sqlite3.Row
+                live_db.execute("PRAGMA busy_timeout=100")
+                live_db.execute("PRAGMA query_only=ON")
+                live = live_db.execute(
+                    "SELECT enabled,vehicle_ids_json FROM subscriptions WHERE subscription_id=? LIMIT 1",
+                    (subscription_id,),
+                ).fetchone()
+            except (OSError, sqlite3.Error):
+                return deferred("subscription_store_busy", 5)
+            finally:
+                if live_db is not None:
+                    live_db.close()
+            if live is None or int(live["enabled"] or 0) != 1:
+                return deferred("subscription_changed", 5)
+            try:
+                live_ids_value = json.loads(str(live["vehicle_ids_json"] or "[]"))
+                live_ids = {str(item).strip()[:190] for item in live_ids_value if str(item).strip()} if isinstance(live_ids_value, list) else set()
+            except (TypeError, ValueError, json.JSONDecodeError):
+                live_ids = set()
+            if remote_id not in live_ids or remote_id not in authorized_ids:
+                raise ValueError("O veículo deixou de pertencer ao escopo autorizado desta assinatura.")
+            if manual is not None and manual(environment, operation_payload):
+                return deferred("manual_priority")
+
+            try:
+                with self._telemetry_request_timeout(client):
+                    result = probe_windowed_mileage_energy(client, vin=vin, begin_ms=begin_ms, end_ms=end_ms)
+            except Exception as exc:  # noqa: BLE001
+                elapsed_ms = int(round((time.monotonic() - overall_started) * 1000))
+                if connector.is_transient_cloud_error(exc):
+                    LOG.info("Sonda oficial de %s cedeu após falha temporária em %sms; sem retry e sem corpo bruto.", subscription_id, elapsed_ms)
+                    return deferred("cloud_temporary", 20)
+                LOG.warning("Sonda oficial de %s falhou em %sms; resposta bruta omitida; tipo=%s.", subscription_id, elapsed_ms, type(exc).__name__)
+                return {
+                    "ok": False, "temporary": False, "low_priority": True, "reason": "probe_failed",
+                    "message": "A nuvem recusou a sonda oficial; nenhum valor bruto foi exposto.",
+                    "engine_version": ENGINE_VERSION, "connector_version": connector.CONNECTOR_VERSION,
+                    "library_version": connector.package_version(), "raw_values_included": False, "mapped_fields": [],
+                    "total_ms": elapsed_ms,
+                }
+            current["last_used_at"] = time.time()
+            result.update({
+                "low_priority": True, "session_reused": True, "engine_version": ENGINE_VERSION,
+                "connector_version": connector.CONNECTOR_VERSION, "library_version": connector.package_version(),
+                "bounded_timeout_seconds": float(self.telemetry_network_timeout_seconds),
+                "latency_ms": {
+                    "account_wait": account_wait_ms,
+                    "connector_slot_wait": slot_wait_ms,
+                    "session_wait": session_wait_ms,
+                    "total": int(round((time.monotonic() - overall_started) * 1000)),
+                },
+            })
+            return result
+        finally:
+            if session_acquired:
+                session_operation_lock.release()
+            if slot_acquired:
+                self.operation_semaphore.release()
+            if account_acquired and account_lock is not None:
+                account_lock.release()
     def execute_account_operation(self, environment: str, payload: dict[str, Any], sync: bool, origin: str) -> dict[str, Any]:
         """Execute account test/sync under the persistent account auth coordinator."""
         account_id = self._account_id(payload)
@@ -3014,7 +3278,7 @@ class TelemetryEngine:
             "command_confirmation": profile == "command",
             "confirmation_window_reused": same_command_window if profile == "command" else False,
             "adaptive_polling": profile == "command",
-            "poll_schedule_seconds": list(self.command_cadence) if profile == "command" else [self.interactive_seconds],
+            "poll_schedule_seconds": list(self.command_effective_cadence) if profile == "command" else [self.interactive_seconds],
             "max_command_polls": self.command_max_polls if profile == "command" else None,
             # Quantos comandos esperam veredito nesta assinatura, contando este.
             # Mais de um deixou de significar que o anterior foi esquecido.
@@ -3197,6 +3461,7 @@ class TelemetryEngine:
                 "interactive_seconds": self.interactive_seconds,
                 "command_seconds": self.command_seconds,
                 "command_cadence_seconds": list(self.command_cadence),
+                "command_effective_cadence_seconds": list(self.command_effective_cadence),
                 "command_max_polls": self.command_max_polls,
                 "manual_priority": self.manual_pending_provider is not None,
                 "collection_profiles": {
@@ -3840,6 +4105,11 @@ class TelemetryEngine:
             command_mode=effective_command_mode,
             command_poll_count=next_command_poll,
         )
+        # 1.12.96: _adaptive_interval preserva a cadencia estrutural historica.
+        # Somente o agendamento real da janela pos-comando recebe 5/5/8.
+        if effective_command_mode:
+            cadence_index = min(max(1, int(next_command_poll)) - 1, len(self.command_effective_cadence) - 1)
+            interval = int(self.command_effective_cadence[cadence_index])
         aggregate_state, candidate_state, candidate_count = self._confirm_state_transition(
             str(subscription["last_state"] or ""),
             str(subscription["candidate_state"] or ""),

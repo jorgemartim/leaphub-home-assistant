@@ -60,3 +60,14 @@
 - Resultado de comando anunciado imediatamente ao Site.
 - Telemetria, comando e imagem não podem manter as travas uns dos outros.
 - Site/PWA não são alterados nesta rodada.
+
+## Gateway 1.12.96 — implementação staged
+
+- Base: 1.12.95 publicada (`672d4dcca0f6928d21f8eb6141bf815fb9bdb5e8`).
+- Controles físicos, ACK-first, payloads C10, imagem, HMAC e OCPP continuam congelados.
+- Confirmação: poll inicial imediato preservado; override exclusivo de command-mode usa 5s → 5s → 8s, mantendo a cadência estrutural/interativa de 6s intacta.
+- Official: rota read-only existente usa somente sessão persistente pronta e autorizada; descoberta SQLite bounded, ordem conta → vaga global de baixa prioridade → sessão e chamada única sem retry/login/refresh próprio.
+- `begintime/endtime` são assinados e enviados em milissegundos.
+- Escopo do veículo é revalidado por `vehicle_ids_json`; resposta é somente shape redigido e nenhum `official_*` é promovido antes do teste real do C10.
+- `config.yaml` fica 1.12.95 no commit funcional; promoção para 1.12.96 continua exclusiva da automação após GHCR público.
+- Próximo campo: publicar 1.12.96, instalar no HA, medir confirmação e coletar evidência redigida do drivingRecord; só depois preparar Site Beta 1.12.360.

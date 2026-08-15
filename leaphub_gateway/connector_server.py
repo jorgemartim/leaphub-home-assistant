@@ -65,7 +65,7 @@ except ModuleNotFoundError:
         _event_transport_spec.loader.exec_module(_event_transport_module)
         EVENT_TRANSPORT = _event_transport_module.EVENT_TRANSPORT
 
-VERSION = "1.12.95"
+VERSION = "1.12.96"
 API_VERSION = 2
 CAPABILITY_SCHEMA_VERSION = 1
 MIN_SUPPORTED_CLIENT_API_VERSION = 1
@@ -1919,6 +1919,20 @@ class Handler(BaseHTTPRequestHandler):
                         "connector_version": connector.CONNECTOR_VERSION,
                     })
                     return
+            if self.path == "/v1/vehicles/driving-record":
+                try:
+                    result = TELEMETRY.execute_driving_record_probe(environment, payload)
+                except ValueError:
+                    LOG.info("Sonda Official recusada por parâmetros ou escopo inválidos; conteúdo omitido.")
+                    self.send_json(400, {
+                        "ok": False, "temporary": False, "reason": "invalid_probe_input",
+                        "message": "Parâmetros inválidos para a leitura oficial.",
+                        "connector_version": connector.CONNECTOR_VERSION,
+                    })
+                    return
+                status = 200 if bool(result.get("ok")) else (503 if bool(result.get("temporary")) else 400)
+                self.send_json(status, result)
+                return
             pending_key = manual_operation_enter(environment, payload)
             acquired = False
             account_acquired = False
@@ -1939,11 +1953,9 @@ class Handler(BaseHTTPRequestHandler):
                     })
                     return
                 if self.path == "/v1/vehicles/driving-record":
-                    # 1.12.72 - diagnostico read-only do historico da nuvem. Passa
-                    # pelas MESMAS travas das demais leituras de conta: ele fala com
-                    # a Leapmotor, entao nao pode furar a fila nem competir com um
-                    # comando do dono.
-                    result = connector.handle_driving_record(payload)
+                    # Compatibilidade do contrato 1.12.72: a rota real já retornou acima,
+                    # antes de manual_operation_enter. Chegar aqui indica regressão de fluxo.
+                    raise RuntimeError("driving-record não pode entrar no caminho manual prioritário.")
                 elif self.path == "/v1/accounts/test":
                     result = TELEMETRY.execute_account_operation(environment, payload, sync=False, origin="account_test")
                 elif self.path == "/v1/vehicles/sync":

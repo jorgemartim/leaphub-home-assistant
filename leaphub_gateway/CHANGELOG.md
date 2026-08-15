@@ -1,10 +1,11 @@
-## 1.12.95
+## 1.12.96
 
-A distribuição permanece pré-compilada no GHCR oficial e conserva a publicação em duas fases.
+A distribuição continua pré-compilada no GHCR oficial e mantém publicação em duas fases.
 
-- mantém controles e telemetria fora do caminho da imagem;
-- carrega o ZIP visual de forma lazy, decodificando apenas as camadas utilizadas;
-- usa WebP lossless de baixa latência (`method=0`) e contrato visual 16;
-- usa dois workers puramente locais para reduzir fila entre contas;
-- registra tempos separados de pacote/render/base64/total;
-- polling, timeouts, payloads e Site permanecem inalterados.
+- preserva ACK-first, payloads C10, retries físicos e isolamento de imagem/telemetria/controle;
+- mantém a primeira confirmação praticamente imediata e aplica 5s → 5s → 8s somente à janela pós-despacho, preservando o degrau estrutural/interativo de 6s;
+- não reduz a cadência interativa permanente nem cria polling de 1–2s;
+- faz a sonda `drivingRecord` usar somente sessão persistente já pronta/autorizada, com descoberta SQLite bounded e ordem conta → vaga global de baixa prioridade → sessão;
+- assina `begintime`/`endtime` em milissegundos junto com o VIN e envia exatamente uma chamada read-only;
+- devolve somente shape redigido, mede apenas tamanho/latência seguros, limpa diagnóstico transitório e não promove `official_*` sem evidência real do C10;
+- Site, HMAC, OCPP, render visual e Produção permanecem funcionalmente inalterados.
