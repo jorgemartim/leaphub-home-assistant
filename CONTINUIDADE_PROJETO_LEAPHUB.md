@@ -92,3 +92,14 @@
 - Falhas anteriores dos publishers 1.12.97 ocorreram antes de commit/push: quoting do WSL, leitura de caminho do Git, `wslpath` de `%TEMP%` e CRLF no stdin.
 - A pré-validação final inclui scanner dos contratos históricos, artefatos root/add-on/recovery do alvo, smoke isolado de `site-packages`, regressões direcionadas e validator oficial completo repetido três vezes.
 - `config.yaml` permanece 1.12.96 até a promoção automática após imagem GHCR pública.
+
+
+## 2026-08-15 — Gateway 1.12.98 preparado após homologação 1.12.97
+
+- Gateway 1.12.97 homologado em campo, inclusive uma única sonda Official `drivingRecord` real no C10: HTTP 200, sessão reutilizada, ~1,19 s, sem retry e sem corpo bruto.
+- Shape comprovado: totais cumulativos + `detail` diário; não há evidência de viagens individuais nesse endpoint.
+- 1.12.98 limita o Official a allowlist dos campos observados e conserva `unit_status=unverified`; o Site não converte RAW para km/kWh.
+- `sunshade_position` já enviava corretamente 0-100 convertido para degraus nativos 0-10, porém ficava fora de `TELEMETRY_CONFIRMABLE_COMMANDS`; logs de campo mostraram `confirmation_pending` sem FAST interno.
+- Telemetria do C10 comprova `sunshade_percent` em movimento (ex.: 48% → 100%). A 1.12.98 usa esse campo somente para confirmação, sem mudar o despacho físico e sem retry.
+- `sunshade_open/close`, clima, trunk, janelas, 5/5/8, imagem, OCPP e HMAC permanecem congelados.
+- Site Beta 1.12.360 é o par compatível: Official / Snapshots / Calculado separados, ABRP preserva `captured_at`, catch-up visual sem F5. Produção continua intocada.

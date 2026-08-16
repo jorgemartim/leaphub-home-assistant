@@ -8,6 +8,7 @@ any response field is promoted to an ``official_*`` semantic alias.
 """
 from __future__ import annotations
 
+import math
 import re
 import time
 from typing import Any
@@ -15,7 +16,7 @@ from urllib.parse import quote
 
 from leapmotor_api.crypto import build_signed_headers
 
-PROBE_VERSION = "1.12.97"
+PROBE_VERSION = "1.12.98"
 WINDOW_PATH = "/carownerservice/oversea/drivingRecord/v1/mileage/energy/detail"
 MAX_WINDOW_MS = 7 * 24 * 60 * 60 * 1000
 MIN_MILLISECONDS = 1_000_000_000_000
@@ -104,6 +105,108 @@ def _shape_nodes(value: Any) -> int:
     return 1
 
 
+
+_C10_DAILY_SIGNATURE = frozenset({
+    "totalAccumulatedMileageMile",
+    "totalmileageMile",
+    "totalAccumulatedMileage",
+    "totalmileage",
+    "deliveryDays",
+    "totalEnergy",
+    "detail",
+})
+
+
+def _mapped_number(value: Any) -> int | float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    if not math.isfinite(number) or abs(number) > 1_000_000_000_000:
+        return None
+    if isinstance(value, int):
+        return int(value)
+    return number
+
+
+def _mapped_text(value: Any, limit: int = 80) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text or len(text) > max(1, min(160, int(limit))) or not text.isprintable():
+        return None
+    return text
+
+
+def map_c10_daily_values(parsed: Any) -> tuple[dict[str, Any] | None, list[str]]:
+    """Map only the exact C10 daily/cumulative fields proven in field homologation.
+
+    Values keep their cloud scale/unit intentionally unverified. Unknown keys,
+    references, identifiers and nested raw response data are never copied.
+    """
+    if not isinstance(parsed, dict):
+        return None, []
+    data = parsed.get("data")
+    if not isinstance(data, dict) or not _C10_DAILY_SIGNATURE.issubset(set(data.keys())):
+        return None, []
+
+    totals: dict[str, Any] = {}
+    mapped_fields: list[str] = []
+    numeric_totals = {
+        "totalAccumulatedMileage": "total_accumulated_mileage_raw",
+        "totalmileage": "total_mileage_raw",
+        "deliveryDays": "delivery_days",
+        "totalEnergy": "total_energy_raw",
+    }
+    text_totals = {
+        "totalAccumulatedMileageMile": "total_accumulated_mileage_mile_text",
+        "totalmileageMile": "total_mileage_mile_text",
+    }
+    for source, target in numeric_totals.items():
+        value = _mapped_number(data.get(source))
+        if value is not None:
+            totals[target] = value
+            mapped_fields.append(f"data.{source}")
+    for source, target in text_totals.items():
+        value = _mapped_text(data.get(source))
+        if value is not None:
+            totals[target] = value
+            mapped_fields.append(f"data.{source}")
+
+    days: list[dict[str, Any]] = []
+    detail = data.get("detail")
+    if isinstance(detail, list):
+        for item in detail[:16]:
+            if not isinstance(item, dict):
+                continue
+            day: dict[str, Any] = {}
+            day_text = _mapped_text(item.get("day"), 40)
+            if day_text is not None:
+                day["day"] = day_text
+                mapped_fields.append("data.detail[].day")
+            for source, target in (
+                ("xDay", "x_day"),
+                ("currentMileage", "current_mileage_raw"),
+                ("accumulatedMileage", "accumulated_mileage_raw"),
+                ("accumulatedEnergyConsume", "accumulated_energy_consume_raw"),
+            ):
+                value = _mapped_number(item.get(source))
+                if value is not None:
+                    day[target] = value
+                    mapped_fields.append(f"data.detail[].{source}")
+            mile_text = _mapped_text(item.get("accumulatedMileageMile"))
+            if mile_text is not None:
+                day["accumulated_mileage_mile_text"] = mile_text
+                mapped_fields.append("data.detail[].accumulatedMileageMile")
+            if day:
+                days.append(day)
+
+    return {
+        "schema_version": 1,
+        "unit_status": "unverified",
+        "totals": totals,
+        "days": days,
+    }, sorted(set(mapped_fields))
+
 def probe_windowed_mileage_energy(client: Any, *, vin: str, begin_ms: int, end_ms: int) -> dict[str, Any]:
     """Perform exactly one signed POST and return only redacted response shape."""
     vin = str(vin or "").strip().upper()
@@ -131,7 +234,8 @@ def probe_windowed_mileage_energy(client: Any, *, vin: str, begin_ms: int, end_m
         if isinstance(last_results, dict):
             last_results.pop(PARSE_LABEL, None)
     shape = describe_shape(parsed)
-    return {
+    official_daily, mapped_fields = map_c10_daily_values(parsed)
+    result = {
         "ok": True,
         "probe_version": PROBE_VERSION,
         "endpoint": "drivingRecord/mileage/energy/detail",
@@ -142,6 +246,11 @@ def probe_windowed_mileage_energy(client: Any, *, vin: str, begin_ms: int, end_m
         "window": {"begintime_ms": int(begin_ms), "endtime_ms": int(end_ms), "duration_ms": int(end_ms - begin_ms)},
         "response_shape": shape,
         "raw_values_included": False,
-        "mapped_fields": [],
-        "mapping_status": "awaiting_c10_field_evidence",
+        "raw_response_included": False,
+        "mapped_values_included": official_daily is not None,
+        "mapped_fields": mapped_fields,
+        "mapping_status": "mapped_c10_daily_raw" if official_daily is not None else "awaiting_c10_daily_shape",
     }
+    if official_daily is not None:
+        result["official_daily"] = official_daily
+    return result

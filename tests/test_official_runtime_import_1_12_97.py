@@ -9,13 +9,14 @@ def test_official_runtime_module_is_installed_and_imported_by_runtime_name():
     telemetry = (APP / "telemetry_engine.py").read_text(encoding="utf-8")
     probe = (APP / "official_trip_probe.py").read_text(encoding="utf-8")
 
+    target = (APP / "RELEASE_TARGET").read_text(encoding="utf-8").strip()
     assert "'official_trip_probe.py': 'leaphub_official_trip_probe.py'" in docker
     assert "import leaphub_official_trip_probe" in docker
-    assert 'assert leaphub_official_trip_probe.PROBE_VERSION == "1.12.97"' in docker
+    assert f'assert leaphub_official_trip_probe.PROBE_VERSION == "{target}"' in docker
     assert "from leaphub_official_trip_probe import normalize_window, probe_windowed_mileage_energy" in telemetry
     assert "except ModuleNotFoundError:" in telemetry
     assert "from official_trip_probe import normalize_window, probe_windowed_mileage_energy" in telemetry
-    assert 'PROBE_VERSION = "1.12.97"' in probe
+    assert f'PROBE_VERSION = "{target}"' in probe
 
 
 def test_hotfix_does_not_change_command_confirmation_contract():

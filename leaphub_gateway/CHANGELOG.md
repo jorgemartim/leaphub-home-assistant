@@ -1,11 +1,10 @@
-## 1.12.97
+## 1.12.98
 
 A distribuição continua pré-compilada no GHCR oficial e mantém publicação em duas fases.
 
-Hotfix mínimo sobre a 1.12.96 publicada.
+Evolução mínima sobre a 1.12.97 homologada em campo.
 
-- corrige o empacotamento runtime da sonda Official `drivingRecord`;
-- instala `official_trip_probe.py` também no `site-packages` como `leaphub_official_trip_probe.py`, no mesmo padrão dos demais módulos internos;
-- o motor tenta primeiro o nome runtime e mantém fallback local apenas para testes/desenvolvimento;
-- adiciona contrato que falha se Dockerfile e import do motor voltarem a divergir;
-- preserva integralmente ACK-first, payloads C10, `climate_off`, retries físicos, 5s → 5s → 8s pós-comando, cadência estrutural de 6s, telemetria, render visual, HMAC, OCPP e Produção.
+- confirma `sunshade_position` pela telemetria FAST usando `sunshade_percent`, sem alterar a transmissão e sem retry físico;
+- uma nova porcentagem supersede a espera da porcentagem anterior;
+- publica allowlist RAW do histórico Official diário comprovado no C10, mantendo unidade/escala como `unverified`;
+- preserva `sunshade_open/close`, ACK-first, clima, trunk, janelas, 5/5/8, imagem, HMAC e OCPP.

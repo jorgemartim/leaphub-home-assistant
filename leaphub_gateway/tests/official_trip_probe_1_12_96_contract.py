@@ -60,6 +60,8 @@ def test_window_is_one_post_signed_redacted_measured_and_diagnostic_cache_cleare
     assert PROBE.count("client._post(") == 1
     assert "last_results.pop(PARSE_LABEL, None)" in PROBE
     assert 'return "<dynamic-key>"' in PROBE
-    assert '"mapped_fields": []' in PROBE and "_retry_on_token_expiry" not in PROBE
+    assert 'map_c10_daily_values' in PROBE and '"mapped_fields": mapped_fields' in PROBE
+    assert '"raw_values_included": False' in PROBE and '"raw_response_included": False' in PROBE
+    assert "_retry_on_token_expiry" not in PROBE
     assert '"response_body_bytes"' in PROBE and '"response_shape_nodes"' in PROBE
     assert "_UUID_KEY" in PROBE and "_LONG_HEX_KEY" in PROBE and "_OPAQUE_PREFIX" in PROBE

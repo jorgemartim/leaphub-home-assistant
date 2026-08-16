@@ -55,7 +55,7 @@ except ModuleNotFoundError:
         EVENT_TRANSPORT = _event_transport_module.EVENT_TRANSPORT
 
 LOG = logging.getLogger("leaphub.telemetry")
-ENGINE_VERSION = "1.12.97"  # runtime packaging hotfix for Official probe; command/visual cadence preserved
+ENGINE_VERSION = "1.12.98"  # Official daily allowlist + sunshade position confirmation; physical dispatch preserved
 
 # Hospedagem compartilhada (Apache/LiteSpeed) fecha a conexão ociosa em poucos
 # segundos. Reaproveitar depois disso escreve num socket já fechado e devolve
@@ -113,6 +113,7 @@ TELEMETRY_CONFIRMABLE_COMMANDS = frozenset({
     "trunk_close",
     "sunshade_open",
     "sunshade_close",
+    "sunshade_position",
     "windows_open",
     "windows_close",
     "sentry_on",
@@ -130,7 +131,7 @@ CONFIRMATION_SUPERSESSION_FAMILIES: dict[str, frozenset[str]] = {
     "climate": frozenset({"climate_on", "climate_off", "quick_cool", "quick_heat", "windshield_defrost"}),
     "trunk": frozenset({"trunk_open", "trunk_close"}),
     "windows": frozenset({"windows_open", "windows_close"}),
-    "sunshade": frozenset({"sunshade_open", "sunshade_close"}),
+    "sunshade": frozenset({"sunshade_open", "sunshade_close", "sunshade_position"}),
     "charging": frozenset({"start_charging", "stop_charging"}),
     "battery_preheat": frozenset({"battery_preheat_on", "battery_preheat_off"}),
     "steering_heat": frozenset({"steering_wheel_heat_on", "steering_wheel_heat_off"}),
@@ -2802,14 +2803,21 @@ class TelemetryEngine:
         if not family:
             return 0
         commands = CONFIRMATION_SUPERSESSION_FAMILIES.get(family, frozenset())
-        opposites = sorted(item for item in commands if item != command_key)
+        include_same_position = command_key == "sunshade_position" and bool(request_id)
+        opposites = sorted(
+            item for item in commands if item != command_key or include_same_position
+        )
         if not opposites:
             return 0
         placeholders = ",".join("?" for _ in opposites)
+        same_request_guard = (
+            " AND NOT (command_key=? AND IFNULL(request_id,'')=?)"
+            if include_same_position else ""
+        )
         sql = (
             "UPDATE command_confirmations SET status='superseded',resolution=?,resolved_at=?,updated_at=? "
             "WHERE subscription_id=? AND IFNULL(command_vehicle_id,'')=? AND status='pending' "
-            f"AND command_key IN ({placeholders})"
+            f"AND command_key IN ({placeholders})" + same_request_guard
         )
         params: list[Any] = [
             f"superseded_by:{command_key}",
@@ -2819,6 +2827,8 @@ class TelemetryEngine:
             vehicle_id,
             *opposites,
         ]
+        if include_same_position:
+            params.extend([command_key, request_id])
         cursor = db.execute(sql, tuple(params))
         count = max(0, int(cursor.rowcount or 0))
         if count:
@@ -5190,6 +5200,7 @@ class TelemetryEngine:
         "trunk_close": ("doors.trunk",),
         "sunshade_open": ("sunshade_open",),
         "sunshade_close": ("sunshade_open",),
+        "sunshade_position": ("sunshade_percent",),
         "windows_open": ("windows",),
         "windows_close": ("windows",),
         "sentry_on": ("security.sentry_mode", "sentry_mode"),
@@ -5343,6 +5354,21 @@ class TelemetryEngine:
             state = self._command_bool(telemetry.get("sunshade_open"))
             expected = command == "sunshade_open"
             return (state is expected, state is not None)
+        if command == "sunshade_position":
+            raw_expected = parameters.get("sunshade_position", parameters.get("value"))
+            actual = telemetry.get("sunshade_percent")
+            try:
+                requested = int(raw_expected)
+                observed = float(actual)
+            except (TypeError, ValueError):
+                return False, False
+            if requested < 0 or requested > 100 or observed < 0 or observed > 100:
+                return False, False
+            # Mesma conversão física já homologada no connector: 45 -> degrau 5 -> 50%.
+            # Tolerância <0,5 impede que 48% confirme 50% enquanto a cortina passa
+            # pelo meio do percurso rumo a 100%. Nenhum retry físico nasce daqui.
+            expected = ((requested + 5) // 10) * 10
+            return (abs(observed - expected) < 0.5, True)
         if command in {"windows_open", "windows_close"}:
             windows = telemetry.get("windows") if isinstance(telemetry.get("windows"), dict) else {}
             known = [self._command_bool(value) for value in windows.values()]
