@@ -44,7 +44,7 @@ except ImportError:
         _privacy_spec.loader.exec_module(_privacy_module)
         sanitize_log = _privacy_module.sanitize_log
 
-CONNECTOR_VERSION = "1.12.99"
+CONNECTOR_VERSION = "1.12.100"
 MAX_INPUT_BYTES = 1024 * 1024
 logging.getLogger("leapmotor_api").setLevel(logging.WARNING)
 LOGGER = logging.getLogger("leaphub.connector")
@@ -3615,6 +3615,7 @@ def execute_vehicle_command(
     vehicle_id: str,
     parameters: dict[str, Any],
     climate_profile: str = "generic",
+    window_native_scale: int = 100,
 ) -> Any:
     # 1.12.79 — C10/B10/B05: AUTO é um cmd 170 completo e OFF é ac_switch
     # operate=off. O parâmetro climate_profile permanece apenas por compatibilidade
@@ -3628,17 +3629,38 @@ def execute_vehicle_command(
         if value < 50 or value > 100 or value % 5 != 0:
             raise ValueError("Limite de carga inválido.")
         return method(vehicle_id, charge_limit_percent=value)
+    if command in {"windows_open", "windows_close"} and window_native_scale == 10:
+        # 1.12.100 - medido no C10 do proprietario em 16/08/2026:
+        # value=0 fecha todas as janelas e value=10 abre ate o fim de curso
+        # observado. A biblioteca 0.3.2 usa value=100 como OPEN por padrao;
+        # nesse C10 a nuvem aceita 100, mas o carro nao executa.
+        native = 10 if command == "windows_open" else 0
+        connector_log(
+            logging.INFO,
+            "WINDOW_DIAG event=dispatch comando=%s pedido_site=%s escala_envio=0-10 valor_nativo=%d tentativas_fisicas=1",
+            command,
+            "100%" if command == "windows_open" else "0%",
+            native,
+        )
+        return method(vehicle_id, value=str(native))
     if command == "windows_position":
-        # 0 = fechada, 100 = totalmente aberta. A biblioteca recebe texto e recusa
-        # fora de 0-100. Um B10 foi observado atuando só em 0/2/5/10 numa escala
-        # 0-10: a nuvem aceita qualquer valor e o carro ignora o que não entende,
-        # então a conversão para a escala nativa é decisão de quem chama.
+        # A interface continua em 0-100%. C10/B10 usam escrita nativa 0-10;
+        # T03 e modelos desconhecidos preservam a escrita anterior 0-100.
         try:
             position = int(parameters.get("window_position", parameters.get("value")))
         except (TypeError, ValueError):
             raise ValueError("Informe a posição da janela.") from None
         if position < 0 or position > 100:
             raise ValueError("Posição de janela inválida.")
+        if window_native_scale == 10:
+            native = (position + 5) // 10
+            connector_log(
+                logging.INFO,
+                "WINDOW_DIAG event=dispatch comando=windows_position pedido_site=%d%% escala_envio=0-10 valor_nativo=%d tentativas_fisicas=1",
+                position,
+                native,
+            )
+            return method(vehicle_id, value=str(native))
         return method(vehicle_id, value=str(position))
     if command == "sunshade_position":
         # A cortina é o único comando desta matriz em que a escala de LEITURA e a
@@ -3793,6 +3815,20 @@ def _select_command_vehicle(
     return selected, available
 
 
+def window_command_native_scale(vehicle: Any | None) -> int:
+    """Escala de escrita do cmd_id=230 sem alterar T03/modelos desconhecidos."""
+    if vehicle is None:
+        return 100
+    parts = [
+        str(attribute(vehicle, name) or "").strip().lower()
+        for name in ("car_type", "model", "model_name", "series_name")
+    ]
+    normalized = re.sub(r"[^a-z0-9]+", "", " ".join(parts))
+    if "c10" in normalized or "b10" in normalized:
+        return 10
+    return 100
+
+
 def _status_capture_epoch(status: Any) -> float:
     for name in ("collect_time", "create_time"):
         value = attribute(status, name)
@@ -3883,35 +3919,56 @@ def execute_vehicle_command_ack_first(
     vehicle_id: str,
     parameters: dict[str, Any],
     climate_profile: str = "generic",
+    window_native_scale: int = 100,
 ) -> tuple[Any, bool]:
-    """Dispatch selected commands without waiting for leapmotor-api result polling.
+    """Dispatch allow-listed commands without waiting for library result polling.
 
-    leapmotor-api==0.3.2 writes the remote command and then polls the returned
-    ``remoteCtlId`` synchronously before returning. Leap Hub already confirms
-    physical state independently through FAST telemetry, so for the explicitly
-    allow-listed commands we temporarily defer only that internal result poll.
-
-    The client belongs to an account/session operation protected by the Gateway
-    lock. The override is restored in ``finally`` before the lease is released.
+    A escala das janelas e somente um argumento do mesmo despacho. Esta funcao
+    nao cria retry e restaura o override de polling antes de devolver a sessao.
     """
     if command not in ACK_FIRST_COMMANDS:
-        return execute_vehicle_command(method, command, vehicle_id, parameters, climate_profile), False
+        return execute_vehicle_command(
+            method,
+            command,
+            vehicle_id,
+            parameters,
+            climate_profile,
+            window_native_scale,
+        ), False
 
     owner = getattr(method, "__self__", None)
     poll = getattr(owner, "_poll_remote_control_result", None) if owner is not None else None
     if owner is None or not callable(poll):
-        return execute_vehicle_command(method, command, vehicle_id, parameters, climate_profile), False
+        return execute_vehicle_command(
+            method,
+            command,
+            vehicle_id,
+            parameters,
+            climate_profile,
+            window_native_scale,
+        ), False
 
     instance_dict = getattr(owner, "__dict__", None)
     sentinel = object()
-    previous_override = instance_dict.get("_poll_remote_control_result", sentinel) if isinstance(instance_dict, dict) else sentinel
+    previous_override = (
+        instance_dict.get("_poll_remote_control_result", sentinel)
+        if isinstance(instance_dict, dict)
+        else sentinel
+    )
 
     def deferred_result_poll(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
         return {"deferred": True, "confirmation_source": "gateway_fast_telemetry"}
 
     setattr(owner, "_poll_remote_control_result", deferred_result_poll)
     try:
-        result = execute_vehicle_command(method, command, vehicle_id, parameters, climate_profile)
+        result = execute_vehicle_command(
+            method,
+            command,
+            vehicle_id,
+            parameters,
+            climate_profile,
+            window_native_scale,
+        )
         return result, True
     finally:
         if previous_override is sentinel:
@@ -3921,6 +3978,7 @@ def execute_vehicle_command_ack_first(
                 pass
         else:
             setattr(owner, "_poll_remote_control_result", previous_override)
+
 
 def fota_task_id(parameters: dict[str, Any]) -> int:
     """Identificador da tarefa de atualização, vindo da listagem FOTA da nuvem.
@@ -4402,6 +4460,7 @@ def handle_command(
     execution_warning: str | None = None
     safe_retry_strategy: str | None = None
     active_climate_profile = "generic"
+    window_native_scale = 100
     climate_dispatch_strategy: str | None = None
     command_dispatched = False
     cloud_accepted = False
@@ -4531,6 +4590,7 @@ def handle_command(
                 resolved_vehicle_id,
                 parameters,
                 active_climate_profile,
+                window_native_scale,
             )
             result, deferred_now = dispatched
             result_poll_deferred = bool(deferred_now)
@@ -4573,6 +4633,22 @@ def handle_command(
             raise_classified(exc)
         finally:
             phase_latency_ms["session_prepare_ms"] += int(round((time.monotonic() - session_prepare_started) * 1000))
+
+        if command in {"windows_open", "windows_close", "windows_position"}:
+            selected_window_vehicle, resolved_list = _select_command_vehicle(
+                client,
+                resolved_vehicle_id,
+                resolved_list,
+            )
+            window_native_scale = window_command_native_scale(selected_window_vehicle)
+            report(
+                "preparing",
+                "Preparando comando de janelas na escala nativa confirmada para este modelo.",
+                {
+                    "window_native_scale": window_native_scale,
+                    "single_delivery": True,
+                },
+            )
 
         is_climate_state_command = command in CLIMATE_VERIFY_COMMANDS
         can_safe_retry = command in SAFE_STATE_RETRY_COMMANDS
@@ -4711,6 +4787,7 @@ def handle_command(
                         resolved_vehicle_id,
                         parameters,
                         active_climate_profile,
+                        window_native_scale,
                     )
                     result, retry_deferred = retry_dispatched
                     result_poll_deferred = bool(result_poll_deferred or retry_deferred)
@@ -4872,6 +4949,11 @@ def handle_command(
             "safe_retry_strategy": safe_retry_strategy,
             "climate_dispatch_strategy": climate_dispatch_strategy,
             "climate_profile_used": None,
+            "window_native_scale_used": (
+                window_native_scale
+                if command in {"windows_open", "windows_close", "windows_position"}
+                else None
+            ),
             "verification_state": verification_state,
             "verification_samples": verification_samples,
             "execution_warning": execution_warning,

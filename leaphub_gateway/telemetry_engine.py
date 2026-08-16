@@ -55,7 +55,7 @@ except ModuleNotFoundError:
         EVENT_TRANSPORT = _event_transport_module.EVENT_TRANSPORT
 
 LOG = logging.getLogger("leaphub.telemetry")
-ENGINE_VERSION = "1.12.99"  # sunshade field diagnostics only; dispatch/matcher/retry preserved
+ENGINE_VERSION = "1.12.100"  # windows C10 mapping + final confirmation push; retry/cadence preserved
 
 # Hospedagem compartilhada (Apache/LiteSpeed) fecha a conexão ociosa em poucos
 # segundos. Reaproveitar depois disso escreve num socket já fechado e devolve
@@ -116,6 +116,7 @@ TELEMETRY_CONFIRMABLE_COMMANDS = frozenset({
     "sunshade_position",
     "windows_open",
     "windows_close",
+    "windows_position",
     "sentry_on",
     "sentry_off",
     "start_charging",
@@ -130,7 +131,7 @@ CONFIRMATION_SUPERSESSION_FAMILIES: dict[str, frozenset[str]] = {
     "locks": frozenset({"lock", "unlock"}),
     "climate": frozenset({"climate_on", "climate_off", "quick_cool", "quick_heat", "windshield_defrost"}),
     "trunk": frozenset({"trunk_open", "trunk_close"}),
-    "windows": frozenset({"windows_open", "windows_close"}),
+    "windows": frozenset({"windows_open", "windows_close", "windows_position"}),
     "sunshade": frozenset({"sunshade_open", "sunshade_close", "sunshade_position"}),
     "charging": frozenset({"start_charging", "stop_charging"}),
     "battery_preheat": frozenset({"battery_preheat_on", "battery_preheat_off"}),
@@ -4194,6 +4195,8 @@ class TelemetryEngine:
                 sid,
             )
         for item in confirmed_outcomes:
+            # 1.12.100 - estado fisico provado; apenas avise o site.
+            self._announce_telemetry_confirmation_async(environment, item)
             # 1.12.70 — o tempo até confirmar entra na linha. Era o número que a
             # análise de campo tinha de reconstruir somando carimbos de hora de
             # linhas diferentes, e é ele que diz se a janela está funcionando.
@@ -5203,6 +5206,7 @@ class TelemetryEngine:
         "sunshade_position": ("sunshade_percent",),
         "windows_open": ("windows",),
         "windows_close": ("windows",),
+        "windows_position": ("window_positions",),
         "sentry_on": ("security.sentry_mode", "sentry_mode"),
         "sentry_off": ("security.sentry_mode", "sentry_mode"),
         "start_charging": ("charging_status", "charging_power_kw"),
@@ -5382,13 +5386,53 @@ class TelemetryEngine:
                 matched,
             )
             return (matched, True)
-        if command in {"windows_open", "windows_close"}:
+        if command in {"windows_open", "windows_close", "windows_position"}:
+            keys = ("front_left", "front_right", "rear_left", "rear_right")
+            positions = (
+                telemetry.get("window_positions")
+                if isinstance(telemetry.get("window_positions"), dict)
+                else {}
+            )
+            observed: list[float] = []
+            positions_complete = True
+            for key in keys:
+                raw = positions.get(key)
+                try:
+                    value = float(raw)
+                except (TypeError, ValueError):
+                    positions_complete = False
+                    break
+                if value < 0 or value > 100:
+                    positions_complete = False
+                    break
+                observed.append(value)
+
+            if command == "windows_position":
+                raw_expected = parameters.get("window_position", parameters.get("value"))
+                try:
+                    expected = float(raw_expected)
+                except (TypeError, ValueError):
+                    return False, False
+                if expected < 0 or expected > 100 or not positions_complete:
+                    return False, False
+                if expected >= 99:
+                    return (all(value >= 90 for value in observed), True)
+                if expected <= 1:
+                    return (all(value <= 5 for value in observed), True)
+                return (all(abs(value - expected) <= 5 for value in observed), True)
+
+            if positions_complete:
+                if command == "windows_open":
+                    return (all(value >= 90 for value in observed), True)
+                return (all(value <= 5 for value in observed), True)
+
             windows = telemetry.get("windows") if isinstance(telemetry.get("windows"), dict) else {}
-            known = [self._command_bool(value) for value in windows.values()]
-            known = [value for value in known if value is not None]
-            if not known:
+            states = [self._command_bool(windows.get(key)) for key in keys]
+            if any(value is None for value in states):
                 return False, False
-            return (any(known) if command == "windows_open" else not any(known), True)
+            if command == "windows_open":
+                return (all(value is True for value in states), True)
+            return (all(value is False for value in states), True)
         if command in {"sentry_on", "sentry_off"}:
             security = telemetry.get("security") if isinstance(telemetry.get("security"), dict) else {}
             state = self._command_bool(security.get("sentry_mode", telemetry.get("sentry_mode")))
@@ -5683,6 +5727,82 @@ class TelemetryEngine:
         ) as exc:
             self._close_delivery_connection()
             self._delivery_failed(valid_rows, connector.clean_message(str(exc)))
+
+    def _announce_telemetry_confirmation_async(
+        self,
+        environment: str,
+        item: dict[str, Any],
+    ) -> bool:
+        """Envie ao site o veredito final ja provado pela telemetria FAST.
+
+        E apenas notificacao/bookkeeping: thread daemon, sem retry, sem comando
+        fisico, sem account/session/connector lock e sem alterar a cadencia.
+        """
+        request_id = str(item.get("request_id") or "").strip()[:96]
+        command_key = str(item.get("command_key") or "").strip().lower()[:80]
+        if not request_id or not bool(item.get("confirmed")):
+            return False
+        try:
+            reads = max(0, int(item.get("poll_count") or 0))
+        except (TypeError, ValueError):
+            reads = 0
+        try:
+            elapsed = max(0, int(float(item.get("elapsed") or 0)))
+        except (TypeError, ValueError):
+            elapsed = 0
+        result = {
+            "ok": True,
+            "accepted": True,
+            "request_id": request_id,
+            "command": command_key,
+            "message": "A acao foi confirmada por uma leitura nova do veiculo.",
+            "command_dispatched": True,
+            "cloud_accepted": True,
+            "confirmation_pending": False,
+            "confirmation_reason": None,
+            "verified_by_gateway": True,
+            "vehicle_confirmed": True,
+            "not_applied": False,
+            "applied": True,
+            "final_outcome": "confirmed",
+            "confirmation_source": "telemetry_match",
+            "confirmation_reads": reads,
+            "confirmation_elapsed_seconds": elapsed,
+            "connector_version": connector.CONNECTOR_VERSION,
+            "gateway_version": ENGINE_VERSION,
+        }
+        def deliver() -> None:
+            try:
+                delivered = self.announce_command_result(environment, request_id, result)
+                if delivered:
+                    LOG.info(
+                        "Veredito final de %s (%s) anunciado ao site apos confirmacao FAST.",
+                        command_key or "desconhecido",
+                        request_id,
+                    )
+            except Exception as exc:  # noqa: BLE001
+                LOG.debug(
+                    "Anuncio final de %s (%s) nao chegou ao site: %s",
+                    command_key or "desconhecido",
+                    request_id,
+                    connector.clean_message(str(exc)),
+                )
+        try:
+            thread = threading.Thread(
+                target=deliver,
+                name=f"leaphub-confirm-announce-{request_id[:12]}",
+                daemon=True,
+            )
+            thread.start()
+            return True
+        except RuntimeError as exc:
+            LOG.debug(
+                "Anuncio final de %s (%s) nao pode iniciar thread: %s",
+                command_key or "desconhecido",
+                request_id,
+                connector.clean_message(str(exc)),
+            )
+            return False
 
     def announce_command_result(self, environment: str, request_id: str, result: dict[str, Any]) -> bool:
         """Avisa o site, no mesmo instante, que o worker terminou um comando.

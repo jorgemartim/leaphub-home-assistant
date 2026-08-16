@@ -123,3 +123,35 @@
 - A 1.12.99 NÃO muda a transmissão. Apenas registra `pedido_site`, `valor_nativo`,
   `esperado_telemetria`, `observado` e `match` para cada intenção/amostra.
 - Uma transmissão por intenção, sem retry físico novo. Produção continua intocada.
+
+
+## Gateway 1.12.100 — janelas C10/B10 + confirmação final
+
+Base limpa: `121e73229072c28ca0238d9738a8505c62544753` (1.12.99 publicada).
+
+- UI/telemetria continuam 0-100%;
+- C10/B10 escrevem cmd 230 em 0-10;
+- abrir=10, fechar=0;
+- T03/modelos desconhecidos continuam 0-100;
+- `windows_position` entra na FAST e na supersessão windows;
+- abrir/fechar exige as quatro janelas;
+- resultado FAST final é anunciado ao site;
+- nenhum retry físico de janela foi criado;
+- cortina e OCPP permanecem inalterados.
+
+A REV3 usa worktree limpo, então as tentativas parciais anteriores não participam da publicação.
+
+### REV4 — alinhamento do Dockerfile e baseline Windows
+
+Na REV3:
+- 31 testes direcionados passaram;
+- a suíte ampla teve 469 passes e 2 falhas;
+- uma falha era real desta candidata: a asserção do `official_trip_probe` no
+  Dockerfile ainda estava em 1.12.99;
+- a outra era `test_ocpp_sqlite_single_writer_1_12_45.py`, falha histórica
+  somente no Windows e já documentada no histórico do projeto.
+
+REV4 alinha o Dockerfile a 1.12.100, não altera OCPP e executa novamente os
+contratos direcionados e a suíte ampla Windows, excluindo apenas os três
+contratos históricos Windows-only. A CI Ubuntu executa tudo sem exclusões antes
+de qualquer promoção.

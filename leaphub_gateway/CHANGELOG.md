@@ -1,10 +1,12 @@
-## 1.12.99
+## 1.12.100
 
 A distribuição continua pré-compilada no GHCR oficial e mantém publicação em duas fases.
 
-Diagnóstico observacional sobre a 1.12.98 homologada.
-
-- adiciona `SUNSHADE_DIAG` ao despacho e às amostras FAST de `sunshade_position`;
-- registra somente percentuais/valor nativo, sem identificadores ou segredos;
-- não altera conversão 0-100 para 0-10, payload, matcher, supersessão ou retry;
-- preserva Official, clima, trunk, janelas, imagem, HMAC e OCPP.
+- C10/B10: UI/telemetria de janelas permanecem 0-100%, escrita cmd_id=230 usa 0-10;
+- C10/B10: `windows_open=10` e `windows_close=0`;
+- T03/modelos desconhecidos preservam 0-100;
+- `windows_position` entra na confirmação FAST e na supersessão windows;
+- abrir/fechar exige evidência das quatro janelas;
+- veredito final FAST é anunciado ao site;
+- nenhum retry físico novo para janelas;
+- cortina, clima, trunk, Official, imagem, HMAC e OCPP permanecem preservados.
