@@ -1,12 +1,12 @@
-## 1.12.100
+## 1.12.101
 
 A distribuição continua pré-compilada no GHCR oficial e mantém publicação em duas fases.
 
-- C10/B10: UI/telemetria de janelas permanecem 0-100%, escrita cmd_id=230 usa 0-10;
-- C10/B10: `windows_open=10` e `windows_close=0`;
-- T03/modelos desconhecidos preservam 0-100;
-- `windows_position` entra na confirmação FAST e na supersessão windows;
-- abrir/fechar exige evidência das quatro janelas;
-- veredito final FAST é anunciado ao site;
-- nenhum retry físico novo para janelas;
-- cortina, clima, trunk, Official, imagem, HMAC e OCPP permanecem preservados.
+- diagnóstico sanitizado das quatro janelas do C10, sem registrar payload bruto sensível;
+- `WINDOW_TELEMETRY_DIAG` só é emitido quando o snapshot de janelas muda;
+- candidatos de `status.raw` ficam limitados a sinais escalares relacionados a janela/vidro;
+- VIN, conta, token, senha, credenciais, certificado, GPS/localização, endereço e identificadores de dispositivo são excluídos;
+- a camada oficial `carpic_leftbehind_window_close.png` fica protegida por teste para o vidro traseiro esquerdo;
+- o contrato visual continua aceitando as quatro tags de janela;
+- o teste de confirmação usa `telemetry.ENGINE_VERSION` em vez de congelar a string 1.12.100;
+- nenhum comando físico, retry, cortina, clima ou OCPP é alterado nesta versão.

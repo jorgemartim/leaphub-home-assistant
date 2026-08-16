@@ -155,3 +155,58 @@ REV4 alinha o Dockerfile a 1.12.100, não altera OCPP e executa novamente os
 contratos direcionados e a suíte ampla Windows, excluindo apenas os três
 contratos históricos Windows-only. A CI Ubuntu executa tudo sem exclusões antes
 de qualquer promoção.
+
+
+## Gateway 1.12.101 - diagnostico das quatro janelas
+
+Com quatro janelas fisicamente abertas, o Leap Hub mostrou `2 aberta(s)` e somente duas tags. O pacote oficial possui `carpic_leftbehind_window_close.png`; a logica visual traseira fica protegida por teste.
+
+A lacuna restante e a telemetria traseira. A 1.12.101 adiciona `WINDOW_TELEMETRY_DIAG`, sanitizado e limitado, para identificar os sinais traseiros reais no `status.raw` sem registrar dados sensiveis nem alterar comandos fisicos.
+
+
+### 1.12.101 REV2 — teste de versão future-proof
+
+A primeira execução da 1.12.101 passou 33 testes direcionados e falhou somente
+porque `test_command_confirmation_announce_1_12_100.py` exigia literalmente
+`gateway_version == "1.12.100"`. O runtime 1.12.101 retornou corretamente
+`1.12.101`.
+
+O teste foi corrigido para comparar `gateway_version` com
+`telemetry.ENGINE_VERSION`, preservando o contrato sem congelar futuras versões.
+Nenhuma alteração adicional foi feita no dispatch, retry, janelas, cortina ou OCPP.
+
+### 1.12.101 REV3 — CHANGELOG de alvo único
+
+A REV2 passou 34/34 testes direcionados, mas a suíte ampla parou no contrato
+`single_changelog_heading`. O repositório exige que `leaphub_gateway/CHANGELOG.md`
+contenha somente um cabeçalho de versão e que ele seja exatamente o `RELEASE_TARGET`.
+
+A candidata havia preservado também o cabeçalho `1.12.100`. A REV3 mantém somente
+`## 1.12.101`. Nenhum código funcional, dispatch, retry, cortina ou OCPP foi alterado.
+
+### 1.12.101 REV5 — varredura completa dos contratos de distribuição
+
+Após a REV4, foi identificado que o problema era o processo de preparação do
+release: contratos históricos de distribuição estavam sendo descobertos
+sequencialmente pela suíte ampla.
+
+Antes de continuar, foram revisados no GitHub os contratos:
+- test_prebuilt_distribution_1_12_31.py
+- test_prebuilt_distribution_1_12_32.py
+- test_prebuilt_distribution_1_12_33.py
+- test_prebuilt_distribution_1_12_34.py
+- test_prebuilt_distribution_1_12_42.py
+- test_prebuilt_distribution_1_12_43.py
+- test_prebuilt_distribution_1_12_44.py
+- test_release_publication_gate_1_12_41.py
+- .github/scripts/validate_repository.py
+
+O CHANGELOG 1.12.101 passa a preservar simultaneamente:
+1. exatamente um cabeçalho `## 1.12.101`;
+2. a frase histórica de distribuição `pré-compilada`;
+3. publicação em duas fases;
+4. resumo do diagnóstico das quatro janelas.
+
+A REV5 executa todos os contratos script-style de distribuição individualmente
+antes da suíte ampla. Nenhuma mudança funcional adicional foi feita em janelas,
+dispatch, retry, cortina ou OCPP.

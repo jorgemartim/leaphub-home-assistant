@@ -44,7 +44,7 @@ except ImportError:
         _privacy_spec.loader.exec_module(_privacy_module)
         sanitize_log = _privacy_module.sanitize_log
 
-CONNECTOR_VERSION = "1.12.100"
+CONNECTOR_VERSION = "1.12.101"
 MAX_INPUT_BYTES = 1024 * 1024
 logging.getLogger("leapmotor_api").setLevel(logging.WARNING)
 LOGGER = logging.getLogger("leaphub.connector")
@@ -1184,6 +1184,94 @@ def enum_or_value(value: Any) -> Any:
 def compact_mapping(values: dict[str, Any]) -> dict[str, Any]:
     """Remove only unknown values; keep False and zero because they are real states."""
     return {key: value for key, value in values.items() if value is not None}
+
+
+WINDOW_DIAG_SENSITIVE_TOKENS = frozenset({
+    "vin", "token", "password", "passwd", "secret", "credential", "certificate",
+    "privatekey", "private_key", "email", "account", "latitude", "longitude",
+    "location", "gps", "address", "deviceid", "device_id",
+})
+WINDOW_DIAG_HINT_TOKENS = ("window", "glass", "vidro")
+_WINDOW_RAW_DIAG_LAST_SIGNATURE: str | None = None
+
+
+def _window_diag_scalar(value: Any) -> bool | int | float | str | None:
+    raw = value_of(value)
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, int) and not isinstance(raw, bool):
+        return raw if -100000 <= raw <= 100000 else None
+    if isinstance(raw, float):
+        if raw != raw or abs(raw) > 100000:
+            return None
+        return round(raw, 4)
+    if isinstance(raw, str):
+        text = raw.strip()
+        if len(text) > 32:
+            return None
+        if re.fullmatch(r"-?\d+(?:\.\d+)?", text):
+            return text
+        if text.lower() in {"true", "false", "open", "opened", "close", "closed", "unknown"}:
+            return text.lower()
+    return None
+
+
+def safe_window_raw_signals(raw: Any, max_items: int = 48) -> dict[str, Any]:
+    """Return a bounded, sanitized subset of window-like scalar signals."""
+    result: dict[str, Any] = {}
+
+    def walk(node: Any, path: tuple[str, ...], depth: int) -> None:
+        if len(result) >= max_items or depth > 7:
+            return
+        if isinstance(node, dict):
+            for raw_key, candidate in node.items():
+                if len(result) >= max_items:
+                    return
+                key = str(raw_key)[:80]
+                normalized_key = re.sub(r"[^a-z0-9_]+", "", key.lower())
+                if any(token in normalized_key for token in WINDOW_DIAG_SENSITIVE_TOKENS):
+                    continue
+                next_path = path + (key,)
+                normalized_path = re.sub(r"[^a-z0-9_]+", "", ".".join(next_path).lower())
+                scalar = _window_diag_scalar(candidate)
+                if scalar is not None and any(token in normalized_path for token in WINDOW_DIAG_HINT_TOKENS):
+                    result[".".join(part[:80] for part in next_path)[:240]] = scalar
+                if isinstance(candidate, (dict, list, tuple)):
+                    walk(candidate, next_path, depth + 1)
+        elif isinstance(node, (list, tuple)):
+            for index, candidate in enumerate(node[:64]):
+                if len(result) >= max_items:
+                    return
+                walk(candidate, path + (f"[{index}]",), depth + 1)
+
+    walk(raw, tuple(), 0)
+    return dict(sorted(result.items()))
+
+
+def log_window_telemetry_diag(
+    window_positions: dict[str, Any],
+    window_state: dict[str, Any],
+    raw_signals: dict[str, Any],
+) -> bool:
+    global _WINDOW_RAW_DIAG_LAST_SIGNATURE
+    snapshot = {
+        "positions": compact_mapping(window_positions),
+        "states": compact_mapping(window_state),
+        "raw_candidates": raw_signals,
+    }
+    encoded = json.dumps(snapshot, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=json_default)
+    signature = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+    if signature == _WINDOW_RAW_DIAG_LAST_SIGNATURE:
+        return False
+    _WINDOW_RAW_DIAG_LAST_SIGNATURE = signature
+    connector_log(
+        logging.INFO,
+        "WINDOW_TELEMETRY_DIAG positions=%s states=%s raw_candidates=%s",
+        json.dumps(snapshot["positions"], ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=json_default),
+        json.dumps(snapshot["states"], ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=json_default),
+        json.dumps(snapshot["raw_candidates"], ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=json_default),
+    )
+    return True
 
 
 def build_visual_signature(
@@ -2684,6 +2772,9 @@ def serialize_vehicle(
         "rear_left": window_open(window_positions["rear_left"]) if window_positions["rear_left"] is not None else first_bool(attribute(windows, "left_rear_window_status")),
         "rear_right": window_open(window_positions["rear_right"]) if window_positions["rear_right"] is not None else first_bool(attribute(windows, "right_rear_window_status")),
     }
+
+    raw_window_signals = safe_window_raw_signals(attribute(status, "raw"))
+    log_window_telemetry_diag(window_positions, window_state, raw_window_signals)
 
     roof_opening = first_numeric(attribute(security, "roof_opening"), map_numeric(cloud_scalars, "roofOpening", "sunroofOpening", "roofOpenPercent"))
     sunshade_position = first_numeric(attribute(windows, "sun_shade"), map_numeric(cloud_scalars, "sunShade", "sunshadeOpening", "sunshadePercent"))

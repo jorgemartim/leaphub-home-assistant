@@ -67,7 +67,7 @@ def test_fast_confirmation_is_announced_as_final(monkeypatch):
     assert result["confirmation_source"] == "telemetry_match"
     assert result["confirmation_reads"] == 4
     assert result["confirmation_elapsed_seconds"] == 23
-    assert result["gateway_version"] == "1.12.100"
+    assert result["gateway_version"] == telemetry.ENGINE_VERSION
 
 
 def test_no_final_announcement_without_positive_verdict(monkeypatch):
