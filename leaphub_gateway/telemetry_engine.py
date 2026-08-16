@@ -55,7 +55,7 @@ except ModuleNotFoundError:
         EVENT_TRANSPORT = _event_transport_module.EVENT_TRANSPORT
 
 LOG = logging.getLogger("leaphub.telemetry")
-ENGINE_VERSION = "1.12.98"  # Official daily allowlist + sunshade position confirmation; physical dispatch preserved
+ENGINE_VERSION = "1.12.99"  # sunshade field diagnostics only; dispatch/matcher/retry preserved
 
 # Hospedagem compartilhada (Apache/LiteSpeed) fecha a conexão ociosa em poucos
 # segundos. Reaproveitar depois disso escreve num socket já fechado e devolve
@@ -5368,7 +5368,20 @@ class TelemetryEngine:
             # Tolerância <0,5 impede que 48% confirme 50% enquanto a cortina passa
             # pelo meio do percurso rumo a 100%. Nenhum retry físico nasce daqui.
             expected = ((requested + 5) // 10) * 10
-            return (abs(observed - expected) < 0.5, True)
+            matched = abs(observed - expected) < 0.5
+            native = (requested + 5) // 10
+            # 1.12.99 — cada amostra da confirmação fica visível para a
+            # homologação física. Apenas percentuais; nenhum identificador,
+            # credencial ou conteúdo bruto da nuvem é registrado.
+            LOG.info(
+                "SUNSHADE_DIAG event=sample pedido_site=%d%% valor_nativo=%d esperado_telemetria=%d observado=%.3f match=%s source=sunshade_percent",
+                requested,
+                native,
+                expected,
+                observed,
+                matched,
+            )
+            return (matched, True)
         if command in {"windows_open", "windows_close"}:
             windows = telemetry.get("windows") if isinstance(telemetry.get("windows"), dict) else {}
             known = [self._command_bool(value) for value in windows.values()]

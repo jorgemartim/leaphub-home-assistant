@@ -44,7 +44,7 @@ except ImportError:
         _privacy_spec.loader.exec_module(_privacy_module)
         sanitize_log = _privacy_module.sanitize_log
 
-CONNECTOR_VERSION = "1.12.98"
+CONNECTOR_VERSION = "1.12.99"
 MAX_INPUT_BYTES = 1024 * 1024
 logging.getLogger("leapmotor_api").setLevel(logging.WARNING)
 LOGGER = logging.getLogger("leaphub.connector")
@@ -3665,6 +3665,14 @@ def execute_vehicle_command(
         # no outro sem regra visível para quem pediu. O valor que o carro recebe
         # é sempre um dos 11 que ele declara aceitar.
         native = (percent + 5) // 10
+        # 1.12.99 — diagnóstico observacional somente. Não altera valor,
+        # método, número de transmissões nem política de retry.
+        connector_log(
+            logging.INFO,
+            "SUNSHADE_DIAG event=dispatch pedido_site=%d%% valor_nativo=%d escala_envio=0-10 tentativas_fisicas=1",
+            percent,
+            native,
+        )
         return method(vehicle_id, value=str(native))
     if command == "set_speed_limit":
         try:

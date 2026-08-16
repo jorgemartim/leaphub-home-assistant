@@ -103,3 +103,23 @@
 - Telemetria do C10 comprova `sunshade_percent` em movimento (ex.: 48% → 100%). A 1.12.98 usa esse campo somente para confirmação, sem mudar o despacho físico e sem retry.
 - `sunshade_open/close`, clima, trunk, janelas, 5/5/8, imagem, OCPP e HMAC permanecem congelados.
 - Site Beta 1.12.360 é o par compatível: Official / Snapshots / Calculado separados, ABRP preserva `captured_at`, catch-up visual sem F5. Produção continua intocada.
+
+
+## 2026-08-15 — Gateway 1.12.99 diagnóstico de campo da cortina
+
+- Gateway 1.12.98 e Site Beta 1.12.360 instalados com Health saudável.
+- Official diário já retornou 8 dias RAW separados de Snapshots/Calculado.
+- Em campo, `sunshade_position` apresentou comportamento não linear/inconsistente:
+  0% fechou fisicamente; em tentativas distintas 100% foi associado a abertura
+  parcial (~15%) e 50% a abertura total, mas os resultados não foram reproduzíveis.
+- Logs também tiveram `result_timeout`, refresh cooperativo, timeouts de leitura e
+  confirmações supersedidas; portanto não é seguro atribuir cada movimento ao
+  último clique sem correlação explícita.
+- Houve confirmações reais de `sunshade_position` pela telemetria (ex.: 22:56:01,
+  23:09:59 e 23:12:04), provando que a janela FAST funciona, mas a 1.12.98 não
+  registrava o percentual solicitado nem cada valor observado.
+- Hipótese a testar: repetir o mesmo valor enquanto o motor se move pode agir como
+  pausa/stop. Ainda não comprovada.
+- A 1.12.99 NÃO muda a transmissão. Apenas registra `pedido_site`, `valor_nativo`,
+  `esperado_telemetria`, `observado` e `match` para cada intenção/amostra.
+- Uma transmissão por intenção, sem retry físico novo. Produção continua intocada.
