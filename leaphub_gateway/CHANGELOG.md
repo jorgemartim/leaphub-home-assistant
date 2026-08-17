@@ -1,10 +1,11 @@
-## 1.12.108
+## 1.12.109
 
 A distribuição continua pré-compilada no GHCR oficial e mantém publicação em duas fases.
 
-- fecha a corrida entre um poll antigo em finalização e uma nova confirmação FAST armada após um comando;
-- preserva `next_run_at` e `command_poll_count` da janela nova quando eles nasceram depois do snapshot do poll;
-- um comando aceito pode cortar apenas espera `recovering/error` anterior; `cooldown` e `auth_required` continuam bloqueios duros;
-- preserva cooldown/autenticação que sejam gravados enquanto um poll antigo termina trabalho local;
-- mantém a cadência pós-despacho 5/5/8 e o backoff seguro 8/15/25/40/60/90;
-- não altera payload, retry/resend físico, janelas, cortina, capô, OCPP, HMAC ou contrato do Site.
+- adiciona OFF do desembaçador no MESMO comando público `windshield_defrost`, usando `enabled=false` e alterando somente `wshld` de `2` para `0`; a matriz permanece 40 estáveis + 12 experimentais;
+- adiciona confirmação FAST do `prepare_car` por climatização ligada, modo, temperatura e ventilação na mesma amostra nova;
+- remove uma passagem redundante de supersessão/lock quando a confirmação já está pendente;
+- adiciona `CONFIRM_ARM_DIAG` para localizar contenções residuais sem mudar cadência, timeout ou quantidade de leituras;
+- mantém `SAFE_STATE_RETRY_COMMANDS` somente em `climate_on`/`climate_off`;
+- mantém `wshld=2` do ON, janelas, cortina, capô e OCPP congelados;
+- mantém `config.yaml` em 1.12.108 até publicação normal via CI/GHCR.

@@ -44,7 +44,7 @@ except ImportError:
         _privacy_spec.loader.exec_module(_privacy_module)
         sanitize_log = _privacy_module.sanitize_log
 
-CONNECTOR_VERSION = "1.12.108"
+CONNECTOR_VERSION = "1.12.109"
 MAX_INPUT_BYTES = 1024 * 1024
 logging.getLogger("leapmotor_api").setLevel(logging.WARNING)
 LOGGER = logging.getLogger("leaphub.connector")
@@ -3832,6 +3832,26 @@ def windshield_defrost_parameters() -> dict[str, str]:
     }
 
 
+
+def windshield_defrost_enabled(parameters: dict[str, Any]) -> bool:
+    """Intenção do mesmo comando de para-brisa.
+
+    Compatibilidade: sem `enabled`, o comportamento histórico continua sendo ON.
+    """
+    if "enabled" not in parameters:
+        return True
+    value = parameters.get("enabled")
+    if not isinstance(value, bool):
+        raise ValueError("Estado do desembaçador inválido.")
+    return value
+
+
+def windshield_defrost_off_parameters() -> dict[str, str]:
+    """Mesmo pacote homologado de ON, mudando somente wshld para OFF."""
+    params = dict(windshield_defrost_parameters())
+    params["wshld"] = "0"
+    return params
+
 def execute_vehicle_command(
     method: Any,
     command: str,
@@ -3848,14 +3868,17 @@ def execute_vehicle_command(
     if command == "climate_off":
         return method(vehicle_id, params={"operate": "off"})
     if command == "windshield_defrost":
-        # 1.12.107 — a biblioteca 0.3.2 monta este preset com wshld=1, que no
-        # C10 aplicou HOT/32/fan7 sem ativar o estado do para-brisa. O payload
-        # verificado do protocolo usa wshld=2. Uma chamada, nenhum retry novo.
+        # 1.12.109 — um único comando público, dois sentidos.
+        # Sem `enabled` = ON legado (wshld=2). OFF = enabled=false (wshld=0).
+        enabled = windshield_defrost_enabled(parameters)
+        params = windshield_defrost_parameters() if enabled else windshield_defrost_off_parameters()
         connector_log(
             logging.INFO,
-            "CLIMATE_DIAG event=windshield_defrost_dispatch wshld=2 tentativas_fisicas=1",
+            "CLIMATE_DIAG event=windshield_defrost_dispatch enabled=%s wshld=%s tentativas_fisicas=1",
+            enabled,
+            params.get("wshld"),
         )
-        return method(vehicle_id, params=windshield_defrost_parameters())
+        return method(vehicle_id, params=params)
     if command == "set_charge_limit":
         value = int(parameters.get("charge_limit_percent", 80))
         if value < 50 or value > 100 or value % 5 != 0:
