@@ -270,3 +270,13 @@ Causas:
 - test_prebuilt_distribution_1_12_32.py e _33.py exigem GITHUB-RECOVERY-<RELEASE_TARGET>.md.
 
 A REV2 corrige somente esses artefatos/documentação. O runtime raw de clima/conforto não foi alterado. Depois disso todos os contratos test_prebuilt_distribution_*.py são executados explicitamente antes da suíte ampla.
+
+## Gateway 1.12.105 — CLIMATE_RAW_PROBE no ponto comprovado
+
+A 1.12.104 foi confirmada em runtime pelo `/health`, mas o teste físico não
+gerou `CLIMATE_COMFORT_DIAG`. No mesmo período, `WINDOW_TELEMETRY_DIAG` apareceu,
+provando que o `status.raw` chegou até o trecho das janelas.
+
+A 1.12.105 adiciona um probe RAW independente imediatamente após o diagnóstico
+das janelas. Ele registra uma amostra vazia uma vez e depois somente mudanças.
+Nenhum comando físico/retry foi alterado.

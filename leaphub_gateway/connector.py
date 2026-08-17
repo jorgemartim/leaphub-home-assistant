@@ -44,7 +44,7 @@ except ImportError:
         _privacy_spec.loader.exec_module(_privacy_module)
         sanitize_log = _privacy_module.sanitize_log
 
-CONNECTOR_VERSION = "1.12.104"
+CONNECTOR_VERSION = "1.12.105"
 MAX_INPUT_BYTES = 1024 * 1024
 logging.getLogger("leapmotor_api").setLevel(logging.WARNING)
 LOGGER = logging.getLogger("leaphub.connector")
@@ -1181,6 +1181,26 @@ def safe_climate_comfort_raw_signals(raw: Any, max_items: int = 32) -> dict[str,
                     walk(value, depth + 1)
     walk(raw, 0)
     return dict(sorted(result.items()))
+
+_CLIMATE_COMFORT_RAW_PROBE_LAST_SIGNATURE: str | None = None
+
+
+def log_climate_comfort_raw_probe(raw_signals: dict[str, Any]) -> bool:
+    # Probe RAW no ponto comprovado da coleta; loga vazio uma vez e mudanças depois.
+    global _CLIMATE_COMFORT_RAW_PROBE_LAST_SIGNATURE
+    payload = dict(sorted((raw_signals or {}).items()))
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=json_default)
+    signature = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+    if signature == _CLIMATE_COMFORT_RAW_PROBE_LAST_SIGNATURE:
+        return False
+    _CLIMATE_COMFORT_RAW_PROBE_LAST_SIGNATURE = signature
+    connector_log(
+        logging.INFO,
+        "CLIMATE_RAW_PROBE raw_candidates=%s",
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=json_default),
+    )
+    return True
+
 
 _CLIMATE_COMFORT_DIAG_LAST_SIGNATURE: str | None = None
 
@@ -2858,6 +2878,10 @@ def serialize_vehicle(
 
     raw_window_signals = safe_window_raw_signals(attribute(status, "raw"))
     log_window_telemetry_diag(window_positions, window_state, raw_window_signals)
+
+    # 1.12.105: probe no mesmo ponto comprovado pelas janelas.
+    raw_climate_probe = safe_climate_comfort_raw_signals(attribute(status, "raw"))
+    log_climate_comfort_raw_probe(raw_climate_probe)
 
     roof_opening = first_numeric(attribute(security, "roof_opening"), map_numeric(cloud_scalars, "roofOpening", "sunroofOpening", "roofOpenPercent"))
     sunshade_position = first_numeric(attribute(windows, "sun_shade"), map_numeric(cloud_scalars, "sunShade", "sunshadeOpening", "sunshadePercent"))
