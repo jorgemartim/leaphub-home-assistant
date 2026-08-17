@@ -109,8 +109,8 @@ def command_context(request_id: str = "req-108") -> dict[str, object]:
 
 
 def test_release_and_physical_guardrails_are_unchanged() -> None:
-    assert telemetry.ENGINE_VERSION == "1.12.108"
-    assert connector.CONNECTOR_VERSION == "1.12.108"
+    assert tuple(int(part) for part in telemetry.ENGINE_VERSION.split(".")) >= (1, 12, 108)
+    assert tuple(int(part) for part in connector.CONNECTOR_VERSION.split(".")) >= (1, 12, 108)
     assert tuple(telemetry.TelemetryEngine.COMMAND_POST_DISPATCH_EARLY_CADENCE) == (5, 5, 8)
     assert tuple(telemetry.TelemetryEngine.COMMAND_TRANSIENT_BACKOFF) == (8, 15, 25, 40, 60, 90)
     assert connector.SAFE_STATE_RETRY_COMMANDS == {"climate_on", "climate_off"}

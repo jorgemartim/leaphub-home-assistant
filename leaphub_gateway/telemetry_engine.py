@@ -55,7 +55,7 @@ except ModuleNotFoundError:
         EVENT_TRANSPORT = _event_transport_module.EVENT_TRANSPORT
 
 LOG = logging.getLogger("leaphub.telemetry")
-ENGINE_VERSION = "1.12.108"  # windows C10 mapping + final confirmation push; retry/cadence preserved
+ENGINE_VERSION = "1.12.109"  # windows C10 mapping + final confirmation push; retry/cadence preserved
 
 # Hospedagem compartilhada (Apache/LiteSpeed) fecha a conexão ociosa em poucos
 # segundos. Reaproveitar depois disso escreve num socket já fechado e devolve
@@ -103,6 +103,7 @@ TELEMETRY_CONFIRMABLE_COMMANDS = frozenset({
     "quick_cool",
     "quick_heat",
     "windshield_defrost",
+    "prepare_car",
     "battery_preheat_on",
     "battery_preheat_off",
     "steering_wheel_heat_on",
@@ -129,7 +130,7 @@ TELEMETRY_CONFIRMABLE_COMMANDS = frozenset({
 # confirmar LOCK depois de um UNLOCK posterior, nem OPEN depois de CLOSE.
 CONFIRMATION_SUPERSESSION_FAMILIES: dict[str, frozenset[str]] = {
     "locks": frozenset({"lock", "unlock"}),
-    "climate": frozenset({"climate_on", "climate_off", "quick_cool", "quick_heat", "windshield_defrost"}),
+    "climate": frozenset({"climate_on", "climate_off", "quick_cool", "quick_heat", "windshield_defrost", "prepare_car"}),
     "trunk": frozenset({"trunk_open", "trunk_close"}),
     "windows": frozenset({"windows_open", "windows_close", "windows_position"}),
     "sunshade": frozenset({"sunshade_open", "sunshade_close", "sunshade_position"}),
@@ -2263,11 +2264,10 @@ class TelemetryEngine:
         """
         command = str(payload.get("command") or "").strip().lower()
         dispatched = bool(result.get("command_dispatched") or result.get("cloud_accepted"))
-        if command in TELEMETRY_CONFIRMABLE_COMMANDS and dispatched:
-            # 1.12.84 — supersessão é consequência da NOVA intenção aceita,
-            # não da necessidade de abrir outra janela. Assim um climate_off
-            # confirmado diretamente também encerra quick_cool/quick_heat
-            # anteriores em vez de deixá-los consumir FAST por ~180s.
+        pending = bool(result.get("confirmation_pending"))
+
+        if command in TELEMETRY_CONFIRMABLE_COMMANDS and dispatched and not pending:
+            supersede_started = time.monotonic()
             try:
                 now_epoch = time.time()
                 now_iso = utc_iso()
@@ -2286,10 +2286,17 @@ class TelemetryEngine:
                     "Comando %s foi aceito, mas a limpeza da confirmação anterior em %s falhou: %s",
                     command, subscription_id, connector.clean_message(str(exc)),
                 )
+            finally:
+                supersede_ms = int(round((time.monotonic() - supersede_started) * 1000))
+                if supersede_ms >= TELEMETRY_STAGE_LOG_THRESHOLD_MS:
+                    LOG.info(
+                        "CONFIRM_ARM_DIAG command=%s stage=supersede ms=%s subscription=%s",
+                        command, supersede_ms, subscription_id,
+                    )
 
         if (
             command not in TELEMETRY_CONFIRMABLE_COMMANDS
-            or not bool(result.get("confirmation_pending"))
+            or not pending
             or not dispatched
         ):
             result["confirmation_armed_by_gateway"] = False
@@ -2303,12 +2310,19 @@ class TelemetryEngine:
             "request_id": str(payload.get("request_id") or "").strip()[:96],
         }
         try:
+            boost_started = time.monotonic()
             armed = self.boost(
                 subscription_id,
                 seconds=180,
                 profile="command",
                 context=context,
             )
+            boost_ms = int(round((time.monotonic() - boost_started) * 1000))
+            if boost_ms >= TELEMETRY_STAGE_LOG_THRESHOLD_MS:
+                LOG.info(
+                    "CONFIRM_ARM_DIAG command=%s stage=boost ms=%s subscription=%s",
+                    command, boost_ms, subscription_id,
+                )
             result["confirmation_armed_by_gateway"] = bool(armed.get("ok"))
             result["confirmation_window_reused"] = bool(armed.get("confirmation_window_reused"))
             if not armed.get("ok"):
@@ -2804,16 +2818,16 @@ class TelemetryEngine:
         if not family:
             return 0
         commands = CONFIRMATION_SUPERSESSION_FAMILIES.get(family, frozenset())
-        include_same_position = command_key == "sunshade_position" and bool(request_id)
+        include_same_intent = command_key in {"sunshade_position", "windshield_defrost"} and bool(request_id)
         opposites = sorted(
-            item for item in commands if item != command_key or include_same_position
+            item for item in commands if item != command_key or include_same_intent
         )
         if not opposites:
             return 0
         placeholders = ",".join("?" for _ in opposites)
         same_request_guard = (
             " AND NOT (command_key=? AND IFNULL(request_id,'')=?)"
-            if include_same_position else ""
+            if include_same_intent else ""
         )
         sql = (
             "UPDATE command_confirmations SET status='superseded',resolution=?,resolved_at=?,updated_at=? "
@@ -2828,7 +2842,7 @@ class TelemetryEngine:
             vehicle_id,
             *opposites,
         ]
-        if include_same_position:
+        if include_same_intent:
             params.extend([command_key, request_id])
         cursor = db.execute(sql, tuple(params))
         count = max(0, int(cursor.rowcount or 0))
@@ -5287,6 +5301,7 @@ class TelemetryEngine:
         "quick_cool": ("climate_on", "climate_details"),
         "quick_heat": ("climate_on", "climate_details"),
         "windshield_defrost": ("climate_details.windshield_defrost",),
+        "prepare_car": ("climate_on", "climate_details"),
         "battery_preheat_on": ("climate_details.battery_preheat",),
         "battery_preheat_off": ("climate_details.battery_preheat",),
         "steering_wheel_heat_on": ("seat_comfort.steering_wheel_heating",),
@@ -5423,7 +5438,59 @@ class TelemetryEngine:
         if command == "windshield_defrost":
             details = telemetry.get("climate_details") if isinstance(telemetry.get("climate_details"), dict) else {}
             state = self._command_bool(details.get("windshield_defrost"))
-            return (state is True, state is not None)
+            parameters = context.get("parameters") if isinstance(context.get("parameters"), dict) else {}
+            expected = parameters.get("enabled", True)
+            if not isinstance(expected, bool):
+                return False, False
+            return (state is expected, state is not None)
+        if command == "prepare_car":
+            parameters = context.get("parameters") if isinstance(context.get("parameters"), dict) else {}
+            climate_on = self._command_bool(telemetry.get("climate_on"))
+            if climate_on is not True:
+                return (False, climate_on is not None)
+
+            requested_mode = str(parameters.get("climate_mode") or "auto").strip().lower()
+            expected_mode = {"auto": "auto", "cold": "cooling", "hot": "heating"}.get(requested_mode)
+            if expected_mode is None:
+                return False, False
+            observed_mode, mode_evaluable = self._command_climate_mode(telemetry)
+            if not mode_evaluable:
+                return False, False
+            if observed_mode != expected_mode:
+                return False, True
+
+            details = telemetry.get("climate_details") if isinstance(telemetry.get("climate_details"), dict) else {}
+
+            def _number(value: Any) -> float | None:
+                try:
+                    if value is None or isinstance(value, bool):
+                        return None
+                    return float(value)
+                except (TypeError, ValueError):
+                    return None
+
+            requested_fan = _number(parameters.get("wind_level"))
+            observed_fan = _number(details.get("fan_level"))
+            if requested_fan is None or observed_fan is None:
+                return False, False
+            if abs(observed_fan - requested_fan) > 0.1:
+                return False, True
+
+            requested_temp = _number(parameters.get("temperature"))
+            if requested_temp is None:
+                return False, False
+            known_temps = [
+                value for value in (
+                    _number(details.get("left_temperature_c")),
+                    _number(details.get("right_temperature_c")),
+                )
+                if value is not None
+            ]
+            if not known_temps:
+                return False, False
+            if any(abs(value - requested_temp) > 0.6 for value in known_temps):
+                return False, True
+            return True, True
         if command in {"battery_preheat_on", "battery_preheat_off"}:
             details = telemetry.get("climate_details") if isinstance(telemetry.get("climate_details"), dict) else {}
             state = self._command_bool(details.get("battery_preheat"))

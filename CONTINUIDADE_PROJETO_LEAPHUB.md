@@ -331,3 +331,20 @@ Congelado: payloads, retries físicos, 5/5/8, backoff 8/15/25/40/60/90, janelas,
 cortina, capô, OCPP, HMAC e contrato do Site. Antes de merge: revisar diff e CI
 verde. Depois de publicar/instalar, homologar apenas o tempo de confirmação com o
 veículo estacionado; nenhum reenvio físico adicional faz parte desta release.
+
+## Gateway 1.12.109 — defrost OFF + Prepare FAST
+
+Após 1.12.108, confirmações normais caíram para ~4-7s quando o arme ocorreu
+rápido, mas foram observados armes isolados de ~39s/~44s. A 1.12.109 remove a
+passagem redundante de supersessão/lock no caminho pending e adiciona
+CONFIRM_ARM_DIAG sem mudar cadência, timeout ou quantidade de leituras.
+
+O segundo clique do desembaçador enviava ON novamente. A candidata preserva
+`windshield_defrost` como único comando público e usa `enabled=false` para OFF,
+com o mesmo pacote homologado e somente wshld=0.
+
+Prepare passa a ser confirmável pela telemetria FAST, exigindo clima ligado,
+modo, setpoint e fan compatíveis na mesma amostra.
+
+Congelado: retries físicos, ON wshld=2, janelas, cortina, capô, OCPP,
+cooldown/auth e config.yaml publicado.
