@@ -24,8 +24,9 @@ EXPECTED = {
 }
 
 
-def test_release_version() -> None:
-    assert connector.CONNECTOR_VERSION == "1.12.107"
+def test_release_version_is_1_12_107_or_newer() -> None:
+    parts = tuple(int(part) for part in connector.CONNECTOR_VERSION.split("."))
+    assert parts >= (1, 12, 107)
 
 
 def test_verified_windshield_payload_is_exact() -> None:

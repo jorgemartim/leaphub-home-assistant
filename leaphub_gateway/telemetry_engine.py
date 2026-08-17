@@ -55,7 +55,7 @@ except ModuleNotFoundError:
         EVENT_TRANSPORT = _event_transport_module.EVENT_TRANSPORT
 
 LOG = logging.getLogger("leaphub.telemetry")
-ENGINE_VERSION = "1.12.107"  # windows C10 mapping + final confirmation push; retry/cadence preserved
+ENGINE_VERSION = "1.12.108"  # windows C10 mapping + final confirmation push; retry/cadence preserved
 
 # Hospedagem compartilhada (Apache/LiteSpeed) fecha a conexão ociosa em poucos
 # segundos. Reaproveitar depois disso escreve num socket já fechado e devolve
@@ -3176,7 +3176,14 @@ class TelemetryEngine:
                 }
             current_next = float(row["next_run_at"] or 0)
             current_status = str(row["status"] or "").strip().lower()
-            protected_wait = current_status in {"recovering", "error", "cooldown", "auth_required"} and current_next > now_epoch
+            # 1.12.108 — um comando físico que ACABOU de ser aceito não pode
+            # herdar 45/120s de uma falha de telemetria anterior. Recovering e
+            # error são esperas soft: só o perfil command pode cortá-las. As
+            # proteções reais permanecem duras — auth_required é recusado acima
+            # e cooldown_until também é recusado antes deste ponto.
+            hard_protected_wait = current_status in {"cooldown", "auth_required"} and current_next > now_epoch
+            recovery_wait = current_status in {"recovering", "error"} and current_next > now_epoch
+            protected_wait = hard_protected_wait or (recovery_wait and profile != "command")
             requested_next = now_epoch + 0.35
             next_run = current_next if protected_wait else (min(current_next, requested_next) if current_next > now_epoch else requested_next)
             interactive_until = now_epoch + seconds if profile == "interactive" else 0.0
@@ -3657,6 +3664,64 @@ class TelemetryEngine:
             delivery = db.execute("SELECT MIN(next_attempt_at) due FROM events WHERE status='pending'").fetchone()
         values = [float(item["due"]) for item in (row, delivery) if item and item["due"] is not None]
         return max(0.25, min(values) - time.time()) if values else 5.0
+
+    def _reconcile_live_post_poll_schedule(
+        self,
+        db: sqlite3.Connection,
+        subscription: sqlite3.Row,
+        cycle_epoch: float,
+        proposed_next_run: float,
+        proposed_command_poll: int,
+    ) -> tuple[float, int, int, bool, bool]:
+        """Mescla somente coordenação que nasceu depois do snapshot deste poll.
+
+        A chamada à nuvem termina antes do processamento/persistência local. Ao
+        liberar a trava da conta, um comando manual pode ser aceito e o arme
+        assíncrono pode gravar ``next_run_at ~= agora + 0.35`` enquanto este poll
+        ainda finaliza. Sem reler a linha viva, o snapshot antigo sobrescreve
+        essa agenda com 45/90/600s e também pode trocar o poll_count novo por um
+        contador velho.
+
+        O mesmo interleaving pode criar cooldown/auth_required depois da leitura
+        que acabou de ter sucesso. Esses bloqueios são mais novos que o snapshot
+        e nunca podem ser apagados por ele.
+        """
+        sid = str(subscription["subscription_id"] or "")
+        live = db.execute(
+            "SELECT status,next_run_at,command_until,command_started_at,command_poll_count,"
+            "auth_required,cooldown_until FROM subscriptions WHERE subscription_id=? LIMIT 1",
+            (sid,),
+        ).fetchone()
+        pending = db.execute(
+            "SELECT COUNT(*) AS total,MAX(started_at) AS newest_started_at "
+            "FROM command_confirmations WHERE subscription_id=? AND status='pending' AND expires_at>?",
+            (sid, cycle_epoch),
+        ).fetchone()
+
+        pending_total = int(pending["total"] or 0) if pending is not None else 0
+        newest_started_at = float(pending["newest_started_at"] or 0) if pending is not None else 0.0
+        snapshot_started_at = float(subscription["command_started_at"] or 0)
+        newer_command_armed = pending_total > 0 and newest_started_at > snapshot_started_at + 0.000001
+
+        next_run = float(proposed_next_run)
+        command_poll = int(proposed_command_poll)
+        hard_protection = False
+        if live is not None:
+            hard_protection = (
+                int(live["auth_required"] or 0) == 1
+                or float(live["cooldown_until"] or 0) > cycle_epoch
+            )
+            if newer_command_armed and not hard_protection:
+                live_next = float(live["next_run_at"] or 0)
+                if live_next > 0:
+                    # O valor pode já estar vencido quando o poll termina. Isso
+                    # é intencional: _inflight impediu duplicata; ao liberar a
+                    # assinatura, o scheduler deve executar a FAST imediatamente.
+                    next_run = min(next_run, live_next)
+                command_poll = max(0, int(live["command_poll_count"] or 0))
+
+        return next_run, command_poll, pending_total, hard_protection, newer_command_armed
+
 
     def _poll_subscription(self, subscription: sqlite3.Row) -> None:
         sid = str(subscription["subscription_id"])
@@ -4171,14 +4236,43 @@ class TelemetryEngine:
             # tiraria a assinatura do modo comando, deixando essa espera órfã
             # até ser recolhida por abandono. É o mesmo veredito perdido que
             # esta versão existe para acabar.
-            live = db.execute(
-                "SELECT COUNT(*) AS total FROM command_confirmations "
-                "WHERE subscription_id=? AND status='pending' AND expires_at>?",
-                (sid, cycle_epoch),
-            ).fetchone()
-            if int(live["total"] or 0) > 0:
+            (
+                next_run,
+                next_command_poll,
+                live_pending_count,
+                hard_live_protection,
+                newer_command_armed,
+            ) = self._reconcile_live_post_poll_schedule(
+                db,
+                subscription,
+                cycle_epoch,
+                next_run,
+                next_command_poll,
+            )
+            if live_pending_count > 0:
                 clear_command = False
-            if clear_command:
+            if hard_live_protection:
+                # Uma proteção criada depois da coleta (por exemplo, um comando
+                # que recebeu cooldown enquanto este poll fazia trabalho local)
+                # vence o snapshot antigo. Atualizamos apenas o fato verdadeiro
+                # de que ESTA leitura teve sucesso; status/agenda/erro/proteção
+                # permanecem como o produtor mais novo gravou.
+                db.execute(
+                    "UPDATE subscriptions SET last_run_at=?,last_success_at=?,last_state=?,parked_streak=?,"
+                    "candidate_state=?,candidate_count=?,sleep_streak=?,updated_at=? WHERE subscription_id=?",
+                    (
+                        now,
+                        now,
+                        aggregate_state,
+                        parked_streak,
+                        candidate_state or None,
+                        candidate_count,
+                        sleep_streak,
+                        now,
+                        sid,
+                    ),
+                )
+            elif clear_command:
                 db.execute(
                     "UPDATE subscriptions SET status='active', next_run_at=?, last_run_at=?, last_success_at=?, last_error=NULL, last_state=?, parked_streak=?, candidate_state=?, candidate_count=?, sleep_streak=?, consecutive_failures=0, cooldown_until=0, cooldown_reason=NULL, command_until=0, command_key=NULL, command_vehicle_id=NULL, command_context_json=NULL, command_poll_count=0, command_started_at=0, updated_at=? WHERE subscription_id=?",
                     (next_run, now, now, aggregate_state, parked_streak, candidate_state or None, candidate_count, sleep_streak, now, sid),
