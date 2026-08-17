@@ -44,7 +44,7 @@ except ImportError:
         _privacy_spec.loader.exec_module(_privacy_module)
         sanitize_log = _privacy_module.sanitize_log
 
-CONNECTOR_VERSION = "1.12.103"
+CONNECTOR_VERSION = "1.12.104"
 MAX_INPUT_BYTES = 1024 * 1024
 logging.getLogger("leapmotor_api").setLevel(logging.WARNING)
 LOGGER = logging.getLogger("leaphub.connector")
@@ -1156,6 +1156,32 @@ def door_open(value: Any) -> bool | None:
     return parsed
 
 
+CLIMATE_COMFORT_SIGNAL_IDS = frozenset({
+    "49", "50", "1349", "1624", "1816",
+    "1938", "1939", "1940", "1941", "1943", "1945", "1946", "1949",
+    "2100", "2101", "2118", "2119",
+    "2183", "2184", "2669", "2681", "3713",
+})
+
+def safe_climate_comfort_raw_signals(raw: Any, max_items: int = 32) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    def walk(node: Any, depth: int) -> None:
+        if len(result) >= max_items or depth > 7:
+            return
+        if isinstance(node, dict):
+            for key, value in node.items():
+                key_text = str(key)
+                if key_text in CLIMATE_COMFORT_SIGNAL_IDS and isinstance(value, (str, int, float, bool)):
+                    result["signal." + key_text] = value
+                if isinstance(value, (dict, list, tuple)):
+                    walk(value, depth + 1)
+        elif isinstance(node, (list, tuple)):
+            for value in node[:64]:
+                if isinstance(value, (dict, list, tuple)):
+                    walk(value, depth + 1)
+    walk(raw, 0)
+    return dict(sorted(result.items()))
+
 _CLIMATE_COMFORT_DIAG_LAST_SIGNATURE: str | None = None
 
 
@@ -1163,6 +1189,7 @@ def log_climate_comfort_diag(
     climate_state: dict[str, Any],
     seat_state: dict[str, Any],
     mirrors_state: dict[str, Any],
+    raw_signals: dict[str, Any] | None = None,
 ) -> bool:
     # Somente campos tipados/allow-listed; status.raw nunca entra aqui.
     global _CLIMATE_COMFORT_DIAG_LAST_SIGNATURE
@@ -1177,9 +1204,8 @@ def log_climate_comfort_diag(
         "climate": {key: climate_state[key] for key in climate_keys if key in climate_state},
         "comfort": {key: seat_state[key] for key in seat_keys if key in seat_state},
         "mirrors": {key: mirrors_state[key] for key in mirror_keys if key in mirrors_state},
+        "raw_candidates": dict(sorted((raw_signals or {}).items())),
     }
-    if not any(snapshot.values()):
-        return False
     encoded = json.dumps(snapshot, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=json_default)
     signature = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
     if signature == _CLIMATE_COMFORT_DIAG_LAST_SIGNATURE:
@@ -1187,10 +1213,11 @@ def log_climate_comfort_diag(
     _CLIMATE_COMFORT_DIAG_LAST_SIGNATURE = signature
     connector_log(
         logging.INFO,
-        "CLIMATE_COMFORT_DIAG climate=%s comfort=%s mirrors=%s",
+        "CLIMATE_COMFORT_DIAG climate=%s comfort=%s mirrors=%s raw_candidates=%s",
         json.dumps(snapshot["climate"], ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=json_default),
         json.dumps(snapshot["comfort"], ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=json_default),
         json.dumps(snapshot["mirrors"], ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=json_default),
+        json.dumps(snapshot["raw_candidates"], ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=json_default),
     )
     return True
 
@@ -2872,7 +2899,8 @@ def serialize_vehicle(
         "right_heating": first_bool(attribute(security, "right_mirror_heating"), mapping_pick(cloud_scalars, ("rightMirrorHeating",))),
         "folded": first_bool(mapping_pick(cloud_scalars, ("rearviewMirrorFolded", "mirrorFolded", "mirrorsFolded"))),
     })
-    log_climate_comfort_diag(climate_state, seat_state, mirrors_state)
+    raw_climate_comfort_signals = safe_climate_comfort_raw_signals(attribute(status, "raw"))
+    log_climate_comfort_diag(climate_state, seat_state, mirrors_state, raw_climate_comfort_signals)
     security_state = compact_mapping({
         "active": first_bool(attribute(security, "is_security_active"), attribute(security, "vehicle_security_active")),
         "raw_state": enum_or_value(attribute(security, "vehicle_security_active")),

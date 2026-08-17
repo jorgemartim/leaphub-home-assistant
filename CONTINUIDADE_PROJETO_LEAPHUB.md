@@ -253,3 +253,20 @@ independente de CRLF/LF, e altera somente a expectativa `auto` -> `manual`.
 
 O teste novo da 1.12.103 continua cobrindo separadamente que AUTO permanece AUTO.
 Nenhum código funcional adicional foi alterado nesta REV3.
+
+## Gateway 1.12.104 — diagnóstico raw clima/conforto
+
+A 1.12.103 não mostrou `CLIMATE_COMFORT_DIAG` no teste físico.
+A 1.12.104 acrescenta somente IDs raw allow-listed de clima/conforto para
+descobrir se o C10 publica as mudanças mesmo quando os campos tipados vêm vazios.
+Sem alteração física de comandos/retry/janelas/cortina/OCPP.
+
+### Gateway 1.12.104 REV2 — contratos de distribuição
+
+A primeira tentativa da 1.12.104 passou 68 testes direcionados e falhou na coleta da suíte ampla por três contratos de distribuição, antes de qualquer commit/push.
+
+Causas:
+- test_prebuilt_distribution_1_12_31.py exige que o CHANGELOG declare que a distribuição continua pré-compilada;
+- test_prebuilt_distribution_1_12_32.py e _33.py exigem GITHUB-RECOVERY-<RELEASE_TARGET>.md.
+
+A REV2 corrige somente esses artefatos/documentação. O runtime raw de clima/conforto não foi alterado. Depois disso todos os contratos test_prebuilt_distribution_*.py são executados explicitamente antes da suíte ampla.
