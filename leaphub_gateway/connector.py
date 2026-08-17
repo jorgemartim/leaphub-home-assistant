@@ -44,7 +44,7 @@ except ImportError:
         _privacy_spec.loader.exec_module(_privacy_module)
         sanitize_log = _privacy_module.sanitize_log
 
-CONNECTOR_VERSION = "1.12.102"
+CONNECTOR_VERSION = "1.12.103"
 MAX_INPUT_BYTES = 1024 * 1024
 logging.getLogger("leapmotor_api").setLevel(logging.WARNING)
 LOGGER = logging.getLogger("leaphub.connector")
@@ -1154,6 +1154,45 @@ def serialize_maintenance(vehicle: Any, status: Any, messages: list[Any], allow_
 def door_open(value: Any) -> bool | None:
     parsed = bool_or_none(value)
     return parsed
+
+
+_CLIMATE_COMFORT_DIAG_LAST_SIGNATURE: str | None = None
+
+
+def log_climate_comfort_diag(
+    climate_state: dict[str, Any],
+    seat_state: dict[str, Any],
+    mirrors_state: dict[str, Any],
+) -> bool:
+    # Somente campos tipados/allow-listed; status.raw nunca entra aqui.
+    global _CLIMATE_COMFORT_DIAG_LAST_SIGNATURE
+    climate_keys = (
+        "on", "left_temperature_c", "right_temperature_c", "fan_level",
+        "mode", "operate_mode", "cooling_and_heating", "recirculation",
+        "windshield_defrost",
+    )
+    seat_keys = ("steering_wheel_heating", "steering_wheel_minutes")
+    mirror_keys = ("left_heating", "right_heating")
+    snapshot = {
+        "climate": {key: climate_state[key] for key in climate_keys if key in climate_state},
+        "comfort": {key: seat_state[key] for key in seat_keys if key in seat_state},
+        "mirrors": {key: mirrors_state[key] for key in mirror_keys if key in mirrors_state},
+    }
+    if not any(snapshot.values()):
+        return False
+    encoded = json.dumps(snapshot, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=json_default)
+    signature = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+    if signature == _CLIMATE_COMFORT_DIAG_LAST_SIGNATURE:
+        return False
+    _CLIMATE_COMFORT_DIAG_LAST_SIGNATURE = signature
+    connector_log(
+        logging.INFO,
+        "CLIMATE_COMFORT_DIAG climate=%s comfort=%s mirrors=%s",
+        json.dumps(snapshot["climate"], ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=json_default),
+        json.dumps(snapshot["comfort"], ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=json_default),
+        json.dumps(snapshot["mirrors"], ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=json_default),
+    )
+    return True
 
 
 def window_open(value: Any) -> bool | None:
@@ -2833,6 +2872,7 @@ def serialize_vehicle(
         "right_heating": first_bool(attribute(security, "right_mirror_heating"), mapping_pick(cloud_scalars, ("rightMirrorHeating",))),
         "folded": first_bool(mapping_pick(cloud_scalars, ("rearviewMirrorFolded", "mirrorFolded", "mirrorsFolded"))),
     })
+    log_climate_comfort_diag(climate_state, seat_state, mirrors_state)
     security_state = compact_mapping({
         "active": first_bool(attribute(security, "is_security_active"), attribute(security, "vehicle_security_active")),
         "raw_state": enum_or_value(attribute(security, "vehicle_security_active")),
@@ -4209,9 +4249,9 @@ def prepare_car_parameters(parameters: dict[str, Any]) -> dict[str, Any]:
     payload: dict[str, Any] = {}
 
     if bool_or_none(parameters.get("climate")) is True:
-        mode = str(parameters.get("climate_mode") or "wind").strip().lower()
-        if mode in {"auto", "generic", "nohotcold"}:
-            mode = "wind"
+        requested_mode = str(parameters.get("climate_mode") or "wind").strip().lower()
+        operate = "auto" if requested_mode in {"auto", "generic", "nohotcold"} else "manual"
+        mode = "wind" if operate == "auto" else requested_mode
         if mode not in {"cold", "hot", "wind"}:
             raise ValueError("Modo de climatização inválido.")
         try:
@@ -4230,7 +4270,7 @@ def prepare_car_parameters(parameters: dict[str, Any]) -> dict[str, Any]:
             "enable": True,
             "circle": "in",
             "mode": mode,
-            "operate": "auto",
+            "operate": operate,
             "position": "all",
             "temperature": str(temperature),
             "windlevel": str(wind_level),

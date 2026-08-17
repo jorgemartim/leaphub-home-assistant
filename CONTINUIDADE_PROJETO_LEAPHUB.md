@@ -222,3 +222,34 @@ do sinal binário dedicado. A 1.12.102 inverte essa prioridade e amplia o diagn�
 para os oito IDs numéricos de janela documentados na leapmotor-api v0.3.2.
 
 Nenhum comando físico, retry, cortina ou OCPP foi alterado.
+
+## Gateway 1.12.103 — clima e conforto
+
+Evidência de campo da 1.12.102:
+- qualquer modo no `prepare_car` terminava em AUTO por `operate=auto` fixo;
+- `windshield_defrost` não teve efeito físico mesmo com retorno concluído da biblioteca;
+- volante e retrovisores receberam ACK de nuvem/result_timeout, sem efeito físico;
+- o Site pode mostrar intenção recente antes de uma telemetria física nova.
+
+1.12.103 corrige AUTO/MANUAL e adiciona `CLIMATE_COMFORT_DIAG` com campos tipados,
+sem raw e sem dados sensíveis. Não adiciona retry, não muda as rotas físicas dos
+três controles e preserva janelas 1.12.102, cortina e OCPP.
+
+Próximo teste: acionar volante, retrovisores e desembacador dentro do próprio carro
+e comparar as linhas `CLIMATE_COMFORT_DIAG`. Isso decide se o defeito restante
+está na telemetria Leapmotor ou apenas na reconciliação do Site.
+
+### 1.12.103 REV3 — contrato histórico HOT=AUTO corrigido
+
+A primeira validação ampla da 1.12.103 passou 491 testes e encontrou somente um
+contrato histórico da 1.12.58 que ainda exigia `climate_mode=hot` com
+`operate=auto`. Esse era exatamente o comportamento funcional que a 1.12.103
+corrige.
+
+A REV2 tentou atualizar o bloco inteiro por igualdade textual e falhou por
+variação de quebra de linha no worktree Windows. A REV3 usa patch estrutural
+restrito à função `test_prepare_car_builds_only_the_requested_dimensions`,
+independente de CRLF/LF, e altera somente a expectativa `auto` -> `manual`.
+
+O teste novo da 1.12.103 continua cobrindo separadamente que AUTO permanece AUTO.
+Nenhum código funcional adicional foi alterado nesta REV3.

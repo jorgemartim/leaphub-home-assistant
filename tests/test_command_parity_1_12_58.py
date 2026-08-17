@@ -250,7 +250,8 @@ def test_prepare_car_builds_only_the_requested_dimensions():
     assert set(params) == {"air_condition"}
     assert params["air_condition"]["temperature"] == "22"
     assert params["air_condition"]["mode"] == "hot"
-    assert params["air_condition"]["operate"] == "auto"
+    # 1.12.103: hot/cold/wind sao escolhas explicitas e usam operacao manual.
+    assert params["air_condition"]["operate"] == "manual"
     assert params["air_condition"]["position"] == "all"
     assert params["air_condition"]["wshld"] == "0"
 
