@@ -210,3 +210,15 @@ O CHANGELOG 1.12.101 passa a preservar simultaneamente:
 A REV5 executa todos os contratos script-style de distribuição individualmente
 antes da suíte ampla. Nenhuma mudança funcional adicional foi feita em janelas,
 dispatch, retry, cortina ou OCPP.
+
+## Gateway 1.12.102 — prioridade do estado binário das janelas
+
+Campo da 1.12.101: quatro janelas fisicamente abertas, porém o Leap Hub mostrou
+somente duas. O log registrou front_left/front_right=true e rear_left/rear_right=false,
+com percentuais traseiros 0.0.
+
+A causa no código era a prioridade incorreta: percentual presente era usado antes
+do sinal binário dedicado. A 1.12.102 inverte essa prioridade e amplia o diagnóstico
+para os oito IDs numéricos de janela documentados na leapmotor-api v0.3.2.
+
+Nenhum comando físico, retry, cortina ou OCPP foi alterado.

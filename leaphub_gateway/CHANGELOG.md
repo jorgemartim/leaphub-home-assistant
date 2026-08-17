@@ -1,12 +1,9 @@
-## 1.12.101
+## 1.12.102
 
 A distribuição continua pré-compilada no GHCR oficial e mantém publicação em duas fases.
 
-- diagnóstico sanitizado das quatro janelas do C10, sem registrar payload bruto sensível;
-- `WINDOW_TELEMETRY_DIAG` só é emitido quando o snapshot de janelas muda;
-- candidatos de `status.raw` ficam limitados a sinais escalares relacionados a janela/vidro;
-- VIN, conta, token, senha, credenciais, certificado, GPS/localização, endereço e identificadores de dispositivo são excluídos;
-- a camada oficial `carpic_leftbehind_window_close.png` fica protegida por teste para o vidro traseiro esquerdo;
-- o contrato visual continua aceitando as quatro tags de janela;
-- o teste de confirmação usa `telemetry.ENGINE_VERSION` em vez de congelar a string 1.12.100;
-- nenhum comando físico, retry, cortina, clima ou OCPP é alterado nesta versão.
+- corrige a leitura das quatro janelas do C10/B10: o sinal binário dedicado de aberto/fechado passa a ter prioridade sobre o percentual;
+- evita que percentuais traseiros `0` mascarem um estado traseiro aberto;
+- mantém o percentual apenas como fallback quando o sinal binário não estiver disponível;
+- amplia `WINDOW_TELEMETRY_DIAG` para reconhecer somente os IDs numéricos de janela 3727, 3728, 1879, 1880, 1693, 1694, 1695 e 1696;
+- preserva comandos físicos, retry, cortina, clima e OCPP sem alterações.

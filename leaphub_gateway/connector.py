@@ -44,7 +44,7 @@ except ImportError:
         _privacy_spec.loader.exec_module(_privacy_module)
         sanitize_log = _privacy_module.sanitize_log
 
-CONNECTOR_VERSION = "1.12.101"
+CONNECTOR_VERSION = "1.12.102"
 MAX_INPUT_BYTES = 1024 * 1024
 logging.getLogger("leapmotor_api").setLevel(logging.WARNING)
 LOGGER = logging.getLogger("leaphub.connector")
@@ -1165,6 +1165,15 @@ def window_open(value: Any) -> bool | None:
     return bool_or_none(value)
 
 
+def effective_window_open(position: Any, explicit_status: Any) -> bool | None:
+    status = first_bool(explicit_status)
+    if status is not None:
+        return status
+    if position is not None:
+        return window_open(position)
+    return None
+
+
 def first_bool(*values: Any) -> bool | None:
     """Return the first boolean signal that can be interpreted safely."""
     for value in values:
@@ -1192,6 +1201,12 @@ WINDOW_DIAG_SENSITIVE_TOKENS = frozenset({
     "location", "gps", "address", "deviceid", "device_id",
 })
 WINDOW_DIAG_HINT_TOKENS = ("window", "glass", "vidro")
+WINDOW_DIAG_SIGNAL_IDS = frozenset({
+    "3727", "3728",
+    "1879", "1880",
+    "1693", "1694",
+    "1695", "1696",
+})
 _WINDOW_RAW_DIAG_LAST_SIGNATURE: str | None = None
 
 
@@ -1234,7 +1249,9 @@ def safe_window_raw_signals(raw: Any, max_items: int = 48) -> dict[str, Any]:
                 next_path = path + (key,)
                 normalized_path = re.sub(r"[^a-z0-9_]+", "", ".".join(next_path).lower())
                 scalar = _window_diag_scalar(candidate)
-                if scalar is not None and any(token in normalized_path for token in WINDOW_DIAG_HINT_TOKENS):
+                is_named_window = any(token in normalized_path for token in WINDOW_DIAG_HINT_TOKENS)
+                is_known_window_signal = normalized_key in WINDOW_DIAG_SIGNAL_IDS
+                if scalar is not None and (is_named_window or is_known_window_signal):
                     result[".".join(part[:80] for part in next_path)[:240]] = scalar
                 if isinstance(candidate, (dict, list, tuple)):
                     walk(candidate, next_path, depth + 1)
@@ -2767,10 +2784,10 @@ def serialize_vehicle(
         "rear_right": first_numeric(attribute(windows, "right_rear_window_percent")),
     }
     window_state = {
-        "front_left": window_open(window_positions["front_left"]) if window_positions["front_left"] is not None else first_bool(attribute(windows, "driver_window_status")),
-        "front_right": window_open(window_positions["front_right"]) if window_positions["front_right"] is not None else first_bool(attribute(windows, "right_front_window_status")),
-        "rear_left": window_open(window_positions["rear_left"]) if window_positions["rear_left"] is not None else first_bool(attribute(windows, "left_rear_window_status")),
-        "rear_right": window_open(window_positions["rear_right"]) if window_positions["rear_right"] is not None else first_bool(attribute(windows, "right_rear_window_status")),
+        "front_left": effective_window_open(window_positions["front_left"], attribute(windows, "driver_window_status")),
+        "front_right": effective_window_open(window_positions["front_right"], attribute(windows, "right_front_window_status")),
+        "rear_left": effective_window_open(window_positions["rear_left"], attribute(windows, "left_rear_window_status")),
+        "rear_right": effective_window_open(window_positions["rear_right"], attribute(windows, "right_rear_window_status")),
     }
 
     raw_window_signals = safe_window_raw_signals(attribute(status, "raw"))
