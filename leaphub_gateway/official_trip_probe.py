@@ -16,7 +16,7 @@ from urllib.parse import quote
 
 from leapmotor_api.crypto import build_signed_headers
 
-PROBE_VERSION = "1.12.105"
+PROBE_VERSION = "1.12.106"
 WINDOW_PATH = "/carownerservice/oversea/drivingRecord/v1/mileage/energy/detail"
 MAX_WINDOW_MS = 7 * 24 * 60 * 60 * 1000
 MIN_MILLISECONDS = 1_000_000_000_000

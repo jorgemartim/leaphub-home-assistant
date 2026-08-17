@@ -280,3 +280,20 @@ provando que o `status.raw` chegou até o trecho das janelas.
 A 1.12.105 adiciona um probe RAW independente imediatamente após o diagnóstico
 das janelas. Ele registra uma amostra vazia uma vez e depois somente mudanças.
 Nenhum comando físico/retry foi alterado.
+
+## Gateway 1.12.106 — hotfix de telemetria contínua
+
+Foi confirmada regressão iniciada na 1.12.103: o diagnóstico tipado de
+clima/conforto foi chamado antes da criação local de `seat_state` e
+`climate_state`. As coletas chegavam ao carro e aos probes intermediários, mas
+`serialize_vehicle()` não concluía; por isso `collection_total` desapareceu e
+todos os carros ficaram atrasados no Site.
+
+A 1.12.106 move somente essa chamada para depois da criação dos dois estados.
+Nenhum comando físico/retry/janelas/cortina/OCPP foi alterado.
+
+Após publicar/instalar, validar primeiro:
+1. retorno de `collection_total`;
+2. atualização do cartão de Telemetria contínua;
+3. atualização do horário/estado dos veículos;
+4. somente depois retomar clima/conforto.

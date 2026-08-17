@@ -44,7 +44,7 @@ except ImportError:
         _privacy_spec.loader.exec_module(_privacy_module)
         sanitize_log = _privacy_module.sanitize_log
 
-CONNECTOR_VERSION = "1.12.105"
+CONNECTOR_VERSION = "1.12.106"
 MAX_INPUT_BYTES = 1024 * 1024
 logging.getLogger("leapmotor_api").setLevel(logging.WARNING)
 LOGGER = logging.getLogger("leaphub.connector")
@@ -2923,8 +2923,6 @@ def serialize_vehicle(
         "right_heating": first_bool(attribute(security, "right_mirror_heating"), mapping_pick(cloud_scalars, ("rightMirrorHeating",))),
         "folded": first_bool(mapping_pick(cloud_scalars, ("rearviewMirrorFolded", "mirrorFolded", "mirrorsFolded"))),
     })
-    raw_climate_comfort_signals = safe_climate_comfort_raw_signals(attribute(status, "raw"))
-    log_climate_comfort_diag(climate_state, seat_state, mirrors_state, raw_climate_comfort_signals)
     security_state = compact_mapping({
         "active": first_bool(attribute(security, "is_security_active"), attribute(security, "vehicle_security_active")),
         "raw_state": enum_or_value(attribute(security, "vehicle_security_active")),
@@ -2967,6 +2965,12 @@ def serialize_vehicle(
             mapping_pick(cloud_scalars, ("batteryPreheat", "batteryPreheating", "batteryHeating")),
         ),
     })
+    # 1.12.106 - hotfix: climate_state e seat_state precisam existir antes
+    # do diagnostico tipado. Isso restaura a conclusao de serialize_vehicle()
+    # e, consequentemente, collection_total + fila/entrega de telemetria.
+    raw_climate_comfort_signals = safe_climate_comfort_raw_signals(attribute(status, "raw"))
+    log_climate_comfort_diag(climate_state, seat_state, mirrors_state, raw_climate_comfort_signals)
+
     charge_plan = attribute(battery, "charge_plan")
     charge_state_details = compact_mapping({
         "remaining_minutes": first_numeric(attribute(battery, "charge_remain_time")),
