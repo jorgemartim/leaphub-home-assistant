@@ -1,9 +1,10 @@
-## 1.12.106
+## 1.12.107
 
 A distribuição continua pré-compilada no GHCR oficial e mantém publicação em duas fases.
 
-- corrige regressão de telemetria introduzida na 1.12.103;
-- `CLIMATE_COMFORT_DIAG` não usa mais `climate_state`/`seat_state` antes da criação dessas variáveis;
-- restaura a conclusão de `serialize_vehicle()`, `collection_total` e o caminho de fila/entrega ao Site;
-- preserva `CLIMATE_RAW_PROBE` da 1.12.105;
-- nenhum comando físico, retry/resend, janela, cortina ou OCPP foi alterado.
+- corrige somente o payload de `windshield_defrost` do cmd 170;
+- envia explicitamente HOT + MANUAL + 32 °C + fan 7 + `wshld=2`, conforme payload verificado do protocolo;
+- preserva `quick_heat`, AUTO, OFF, temperaturas, fan e demais comandos;
+- `SAFE_STATE_RETRY_COMMANDS` continua exclusivamente `climate_on`/`climate_off`;
+- o desembaçador não ganha retry/resend nem entra em ACK-first;
+- nenhuma alteração em janelas, cortina, capô ou OCPP.

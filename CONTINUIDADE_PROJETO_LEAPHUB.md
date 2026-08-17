@@ -297,3 +297,18 @@ Após publicar/instalar, validar primeiro:
 2. atualização do cartão de Telemetria contínua;
 3. atualização do horário/estado dos veículos;
 4. somente depois retomar clima/conforto.
+
+## Gateway 1.12.107 — payload verificado do desembaçador
+
+O C10 confirmou fisicamente MAX do para-brisa com `signal.1945=2`. A tentativa
+remota anterior aplicou HOT/32/fan7, mas não ativou `windshield_defrost` porque a
+biblioteca 0.3.2 usa `wshld=1` no preset interno. A referência de payloads
+verificados do protocolo usa `wshld=2` para WINDSHIELD DEFROST.
+
+A 1.12.107 altera somente esse despacho para enviar explicitamente `wshld=2`.
+Nenhum retry/resend novo é criado; `SAFE_STATE_RETRY_COMMANDS` continua somente
+com climate_on/climate_off. Quick Heat e demais comandos ficam intactos.
+
+Antes de mesclar/publicar: CI verde e revisão do diff. Depois de instalar, fazer
+uma única tentativa física com o veículo parado e confirmar `signal.1945=2` /
+`windshield_defrost=true`.

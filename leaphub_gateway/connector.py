@@ -44,7 +44,7 @@ except ImportError:
         _privacy_spec.loader.exec_module(_privacy_module)
         sanitize_log = _privacy_module.sanitize_log
 
-CONNECTOR_VERSION = "1.12.106"
+CONNECTOR_VERSION = "1.12.107"
 MAX_INPUT_BYTES = 1024 * 1024
 logging.getLogger("leapmotor_api").setLevel(logging.WARNING)
 LOGGER = logging.getLogger("leaphub.connector")
@@ -3813,6 +3813,25 @@ def climate_auto_parameters(parameters: dict[str, Any]) -> dict[str, str]:
     }
 
 
+def windshield_defrost_parameters() -> dict[str, str]:
+    """Payload de desembaçamento dianteiro verificado para cmd_id 170.
+
+    leapmotor-api 0.3.2 usa wshld=1 no preset interno. A referência de payloads
+    verificados do protocolo Leapmotor usa wshld=2 para WINDSHIELD DEFROST,
+    enquanto QUICK HEAT permanece em wshld=1. Em campo, o C10 do proprietário
+    também publicou signal.1945=2 quando o MAX do para-brisa estava ativo.
+    """
+    return {
+        "circle": "in",
+        "mode": "hot",
+        "operate": "manual",
+        "position": "all",
+        "temperature": "32",
+        "windlevel": "7",
+        "wshld": "2",
+    }
+
+
 def execute_vehicle_command(
     method: Any,
     command: str,
@@ -3828,6 +3847,15 @@ def execute_vehicle_command(
         return method(vehicle_id, params=climate_auto_parameters(parameters))
     if command == "climate_off":
         return method(vehicle_id, params={"operate": "off"})
+    if command == "windshield_defrost":
+        # 1.12.107 — a biblioteca 0.3.2 monta este preset com wshld=1, que no
+        # C10 aplicou HOT/32/fan7 sem ativar o estado do para-brisa. O payload
+        # verificado do protocolo usa wshld=2. Uma chamada, nenhum retry novo.
+        connector_log(
+            logging.INFO,
+            "CLIMATE_DIAG event=windshield_defrost_dispatch wshld=2 tentativas_fisicas=1",
+        )
+        return method(vehicle_id, params=windshield_defrost_parameters())
     if command == "set_charge_limit":
         value = int(parameters.get("charge_limit_percent", 80))
         if value < 50 or value > 100 or value % 5 != 0:
