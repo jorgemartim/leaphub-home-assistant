@@ -312,3 +312,22 @@ com climate_on/climate_off. Quick Heat e demais comandos ficam intactos.
 Antes de mesclar/publicar: CI verde e revisão do diff. Depois de instalar, fazer
 uma única tentativa física com o veículo parado e confirmar `signal.1945=2` /
 `windshield_defrost=true`.
+
+## Gateway 1.12.108 — corrida da agenda FAST pós-comando
+
+Auditoria do caminho Site → worker de comando → trava da conta → arme assíncrono
+→ SQLite → scheduler → telemetria → fila de eventos → Site encontrou dois
+atrasos que podiam esconder a cadência 5/5/8: um poll antigo podia sobrescrever
+o agendamento novo após liberar a conta, e um `recovering/error` anterior podia
+ser herdado mesmo depois de um comando manual aceito.
+
+A correção é somente de coordenação local. A finalização passa a reler, na mesma
+transação, a agenda/proteções vivas e preserva uma confirmação que nasceu depois
+do snapshot. Um comando aceito pode cortar `recovering/error`, mas nunca
+`cooldown` ou `auth_required`. Se um cooldown/auth surgir enquanto um poll antigo
+termina, ele prevalece.
+
+Congelado: payloads, retries físicos, 5/5/8, backoff 8/15/25/40/60/90, janelas,
+cortina, capô, OCPP, HMAC e contrato do Site. Antes de merge: revisar diff e CI
+verde. Depois de publicar/instalar, homologar apenas o tempo de confirmação com o
+veículo estacionado; nenhum reenvio físico adicional faz parte desta release.

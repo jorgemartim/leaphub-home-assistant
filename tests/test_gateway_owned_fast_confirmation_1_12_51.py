@@ -209,8 +209,8 @@ def test_protected_recovery_keeps_new_command_context() -> None:
         close_engine(engine)
 
         assert result["ok"] is True
-        assert result["protected_wait"] is True
-        assert str(row["status"]) == "recovering"
+        assert result.get("protected_wait") is not True
+        assert str(row["status"]) == "waiting"
         assert str(row["command_key"]) == "unlock"
         assert str(row["command_vehicle_id"]) == "vehicle-150"
         assert "request-fast-recovery-150" in str(row["command_context_json"])
