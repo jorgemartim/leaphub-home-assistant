@@ -378,3 +378,22 @@ A 1.12.111 nao reabre comandos fisicos. Ela coordena os writers internos em um l
 
 Congelado: janelas, cortina, defrost, clima, SAFE retry, auth/cooldown, OCPP,
 matriz 40+12, cadencia 5/5/8 e backoff 8/15/25/40/60/90.
+
+## Gateway 1.12.112 — maintenance incremental de baixa latencia
+
+Base publicada: `bb8005653322e69f779eeb785435c6f51b9671c1` (Gateway 1.12.111).
+
+Novo log de campo confirmou que a 1.12.111 removeu `database is locked`, mas nao
+o custo do scan: maintenance repetiu 19-35 s e coincidiu com ACK HTTP lento,
+timeout de entrega e OCPP. Quando a maintenance estava fora do caminho,
+windows_close/open foram aceitos em ~2 ms, despachados em ~0,62 s e confirmados
+em 0-6 s.
+
+A 1.12.112 substitui a descoberta global por fatias de 200 rowids, torna o COUNT
+raro/abortavel e faz maintenance ceder rapidamente ao writer. Nenhum comando
+fisico, rota de ACK, auth, OCPP, matcher ou cadencia e alterado.
+
+Na R3, o contrato concorrente herdado da 1.12.111 também teve o fixture corrigido:
+eventos terminais artificiais passam a usar `sequence=0` (legado/não ordenado),
+em vez de pré-ocupar 1..20 sem alimentar `vehicle_state_cache`. O assert que
+proíbe duplicidade entre eventos reais permanece inalterado.

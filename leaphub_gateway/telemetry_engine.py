@@ -55,7 +55,7 @@ except ModuleNotFoundError:
         EVENT_TRANSPORT = _event_transport_module.EVENT_TRANSPORT
 
 LOG = logging.getLogger("leaphub.telemetry")
-ENGINE_VERSION = "1.12.111"  # windows C10 mapping + final confirmation push; retry/cadence preserved
+ENGINE_VERSION = "1.12.112"  # windows C10 mapping + final confirmation push; retry/cadence preserved
 
 # Hospedagem compartilhada (Apache/LiteSpeed) fecha a conexão ociosa em poucos
 # segundos. Reaproveitar depois disso escreve num socket já fechado e devolve
@@ -94,6 +94,15 @@ MAINTENANCE_INTERVAL_SECONDS = 60.0
 MAINTENANCE_BUSY_TIMEOUT_SECONDS = 0.15
 MAINTENANCE_BATCH_SIZE = 200
 MAINTENANCE_WORKER_POLL_SECONDS = 30.0
+
+# 1.12.112 — o LIMIT da 1.12.111 limitava linhas DEVOLVIDAS, nao linhas
+# examinadas. Em campo a discovery ainda consumiu 19-35s e atrasou ACK HTTP,
+# entrega e OCPP. A poda agora trabalha em fatias por rowid, sem scan/sort
+# global. O COUNT de capacidade e raro e recebe progress handler proprio.
+MAINTENANCE_SLICE_BUDGET_SECONDS = 0.25
+MAINTENANCE_WRITER_WAIT_SECONDS = 0.02
+MAINTENANCE_QUEUE_COUNT_INTERVAL_SECONDS = 900.0
+MAINTENANCE_COUNT_BUDGET_SECONDS = 0.04
 
 # 1.12.78 — o anúncio do fim do comando é melhor esforço, e o teto é curto de
 # propósito. Ele existe para o site não esperar a próxima volta do cron; se
@@ -497,6 +506,10 @@ class TelemetryEngine:
         self._connections_guard = threading.RLock()
         self._storage_checked_at = 0.0
         self._maintenance_last_at = 0.0
+        # 1.12.112 — cursor incremental: nunca redescobre a fila inteira a cada minuto.
+        self._maintenance_event_cursor = 0
+        self._maintenance_queue_count_last_at = 0.0
+        self._maintenance_queue_overflow = 0
         # 1.12.50 — a coleta de uma conta não atrasa mais a das outras. O teto
         # real de chamadas simultâneas à nuvem continua sendo o semáforo global
         # do Connector; isto apenas deixa de serializar tudo antes dele.
@@ -6469,9 +6482,8 @@ class TelemetryEngine:
 
 
     def _maintenance(self) -> str:
-        """Limpeza local limitada, interrompivel e subordinada a comandos."""
+        """Poda incremental com custo proporcional a uma fatia, nunca a fila inteira."""
         now_epoch = time.time()
-        # Sessao ociosa e memoria; nao precisa esperar a janela da poda em disco.
         self._expire_idle_sessions(now_epoch)
         if now_epoch - self._maintenance_last_at < MAINTENANCE_INTERVAL_SECONDS:
             return "throttled"
@@ -6479,11 +6491,20 @@ class TelemetryEngine:
         cutoff = now_epoch - self.retention_days * 86400
         cutoff_iso = datetime.fromtimestamp(cutoff, timezone.utc).isoformat().replace("+00:00", "Z")
         batch = int(MAINTENANCE_BATCH_SIZE)
+        started = time.monotonic()
+        slice_deadline = started + float(MAINTENANCE_SLICE_BUDGET_SECONDS)
 
-        # Toda descoberta e SELECT pode levar o tempo que o volume precisar sem
-        # possuir writer lock. WAL mantem os comandos/escritas livres. So as
-        # mutacoes finais recebem listas pequenas de PKs.
+        def over_budget() -> bool:
+            return time.monotonic() >= slice_deadline
+
+        def progress_handler() -> int:
+            return 1 if over_budget() else 0
+
+        def is_interrupted(exc: sqlite3.OperationalError) -> bool:
+            return "interrupt" in str(exc).lower()
+
         with self._db(timeout_seconds=MAINTENANCE_BUSY_TIMEOUT_SECONDS) as db:
+            # Comando e confirmacao sempre vencem antes de qualquer discovery de fila.
             command_active = db.execute(
                 "SELECT 1 FROM subscriptions WHERE enabled=1 AND command_until>? LIMIT 1",
                 (now_epoch,),
@@ -6495,65 +6516,156 @@ class TelemetryEngine:
             if command_active is not None or confirmation_active is not None:
                 return "command_priority"
 
+            # Assinaturas sao poucas; ainda assim a lista fica limitada.
             expired_windows = [str(row[0]) for row in db.execute(
                 "SELECT subscription_id FROM subscriptions WHERE enabled=1 AND active_until<=? "
                 "AND status NOT IN ('idle','background','disabled','auth_required','cooldown') LIMIT ?",
                 (now_epoch, batch),
             ).fetchall()]
-            if expired_windows:
-                placeholders = ",".join("?" for _ in expired_windows)
-                expired_status = "background" if self.background_enabled else "idle"
-                db.execute(
-                    f"UPDATE subscriptions SET status=?,interactive_until=0,command_until=0,last_error=NULL,updated_at=? "
-                    f"WHERE subscription_id IN ({placeholders})",
-                    (expired_status, utc_iso(), *expired_windows),
+
+            # O ponto central da 1.12.112: rowid e a B-tree primaria implicita.
+            # LIMIT 200 agora significa no maximo uma fatia curta examinada, sem
+            # ORDER BY created_at, COALESCE ou sort temporario sobre a fila inteira.
+            rows: list[sqlite3.Row] = []
+            try:
+                db.set_progress_handler(progress_handler, 400)
+                rows = list(db.execute(
+                    "SELECT rowid AS maintenance_rowid,event_id,status,created_at,delivered_at "
+                    "FROM events WHERE rowid>? ORDER BY rowid ASC LIMIT ?",
+                    (int(self._maintenance_event_cursor or 0), batch),
+                ).fetchall())
+                if not rows and int(self._maintenance_event_cursor or 0) > 0 and not over_budget():
+                    self._maintenance_event_cursor = 0
+                    rows = list(db.execute(
+                        "SELECT rowid AS maintenance_rowid,event_id,status,created_at,delivered_at "
+                        "FROM events WHERE rowid>? ORDER BY rowid ASC LIMIT ?",
+                        (0, batch),
+                    ).fetchall())
+            except sqlite3.OperationalError as exc:
+                if not is_interrupted(exc):
+                    raise
+                self._maintenance_last_at = time.time()
+                return "budget"
+            finally:
+                db.set_progress_handler(None, 0)
+
+            if rows:
+                self._maintenance_event_cursor = max(int(row["maintenance_rowid"] or 0) for row in rows)
+            else:
+                self._maintenance_event_cursor = 0
+
+            stale_pending: list[str] = []
+            terminal_old: list[str] = []
+            terminal_slice: list[str] = []
+            for row in rows:
+                event_id = str(row["event_id"] or "")
+                status = str(row["status"] or "")
+                created_at = str(row["created_at"] or "")
+                delivered_at = str(row["delivered_at"] or "")
+                if not event_id:
+                    continue
+                if status == "pending" and created_at and created_at < cutoff_iso:
+                    stale_pending.append(event_id)
+                    continue
+                if status == "failed":
+                    terminal_slice.append(event_id)
+                    if created_at and created_at < cutoff_iso:
+                        terminal_old.append(event_id)
+                    continue
+                if status == "delivered":
+                    terminal_slice.append(event_id)
+                    terminal_at = delivered_at or created_at
+                    if terminal_at and terminal_at < cutoff_iso:
+                        terminal_old.append(event_id)
+
+            # Capacidade deixa de executar COUNT(*) a cada minuto. Uma amostra de
+            # capacidade ocorre no maximo a cada 15 min e e abortada pelo proprio
+            # SQLite se consumir mais de ~40 ms de VM time nesta passada.
+            if (
+                now_epoch - float(self._maintenance_queue_count_last_at or 0)
+                >= MAINTENANCE_QUEUE_COUNT_INTERVAL_SECONDS
+                and not over_budget()
+            ):
+                count_deadline = min(
+                    slice_deadline,
+                    time.monotonic() + float(MAINTENANCE_COUNT_BUDGET_SECONDS),
                 )
 
-            stale_pending = [str(row[0]) for row in db.execute(
-                "SELECT event_id FROM events WHERE status='pending' AND created_at<? ORDER BY created_at ASC LIMIT ?",
-                (cutoff_iso, batch),
-            ).fetchall()]
-            if stale_pending:
-                placeholders = ",".join("?" for _ in stale_pending)
-                db.execute(
-                    f"UPDATE events SET status='failed',last_error=? WHERE event_id IN ({placeholders})",
-                    ("A fila desistiu: nao entregue dentro da janela de retencao.", *stale_pending),
-                )
-                LOG.warning(
-                    "Fila de telemetria desistiu de %s evento(s) nao entregue(s) ha mais de %s dia(s).",
-                    len(stale_pending),
-                    self.retention_days,
-                )
+                def count_progress() -> int:
+                    return 1 if time.monotonic() >= count_deadline else 0
 
-            old_delivered = [str(row[0]) for row in db.execute(
-                "SELECT event_id FROM events WHERE status='delivered' "
-                "AND COALESCE(delivered_at,created_at)<? ORDER BY created_at ASC LIMIT ?",
-                (cutoff_iso, batch),
-            ).fetchall()]
-            if old_delivered:
-                placeholders = ",".join("?" for _ in old_delivered)
-                db.execute(f"DELETE FROM events WHERE event_id IN ({placeholders})", old_delivered)
+                try:
+                    db.set_progress_handler(count_progress, 400)
+                    total = int(db.execute("SELECT COUNT(*) FROM events").fetchone()[0])
+                except sqlite3.OperationalError as exc:
+                    if not is_interrupted(exc):
+                        raise
+                    total = -1
+                finally:
+                    db.set_progress_handler(None, 0)
+                    self._maintenance_queue_count_last_at = now_epoch
+                if total >= 0:
+                    self._maintenance_queue_overflow = max(0, total - int(self.queue_max))
 
-            old_failed = [str(row[0]) for row in db.execute(
-                "SELECT event_id FROM events WHERE status='failed' AND created_at<? ORDER BY created_at ASC LIMIT ?",
-                (cutoff_iso, batch),
-            ).fetchall()]
-            if old_failed:
-                placeholders = ",".join("?" for _ in old_failed)
-                db.execute(f"DELETE FROM events WHERE event_id IN ({placeholders})", old_failed)
+            # Se nao ha mutacao, a passada termina sem sequer disputar writer.
+            overflow_delete: list[str] = []
+            if self._maintenance_queue_overflow > 0 and terminal_slice:
+                old_set = set(terminal_old)
+                overflow_delete = [event_id for event_id in terminal_slice if event_id not in old_set][
+                    : min(batch, int(self._maintenance_queue_overflow))
+                ]
+            needs_writer = bool(expired_windows or stale_pending or terminal_old or overflow_delete)
+            if not needs_writer:
+                self._maintenance_last_at = time.time()
+                return "cleaned"
 
-            total = int(db.execute("SELECT COUNT(*) FROM events").fetchone()[0])
-            if total > self.queue_max:
-                trim_limit = min(batch, total - self.queue_max)
-                terminal = [str(row[0]) for row in db.execute(
-                    "SELECT event_id FROM events WHERE status IN ('delivered','failed') "
-                    "ORDER BY created_at ASC LIMIT ?",
-                    (trim_limit,),
-                ).fetchall()]
-                if terminal:
-                    placeholders = ",".join("?" for _ in terminal)
-                    db.execute(f"DELETE FROM events WHERE event_id IN ({placeholders})", terminal)
+            # Writer interno ocupado? Cede em ~20 ms. Nao transforma manutencao
+            # em fila na frente de boost, confirmacao, auth ou entrega.
+            if not self.sqlite_writer_lock.acquire(timeout=MAINTENANCE_WRITER_WAIT_SECONDS):
+                return "writer_busy"
+            try:
+                # Revalida prioridade DEPOIS de conquistar o writer: um comando
+                # pode ter sido armado entre a discovery e este ponto.
+                command_active = db.execute(
+                    "SELECT 1 FROM subscriptions WHERE enabled=1 AND command_until>? LIMIT 1",
+                    (time.time(),),
+                ).fetchone()
+                confirmation_active = db.execute(
+                    "SELECT 1 FROM command_confirmations WHERE status='pending' AND expires_at>? LIMIT 1",
+                    (time.time(),),
+                ).fetchone()
+                if command_active is not None or confirmation_active is not None:
+                    return "command_priority"
 
-        # So uma passada realmente concluida abre o throttle historico de 60 segundos.
+                if expired_windows:
+                    placeholders = ",".join("?" for _ in expired_windows)
+                    expired_status = "background" if self.background_enabled else "idle"
+                    db.execute(
+                        f"UPDATE subscriptions SET status=?,interactive_until=0,command_until=0,last_error=NULL,updated_at=? "
+                        f"WHERE subscription_id IN ({placeholders})",
+                        (expired_status, utc_iso(), *expired_windows),
+                    )
+                if stale_pending:
+                    placeholders = ",".join("?" for _ in stale_pending)
+                    db.execute(
+                        f"UPDATE events SET status='failed',last_error=? WHERE event_id IN ({placeholders})",
+                        ("A fila desistiu: nao entregue dentro da janela de retencao.", *stale_pending),
+                    )
+                    LOG.warning(
+                        "Fila de telemetria desistiu de %s evento(s) antigo(s) nesta fatia.",
+                        len(stale_pending),
+                    )
+                if terminal_old:
+                    placeholders = ",".join("?" for _ in terminal_old)
+                    db.execute(f"DELETE FROM events WHERE event_id IN ({placeholders})", terminal_old)
+                if overflow_delete:
+                    placeholders = ",".join("?" for _ in overflow_delete)
+                    db.execute(f"DELETE FROM events WHERE event_id IN ({placeholders})", overflow_delete)
+                    self._maintenance_queue_overflow = max(
+                        0, int(self._maintenance_queue_overflow) - len(overflow_delete)
+                    )
+            finally:
+                self.sqlite_writer_lock.release()
+
         self._maintenance_last_at = time.time()
         return "cleaned"
