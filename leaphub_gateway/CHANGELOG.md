@@ -1,11 +1,12 @@
-## 1.12.109
+## 1.12.110
 
 A distribuição continua pré-compilada no GHCR oficial e mantém publicação em duas fases.
 
-- adiciona OFF do desembaçador no MESMO comando público `windshield_defrost`, usando `enabled=false` e alterando somente `wshld` de `2` para `0`; a matriz permanece 40 estáveis + 12 experimentais;
-- adiciona confirmação FAST do `prepare_car` por climatização ligada, modo, temperatura e ventilação na mesma amostra nova;
-- remove uma passagem redundante de supersessão/lock quando a confirmação já está pendente;
-- adiciona `CONFIRM_ARM_DIAG` para localizar contenções residuais sem mudar cadência, timeout ou quantidade de leituras;
-- mantém `SAFE_STATE_RETRY_COMMANDS` somente em `climate_on`/`climate_off`;
-- mantém `wshld=2` do ON, janelas, cortina, capô e OCPP congelados;
-- mantém `config.yaml` em 1.12.108 até publicação normal via CI/GHCR.
+- corrige regressão de latência comprovada em campo: `CONFIRM_ARM_DIAG stage=boost` chegou a 17.887 ms apesar de o despacho remoto terminar em ~0,6 s;
+- separa agenda/confirmacao (`schedule_lock`) da trava global usada por fila, entrega, autenticação e outros bookkeepings;
+- tira retenção/manutenção do laço do scheduler e executa-a em worker local dedicado;
+- remove a trava global de leituras read-only do scheduler e do caminho FAST de confirmação;
+- mantém a transação `BEGIN IMMEDIATE` da fila, mas sem segurar `self.lock` enquanto SQLite aguarda;
+- adiciona `CONFIRM_SCHED_DIAG` e `TELEMETRY_MAINTENANCE_DIAG` para detectar nova regressão;
+- não altera payload físico, janelas 0-100 -> 0-10, matcher de janelas, defrost ON/OFF, retry, cooldown/auth, OCPP nem cadência 5/5/8;
+- mantém `config.yaml` em 1.12.109 até publicação normal via CI/GHCR.

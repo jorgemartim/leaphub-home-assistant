@@ -348,3 +348,21 @@ modo, setpoint e fan compatíveis na mesma amostra.
 
 Congelado: retries físicos, ON wshld=2, janelas, cortina, capô, OCPP,
 cooldown/auth e config.yaml publicado.
+
+## Gateway 1.12.110 — isolamento do scheduler de confirmacao
+
+O log de campo de 17/08/2026 provou que o gargalo nao estava no payload da
+janela: `windows_open` saiu em ~0,6 s e com valor nativo 10. O defeito estava
+no caminho local de confirmacao. `climate_on` registrou
+`CONFIRM_ARM_DIAG stage=boost ms=17887`, depois de o comando ja ter terminado.
+
+A causa arquitetural foi isolada: scheduler, boost, fila e manutencao ainda
+compartilhavam `self.lock`; a fila usa `BEGIN IMMEDIATE`, entao espera local de
+SQLite podia virar bloqueio global. A 1.12.110 separa agenda/confirmacao em
+`schedule_lock`, deixa leituras read-only fora do lock global e move manutencao
+para worker dedicado.
+
+Nao houve mudanca de comando fisico. Janelas, cortina, defrost, retry, auth,
+OCPP e cadencias permanecem congelados. A proxima validacao de campo deve ser
+com veiculo parado e uma unica intencao por vez, medindo despacho, arme,
+primeira leitura e veredito antes de qualquer novo ajuste.
