@@ -420,3 +420,22 @@ R5: os contratos historicos 1.12.93/94/95 que ainda congelavam literalmente o
 ACK-first antigo foram alinhados ao fence mecanico. Os demais asserts continuam
 intactos, e o patcher varre todos os `tests/test_*.py` para impedir outro
 contrato antigo escondido.
+
+
+## Gateway 1.12.114 — Trip Telemetry Quality
+
+Base: `66e7a0ffb3ec0bf78bb2fca4dd4cd0f81867c53f` (1.12.113 publicada).
+
+A 1.12.114 melhora exclusivamente a qualidade de Trips: sinais paralelos 1319/1318,
+timestamp proprio do veiculo, memoria persistente de hemisferio e burst de 8s quando
+ha conducao. O burst recua quando a nuvem repete o mesmo quadro e volta a 8s assim
+que recebe uma amostra nova.
+
+Nao foi alterado nenhum payload fisico, SAFE retry, fence mecanico de janelas/cortina,
+escala C10 0-10, defrost 2/0, Prepare, OCPP, auth/cooldown, maintenance 1.12.112,
+SQLite writer nem a cadencia de confirmacao 5/5/8.
+
+Proximo passo depois da suite: revisar o branch candidato, conferir CI e somente
+entao mesclar/publicar. Depois da publicacao, validar uma viagem real comparando:
+pontos unicos, intervalo entre timestamps do veiculo, velocidade maxima 1319,
+hodometro 1318 e geometria da rota.

@@ -44,7 +44,7 @@ except ImportError:
         _privacy_spec.loader.exec_module(_privacy_module)
         sanitize_log = _privacy_module.sanitize_log
 
-CONNECTOR_VERSION = "1.12.113"
+CONNECTOR_VERSION = "1.12.114"
 MAX_INPUT_BYTES = 1024 * 1024
 logging.getLogger("leapmotor_api").setLevel(logging.WARNING)
 LOGGER = logging.getLogger("leaphub.connector")
@@ -2860,6 +2860,32 @@ def serialize_vehicle(
         for key, value in source_map.items():
             cloud_scalars.setdefault(key, value)
 
+    # 1.12.114 — diagnostico aditivo para Trips. Nenhum valor legado e
+    # substituido: speed_kmh/odometer_km continuam exatamente nas fontes
+    # anteriores. Estes campos expoem os sinais brutos comprovados 1319/1318 e
+    # apenas o SINAL do quadro GPS assinado (2/3), sem duplicar coordenadas
+    # precisas no diagnostico.
+    raw_vehicle_speed_kmh = map_numeric(cloud_scalars, "1319")
+    raw_odometer_km = map_numeric(cloud_scalars, "1318")
+    raw_signed_latitude = map_numeric(cloud_scalars, "3")
+    raw_signed_longitude = map_numeric(cloud_scalars, "2")
+    gps_signed_latitude_sign = (
+        -1 if raw_signed_latitude is not None and raw_signed_latitude < 0
+        else 1 if raw_signed_latitude is not None and raw_signed_latitude > 0
+        else None
+    )
+    gps_signed_longitude_sign = (
+        -1 if raw_signed_longitude is not None and raw_signed_longitude < 0
+        else 1 if raw_signed_longitude is not None and raw_signed_longitude > 0
+        else None
+    )
+    vehicle_timestamp = optional_timestamp(
+        mapping_pick(
+            cloud_scalars,
+            ("sts", "collectTimeMs", "collectTime", "lastVehicleTimestamp"),
+        )
+    )
+
     door_state = {
         "front_left": door_open(attribute(doors, "lbcm_driver_door_status")),
         "front_right": door_open(attribute(doors, "rbcm_driver_door_status")),
@@ -3148,6 +3174,12 @@ def serialize_vehicle(
         "estimated_range_km": numeric(attribute(battery, "expected_mileage")) or numeric(attribute(driving, "live_remaining_range")),
         "odometer_km": numeric(attribute(driving, "total_mileage")),
         "speed_kmh": speed_value,
+        # 1.12.114 — campos paralelos; nao alteram os valores historicos acima.
+        "raw_vehicle_speed_kmh": raw_vehicle_speed_kmh,
+        "raw_odometer_km": raw_odometer_km,
+        "vehicle_timestamp": vehicle_timestamp,
+        "gps_signed_latitude_sign": gps_signed_latitude_sign,
+        "gps_signed_longitude_sign": gps_signed_longitude_sign,
         "is_parked": parked_value,
         "vehicle_state": vehicle_state,
         "gear_position": value_of(attribute(driving, "gear_position")) or value_of(attribute(driving, "gear")) or value_of(attribute(status, "gear_position")),

@@ -55,7 +55,7 @@ except ModuleNotFoundError:
         EVENT_TRANSPORT = _event_transport_module.EVENT_TRANSPORT
 
 LOG = logging.getLogger("leaphub.telemetry")
-ENGINE_VERSION = "1.12.113"  # windows C10 mapping + final confirmation push; retry/cadence preserved
+ENGINE_VERSION = "1.12.114"  # trip telemetry quality; command/physical contracts preserved
 
 # Hospedagem compartilhada (Apache/LiteSpeed) fecha a conexão ociosa em poucos
 # segundos. Reaproveitar depois disso escreve num socket já fechado e devolve
@@ -103,6 +103,19 @@ MAINTENANCE_SLICE_BUDGET_SECONDS = 0.25
 MAINTENANCE_WRITER_WAIT_SECONDS = 0.02
 MAINTENANCE_QUEUE_COUNT_INTERVAL_SECONDS = 900.0
 MAINTENANCE_COUNT_BUDGET_SECONDS = 0.04
+
+# 1.12.114 — Trips recebe uma cadencia propria SOMENTE enquanto ha evidencia de
+# conducao. Confirmacao de comando continua em 5/5/8, tela interativa continua
+# com seu teto de 6s e o polling legado de fundo permanece intacto fora de
+# viagens. Snapshots repetidos recuam progressivamente ate o teto anterior para
+# nao multiplicar chamadas quando a nuvem apenas repete o mesmo quadro.
+TRIP_DRIVING_SECONDS_DEFAULT = 8
+TRIP_DRIVING_SECONDS_MIN = 6
+TRIP_DRIVING_SECONDS_MAX = 15
+TRIP_DUPLICATE_BACKOFF_CAP_SECONDS = 20
+TRIP_SIGN_FLIP_CONFIRMATIONS = 10
+TRIP_MERIDIAN_CROSSING_DEGREES = 1.0
+TRIP_GPS_FRESH_SECONDS = 120.0
 
 # 1.12.78 — o anúncio do fim do comando é melhor esforço, e o teto é curto de
 # propósito. Ele existe para o site não esperar a próxima volta do cron; se
@@ -510,6 +523,10 @@ class TelemetryEngine:
         self._maintenance_event_cursor = 0
         self._maintenance_queue_count_last_at = 0.0
         self._maintenance_queue_overflow = 0
+        # 1.12.114 — memoria pequena e local. Hemisferios tambem sao persistidos
+        # no SQLite; fingerprints de quadro so precisam sobreviver ao processo.
+        self._trip_location_memory: dict[tuple[str, str], dict[str, int | None]] = {}
+        self._trip_sample_registry: dict[str, tuple[str, int]] = {}
         # 1.12.50 — a coleta de uma conta não atrasa mais a das outras. O teto
         # real de chamadas simultâneas à nuvem continua sendo o semáforo global
         # do Connector; isto apenas deixa de serializar tudo antes dele.
@@ -551,6 +568,12 @@ class TelemetryEngine:
         self._delivery_connection_idle_since = 0.0
         self._delivery_idle_max = DELIVERY_IDLE_DEFAULT_SECONDS
         self.active_seconds = self._bounded("telemetry_active_seconds", 20, 15, 300)
+        self.trip_driving_seconds = self._bounded(
+            "telemetry_trip_driving_seconds",
+            TRIP_DRIVING_SECONDS_DEFAULT,
+            TRIP_DRIVING_SECONDS_MIN,
+            TRIP_DRIVING_SECONDS_MAX,
+        )
         # 1.12.77 — o valor gravado na instalação é puxado para BAIXO pelo teto
         # em código; sem o `min`, a instalação de campo seguiria em 20s. O piso
         # de 5s não é estética: o round-trip HTTPS medido em 12/08/2026 ficou
@@ -1199,6 +1222,16 @@ class TelemetryEngine:
                         FOREIGN KEY(subscription_id) REFERENCES subscriptions(subscription_id) ON DELETE CASCADE
                     );
                     CREATE INDEX IF NOT EXISTS idx_vehicle_state_updated ON vehicle_state_cache(updated_at);
+                    CREATE TABLE IF NOT EXISTS vehicle_location_signs (
+                        subscription_id TEXT NOT NULL,
+                        remote_id TEXT NOT NULL,
+                        latitude_sign INTEGER NULL,
+                        longitude_sign INTEGER NULL,
+                        latitude_flip_count INTEGER NOT NULL DEFAULT 0,
+                        longitude_flip_count INTEGER NOT NULL DEFAULT 0,
+                        updated_at TEXT NOT NULL,
+                        PRIMARY KEY(subscription_id, remote_id)
+                    );
                     CREATE INDEX IF NOT EXISTS idx_events_vehicle_order ON events(subscription_id, remote_id, status, sequence);
                     """
                 )
@@ -3716,6 +3749,14 @@ class TelemetryEngine:
             "recent_confirmations": recent_confirmations,
             "profiles": {
                 "driving_seconds": self.active_seconds,
+                "trip_driving_seconds": self.trip_driving_seconds,
+                "trip_duplicate_backoff_cap_seconds": min(
+                    self.active_seconds, TRIP_DUPLICATE_BACKOFF_CAP_SECONDS
+                ),
+                "trip_vehicle_timestamp": True,
+                "trip_raw_speed_signal": "1319",
+                "trip_raw_odometer_signal": "1318",
+                "trip_gps_hemisphere_memory": True,
                 "interactive_seconds": self.interactive_seconds,
                 "command_seconds": self.command_seconds,
                 "command_cadence_seconds": list(self.command_cadence),
@@ -4374,6 +4415,11 @@ class TelemetryEngine:
             self._reschedule(sid, empty_delay, "error", "Nenhum veículo autorizado foi retornado.", failed=True)
             return
 
+        # 1.12.114 — corrige somente hemisferio/qualidade do quadro que JA foi
+        # recebido. Nenhuma chamada extra e feita aqui e nenhum comando fisico
+        # passa por esta rotina.
+        self._normalize_trip_vehicles(sid, vehicles)
+
         states: list[str] = []
         activity_parts: list[str] = []
         queued_events = 0
@@ -4478,6 +4524,22 @@ class TelemetryEngine:
                 ),
                 interactive=interactive,
             )
+
+        # 1.12.114 — burst exclusivo de viagem. Nao toca em comando (5/5/8) e
+        # nao deixa a tela interativa, que ja e mais rapida, ficar mais lenta.
+        # A evidencia "driving" observada vence a histerese de transicao apenas
+        # para a AGENDA da proxima leitura; o estado persistido continua seguindo
+        # _confirm_state_transition como antes.
+        if (
+            not effective_command_mode
+            and not interactive
+            and ("driving" in states or aggregate_state == "driving")
+        ):
+            trip_interval, _trip_duplicate_count = self._trip_poll_interval_for_vehicles(
+                sid, vehicles
+            )
+            interval = min(int(interval), int(trip_interval))
+
         previous_sleep_streak = int(subscription["sleep_streak"] or 0)
         sleep_streak = previous_sleep_streak + 1 if aggregate_state == "sleep" else 0
         if aggregate_state == "sleep" and not effective_command_mode:
@@ -5341,6 +5403,284 @@ class TelemetryEngine:
     def _failure_backoff(failures: int) -> int:
         schedule = (300, 900, 1800, 3600, 10800, 21600)
         return schedule[min(max(1, int(failures)), len(schedule)) - 1]
+
+    @staticmethod
+    def _trip_number(value: Any) -> float | None:
+        if value is None or isinstance(value, bool):
+            return None
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+        if number != number or abs(number) > 1_000_000_000:
+            return None
+        return number
+
+    @classmethod
+    def _trip_resolve_axis(
+        cls,
+        value: Any,
+        observed_sign: Any,
+        remembered_sign: int | None,
+        pending_flip_count: int,
+    ) -> tuple[float | None, int | None, int, str]:
+        # Resolve one GPS axis without trusting an isolated lost-minus frame.
+        current = cls._trip_number(value)
+        if current is None:
+            return None, remembered_sign, 0, "unavailable"
+
+        magnitude = abs(current)
+        proposed_sign: int | None = None
+        try:
+            sign_number = int(observed_sign) if observed_sign is not None else 0
+        except (TypeError, ValueError):
+            sign_number = 0
+        if sign_number in (-1, 1):
+            proposed_sign = sign_number
+
+        if proposed_sign is not None:
+            authoritative = (
+                remembered_sign is None
+                or remembered_sign == proposed_sign
+                or proposed_sign < 0
+                or magnitude <= TRIP_MERIDIAN_CROSSING_DEGREES
+            )
+            if authoritative:
+                return magnitude * proposed_sign, proposed_sign, 0, "signed_signal"
+
+            confirmations = max(0, int(pending_flip_count or 0)) + 1
+            if confirmations >= TRIP_SIGN_FLIP_CONFIRMATIONS:
+                return (
+                    magnitude * proposed_sign,
+                    proposed_sign,
+                    0,
+                    "confirmed_hemisphere_crossing",
+                )
+            return (
+                magnitude * int(remembered_sign),
+                int(remembered_sign),
+                confirmations,
+                "remembered_sign_guard",
+            )
+
+        if remembered_sign in (-1, 1):
+            return (
+                magnitude * int(remembered_sign),
+                int(remembered_sign),
+                0,
+                "remembered_sign_memory",
+            )
+
+        if current < 0:
+            return current, -1, 0, "negative_coordinate_seed"
+        return current, None, 0, "coordinate_without_sign_memory"
+
+    @staticmethod
+    def _trip_timestamp_age_seconds(value: Any) -> float | None:
+        if not value:
+            return None
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.astimezone()
+        try:
+            age = time.time() - parsed.timestamp()
+        except (OverflowError, OSError, ValueError):
+            return None
+        return round(max(0.0, age), 3)
+
+    def _trip_location_state(self, subscription_id: str, remote_id: str) -> dict[str, int | None]:
+        key = (str(subscription_id), str(remote_id))
+        cached = self._trip_location_memory.get(key)
+        if cached is not None:
+            return dict(cached)
+
+        state: dict[str, int | None] = {
+            "latitude_sign": None,
+            "longitude_sign": None,
+            "latitude_flip_count": 0,
+            "longitude_flip_count": 0,
+        }
+        try:
+            with self._db(timeout_seconds=0.05) as db:
+                row = db.execute(
+                    "SELECT latitude_sign,longitude_sign,latitude_flip_count,longitude_flip_count "
+                    "FROM vehicle_location_signs WHERE subscription_id=? AND remote_id=? LIMIT 1",
+                    key,
+                ).fetchone()
+            if row is not None:
+                for name in ("latitude_sign", "longitude_sign"):
+                    value = row[name]
+                    state[name] = int(value) if value in (-1, 1) else None
+                state["latitude_flip_count"] = max(0, int(row["latitude_flip_count"] or 0))
+                state["longitude_flip_count"] = max(0, int(row["longitude_flip_count"] or 0))
+        except sqlite3.Error:
+            pass
+        self._trip_location_memory[key] = dict(state)
+        return state
+
+    def _trip_persist_location_state(
+        self,
+        subscription_id: str,
+        remote_id: str,
+        state: dict[str, int | None],
+    ) -> None:
+        key = (str(subscription_id), str(remote_id))
+        previous = self._trip_location_memory.get(key)
+        self._trip_location_memory[key] = dict(state)
+        if previous == state:
+            return
+
+        acquired = self.sqlite_writer_lock.acquire(timeout=0.02)
+        if not acquired:
+            return
+        try:
+            try:
+                with self._db(timeout_seconds=0.05) as db:
+                    db.execute(
+                        "INSERT INTO vehicle_location_signs "
+                        "(subscription_id,remote_id,latitude_sign,longitude_sign,"
+                        "latitude_flip_count,longitude_flip_count,updated_at) "
+                        "VALUES (?,?,?,?,?,?,?) "
+                        "ON CONFLICT(subscription_id,remote_id) DO UPDATE SET "
+                        "latitude_sign=excluded.latitude_sign,"
+                        "longitude_sign=excluded.longitude_sign,"
+                        "latitude_flip_count=excluded.latitude_flip_count,"
+                        "longitude_flip_count=excluded.longitude_flip_count,"
+                        "updated_at=excluded.updated_at",
+                        (
+                            key[0],
+                            key[1],
+                            state.get("latitude_sign"),
+                            state.get("longitude_sign"),
+                            int(state.get("latitude_flip_count") or 0),
+                            int(state.get("longitude_flip_count") or 0),
+                            utc_iso(),
+                        ),
+                    )
+            except sqlite3.Error:
+                pass
+        finally:
+            self.sqlite_writer_lock.release()
+
+    def _normalize_trip_location(self, subscription_id: str, vehicle: dict[str, Any]) -> None:
+        telemetry = vehicle.get("telemetry")
+        if not isinstance(telemetry, dict):
+            return
+        remote_id = str(vehicle.get("remote_id") or vehicle.get("vin") or "").strip()
+        if not remote_id:
+            return
+
+        state = self._trip_location_state(subscription_id, remote_id)
+        latitude_before = self._trip_number(telemetry.get("latitude"))
+        longitude_before = self._trip_number(telemetry.get("longitude"))
+
+        latitude, latitude_sign, latitude_pending, latitude_source = self._trip_resolve_axis(
+            latitude_before,
+            telemetry.get("gps_signed_latitude_sign"),
+            state.get("latitude_sign"),
+            int(state.get("latitude_flip_count") or 0),
+        )
+        longitude, longitude_sign, longitude_pending, longitude_source = self._trip_resolve_axis(
+            longitude_before,
+            telemetry.get("gps_signed_longitude_sign"),
+            state.get("longitude_sign"),
+            int(state.get("longitude_flip_count") or 0),
+        )
+
+        if latitude is not None:
+            telemetry["latitude"] = latitude
+        if longitude is not None:
+            telemetry["longitude"] = longitude
+
+        new_state: dict[str, int | None] = {
+            "latitude_sign": latitude_sign,
+            "longitude_sign": longitude_sign,
+            "latitude_flip_count": latitude_pending,
+            "longitude_flip_count": longitude_pending,
+        }
+        self._trip_persist_location_state(subscription_id, remote_id, new_state)
+
+        age = self._trip_timestamp_age_seconds(telemetry.get("vehicle_timestamp"))
+        telemetry["gps_quality"] = {
+            "schema": 1,
+            "vehicle_timestamp": telemetry.get("vehicle_timestamp"),
+            "age_seconds": age,
+            "fresh": (age <= TRIP_GPS_FRESH_SECONDS) if age is not None else None,
+            "latitude_source": latitude_source,
+            "longitude_source": longitude_source,
+            "latitude_corrected": (
+                latitude_before is not None
+                and latitude is not None
+                and abs(latitude_before - latitude) > 1e-9
+            ),
+            "longitude_corrected": (
+                longitude_before is not None
+                and longitude is not None
+                and abs(longitude_before - longitude) > 1e-9
+            ),
+            "latitude_sign": latitude_sign,
+            "longitude_sign": longitude_sign,
+            "hemisphere_memory_known": latitude_sign is not None or longitude_sign is not None,
+        }
+
+    def _normalize_trip_vehicles(self, subscription_id: str, vehicles: list[dict[str, Any]]) -> None:
+        for vehicle in vehicles:
+            self._normalize_trip_location(subscription_id, vehicle)
+
+    @staticmethod
+    def _trip_sample_fingerprint(telemetry: dict[str, Any]) -> str:
+        sample = {
+            "vehicle_timestamp": telemetry.get("vehicle_timestamp"),
+            "latitude": telemetry.get("latitude"),
+            "longitude": telemetry.get("longitude"),
+            "raw_vehicle_speed_kmh": telemetry.get("raw_vehicle_speed_kmh"),
+            "raw_odometer_km": telemetry.get("raw_odometer_km"),
+            "speed_kmh": telemetry.get("speed_kmh"),
+            "odometer_km": telemetry.get("odometer_km"),
+        }
+        return hashlib.sha256(canonical_json(sample)).hexdigest()
+
+    def _trip_poll_interval_for_vehicles(
+        self,
+        subscription_id: str,
+        vehicles: list[dict[str, Any]],
+    ) -> tuple[int, int]:
+        duplicate_counts: list[int] = []
+        for vehicle in vehicles:
+            telemetry = vehicle.get("telemetry")
+            if not isinstance(telemetry, dict) or self._state_of(telemetry) != "driving":
+                continue
+            remote_id = str(vehicle.get("remote_id") or vehicle.get("vin") or "").strip()
+            if not remote_id:
+                continue
+            key = f"{subscription_id}|{remote_id}"
+            fingerprint = self._trip_sample_fingerprint(telemetry)
+            previous = self._trip_sample_registry.get(key)
+            duplicate_count = (
+                int(previous[1]) + 1
+                if previous is not None and previous[0] == fingerprint
+                else 0
+            )
+            self._trip_sample_registry[key] = (fingerprint, duplicate_count)
+            duplicate_counts.append(duplicate_count)
+
+        if len(self._trip_sample_registry) > 256:
+            for stale_key in list(self._trip_sample_registry)[:-192]:
+                self._trip_sample_registry.pop(stale_key, None)
+
+        duplicate_count = min(duplicate_counts) if duplicate_counts else 0
+        base = int(self.trip_driving_seconds)
+        if duplicate_count <= 1:
+            return base, duplicate_count
+        if duplicate_count == 2:
+            return max(base, 10), duplicate_count
+        if duplicate_count == 3:
+            return max(base, 12), duplicate_count
+        legacy_cap = min(int(self.active_seconds), TRIP_DUPLICATE_BACKOFF_CAP_SECONDS)
+        return max(base, legacy_cap), duplicate_count
 
     def _state_of(self, telemetry: dict[str, Any]) -> str:
         state = str(telemetry.get("vehicle_state") or "").lower()
