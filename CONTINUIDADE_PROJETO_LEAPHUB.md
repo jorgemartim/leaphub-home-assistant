@@ -397,3 +397,26 @@ Na R3, o contrato concorrente herdado da 1.12.111 também teve o fixture corrigi
 eventos terminais artificiais passam a usar `sequence=0` (legado/não ordenado),
 em vez de pré-ocupar 1..20 sem alimentar `vehicle_state_cache`. O assert que
 proíbe duplicidade entre eventos reais permanece inalterado.
+
+## Gateway 1.12.113 — fence mecânico e confirmação terminal
+
+Base publicada: `3fb12fbd5d9632d3a2d2bf5be9104ab263dce682` (Gateway 1.12.112).
+
+Campo confirmou melhora expressiva da 1.12.112 e ausência do antigo
+`database is locked`. Restou um caso: `windows_open` abriu fisicamente, mas a
+telemetria não trouxe confirmação/imagem; um `sunshade_open` enviado ~5s depois
+entrou enquanto a primeira operação ainda podia estar em curso.
+
+A 1.12.113 retira janelas/cortina do ACK-first, preservando uma única transmissão
+e usando o polling remoteCtlId já existente na biblioteca como fence da lane da
+conta. Se esse polling expirar, a classificação existente continua tratando o
+write como aceito e a telemetria FAST assume a confirmação — sem retry físico.
+
+A janela FAST inconclusiva agora envia resultado terminal `unconfirmed`, e o
+diário local possui fallback de 210s para impedir pendência eterna. A imagem
+continua sendo renderizada apenas de estado real recebido da telemetria.
+
+R5: os contratos historicos 1.12.93/94/95 que ainda congelavam literalmente o
+ACK-first antigo foram alinhados ao fence mecanico. Os demais asserts continuam
+intactos, e o patcher varre todos os `tests/test_*.py` para impedir outro
+contrato antigo escondido.

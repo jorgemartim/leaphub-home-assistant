@@ -43,6 +43,6 @@ def test_server_accounts_for_post_dispatch_local_time() -> None:
 
 def test_critical_command_guardrails_are_unchanged() -> None:
     assert 'return method(vehicle_id, params={"operate": "off"})' in CONNECTOR
-    assert 'ACK_FIRST_COMMANDS = {"lock", "unlock", "climate_on", "climate_off", "quick_cool", "quick_heat", "trunk_open", "trunk_close", "windows_open", "windows_close", "sunshade_open", "sunshade_close"}' in CONNECTOR
+    assert 'ACK_FIRST_COMMANDS = {"lock", "unlock", "climate_on", "climate_off", "quick_cool", "quick_heat", "trunk_open", "trunk_close"}' in CONNECTOR
     assert "repeat_exact_state_command" in CONNECTOR
     assert "command_attempts < 2" in CONNECTOR

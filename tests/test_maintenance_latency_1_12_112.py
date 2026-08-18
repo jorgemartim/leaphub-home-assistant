@@ -118,8 +118,9 @@ class Harness:
 
 
 def test_versions_and_physical_contracts_are_frozen() -> None:
-    assert connector.CONNECTOR_VERSION == "1.12.112"
-    assert telemetry.ENGINE_VERSION == "1.12.112"
+    release_target = (APP / "RELEASE_TARGET").read_text(encoding="utf-8").strip()
+    assert connector.CONNECTOR_VERSION == release_target
+    assert telemetry.ENGINE_VERSION == release_target
     assert connector.SAFE_STATE_RETRY_COMMANDS == {"climate_on", "climate_off"}
     assert len(connector.COMMAND_METHODS) == 40
     assert len(connector.EXPERIMENTAL_COMMAND_METHODS) == 12

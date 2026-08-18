@@ -44,7 +44,7 @@ except ImportError:
         _privacy_spec.loader.exec_module(_privacy_module)
         sanitize_log = _privacy_module.sanitize_log
 
-CONNECTOR_VERSION = "1.12.112"
+CONNECTOR_VERSION = "1.12.113"
 MAX_INPUT_BYTES = 1024 * 1024
 logging.getLogger("leapmotor_api").setLevel(logging.WARNING)
 LOGGER = logging.getLogger("leaphub.connector")
@@ -65,10 +65,14 @@ SAFE_STATE_RETRY_COMMANDS = {"climate_on", "climate_off"}
 # aqui isso é redundante porque a confirmação física já é feita pela telemetria
 # FAST do Gateway. Na 1.12.81 climate_off entra na mesma estratégia,
 # preservando o ac_switch operate=off e o teto de duas transmissões exatas.
-# 1.12.84 — porta-malas, janelas e cortina também são comandos de ESTADO
-# confirmáveis pela telemetria. Eles deixam de esperar o polling síncrono do
-# remoteCtlId, mas continuam sem qualquer retry físico adicional.
-ACK_FIRST_COMMANDS = {"lock", "unlock", "climate_on", "climate_off", "quick_cool", "quick_heat", "trunk_open", "trunk_close", "windows_open", "windows_close", "sunshade_open", "sunshade_close"}
+# 1.12.113 — janelas e cortina sao mecanismos com movimento prolongado.
+# O log de campo mostrou windows_open aceito em ~0,6s e sunshade_open entrando
+# ~5s depois, antes de a primeira operacao ter um resultado remoto terminal.
+# Para estes quatro comandos o worker volta a respeitar o remoteCtlId da propria
+# leapmotor-api. Isso SERIALIZA o mecanismo por conta, sem reenviar a acao.
+# Timeout do result/query continua classificado como ACK aceito + confirmacao
+# FAST pendente pelo classify_accepted_ambiguity existente.
+ACK_FIRST_COMMANDS = {"lock", "unlock", "climate_on", "climate_off", "quick_cool", "quick_heat", "trunk_open", "trunk_close"}
 
 COMMAND_METHODS: dict[str, str] = {
     "lock": "lock_vehicle",

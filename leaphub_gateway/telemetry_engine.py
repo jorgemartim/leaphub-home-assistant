@@ -55,7 +55,7 @@ except ModuleNotFoundError:
         EVENT_TRANSPORT = _event_transport_module.EVENT_TRANSPORT
 
 LOG = logging.getLogger("leaphub.telemetry")
-ENGINE_VERSION = "1.12.112"  # windows C10 mapping + final confirmation push; retry/cadence preserved
+ENGINE_VERSION = "1.12.113"  # windows C10 mapping + final confirmation push; retry/cadence preserved
 
 # Hospedagem compartilhada (Apache/LiteSpeed) fecha a conexão ociosa em poucos
 # segundos. Reaproveitar depois disso escreve num socket já fechado e devolve
@@ -3260,6 +3260,30 @@ class TelemetryEngine:
                 continue
             evaluated_samples += 1
             matched, sample_evaluable = self._command_confirmation(command_key, telemetry, context)
+            if command_key in {"windows_open", "windows_close", "windows_position"}:
+                safe_states = telemetry.get("windows") if isinstance(telemetry.get("windows"), dict) else {}
+                safe_positions = telemetry.get("window_positions") if isinstance(telemetry.get("window_positions"), dict) else {}
+                LOG.info(
+                    "CONFIRM_STATE_DIAG command=%s request=%s poll=%s windows=%s positions=%s evaluable=%s match=%s",
+                    command_key,
+                    str(entry["request_id"] or "")[:24],
+                    int(entry["poll_count"] or 0) + 1,
+                    json.dumps(safe_states, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+                    json.dumps(safe_positions, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+                    sample_evaluable,
+                    matched,
+                )
+            elif command_key in {"sunshade_open", "sunshade_close", "sunshade_position"}:
+                LOG.info(
+                    "CONFIRM_STATE_DIAG command=%s request=%s poll=%s sunshade_open=%s sunshade_percent=%s evaluable=%s match=%s",
+                    command_key,
+                    str(entry["request_id"] or "")[:24],
+                    int(entry["poll_count"] or 0) + 1,
+                    telemetry.get("sunshade_open"),
+                    telemetry.get("sunshade_percent"),
+                    sample_evaluable,
+                    matched,
+                )
             evaluable = evaluable or sample_evaluable
             if not sample_evaluable:
                 # Guarda a última amostra inconclusiva; só nomes de campo.
@@ -4556,6 +4580,8 @@ class TelemetryEngine:
                 len(remaining_outcomes),
             )
         for item in exhausted_outcomes:
+            # 1.12.113 — a tela recebe um fim terminal, mas sem concluir que o carro falhou.
+            self._announce_telemetry_unconfirmed_async(environment, item)
             if item["command_vehicle_id"] and not item["target_seen"]:
                 LOG.warning(
                     "Janela rápida de %s não encontrou o veículo-alvo de %s entre os dados retornados; assinatura será reconciliada pelo site.",
@@ -6196,6 +6222,81 @@ class TelemetryEngine:
         except RuntimeError as exc:
             LOG.debug(
                 "Anuncio final de %s (%s) nao pode iniciar thread: %s",
+                command_key or "desconhecido",
+                request_id,
+                connector.clean_message(str(exc)),
+            )
+            return False
+
+    def _announce_telemetry_unconfirmed_async(
+        self,
+        environment: str,
+        item: dict[str, Any],
+    ) -> bool:
+        # Finaliza no site uma janela FAST esgotada sem inferir falha fisica.
+        # A nuvem ja aceitou o comando; falta de confirmacao nao prova falha
+        # fisica e nunca autoriza retry/reenvio.
+        request_id = str(item.get("request_id") or "").strip()[:96]
+        command_key = str(item.get("command_key") or "").strip().lower()[:80]
+        if not request_id or bool(item.get("confirmed")) or not bool(item.get("exhausted")):
+            return False
+        try:
+            reads = max(0, int(item.get("poll_count") or 0))
+        except (TypeError, ValueError):
+            reads = 0
+        try:
+            elapsed = max(0, int(float(item.get("elapsed") or 0)))
+        except (TypeError, ValueError):
+            elapsed = 0
+        reason = str(item.get("reason") or "confirmation_window_expired")[:80]
+        result = {
+            "ok": True,
+            "accepted": True,
+            "request_id": request_id,
+            "command": command_key,
+            "message": "O comando foi enviado, mas o estado do veiculo nao pode ser confirmado dentro da janela segura.",
+            "command_dispatched": True,
+            "cloud_accepted": True,
+            "confirmation_pending": False,
+            "confirmation_reason": reason,
+            "verified_by_gateway": False,
+            "vehicle_confirmed": False,
+            "not_applied": False,
+            "applied": None,
+            "final_outcome": "unconfirmed",
+            "confirmation_source": "telemetry_window_exhausted",
+            "confirmation_reads": reads,
+            "confirmation_elapsed_seconds": elapsed,
+            "connector_version": connector.CONNECTOR_VERSION,
+            "gateway_version": ENGINE_VERSION,
+        }
+
+        def deliver() -> None:
+            try:
+                delivered = self.announce_command_result(environment, request_id, result)
+                if delivered:
+                    LOG.info(
+                        "Veredito inconclusivo de %s (%s) anunciado ao site; nenhum reenvio fisico.",
+                        command_key or "desconhecido",
+                        request_id,
+                    )
+            except Exception as exc:  # noqa: BLE001
+                LOG.debug(
+                    "Anuncio inconclusivo de %s (%s) nao chegou ao site: %s",
+                    command_key or "desconhecido",
+                    request_id,
+                    connector.clean_message(str(exc)),
+                )
+        try:
+            threading.Thread(
+                target=deliver,
+                name=f"leaphub-unconfirmed-announce-{request_id[:12]}",
+                daemon=True,
+            ).start()
+            return True
+        except RuntimeError as exc:
+            LOG.debug(
+                "Anuncio inconclusivo de %s (%s) nao pode iniciar thread: %s",
                 command_key or "desconhecido",
                 request_id,
                 connector.clean_message(str(exc)),
