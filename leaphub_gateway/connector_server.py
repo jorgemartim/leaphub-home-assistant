@@ -65,7 +65,7 @@ except ModuleNotFoundError:
         _event_transport_spec.loader.exec_module(_event_transport_module)
         EVENT_TRANSPORT = _event_transport_module.EVENT_TRANSPORT
 
-VERSION = "1.12.112"
+VERSION = "1.12.113"
 API_VERSION = 2
 CAPABILITY_SCHEMA_VERSION = 1
 MIN_SUPPORTED_CLIENT_API_VERSION = 1
@@ -87,6 +87,8 @@ COMMAND_CACHE_MAX = 2000
 COMMAND_CANCEL_REQUESTS: set[str] = set()
 MAX_AUTH_RETRY_SECONDS = 1800
 AUTH_RETRY_CLOCK_SKEW_SECONDS = 90
+# 1.12.113 — janela FAST maxima (180s) + margem de entrega/cron.
+COMMAND_CONFIRMATION_STATUS_CEILING_SECONDS = 210.0
 
 
 class CommandCancelled(RuntimeError):
@@ -636,6 +638,40 @@ def command_journal_fail(request_hash: str | None, request_id: str, exc: BaseExc
         LOG.warning("Não foi possível registrar a falha do comando: %s", db_exc)
 
 
+def command_confirmation_terminal_payload(
+    status: str,
+    response: dict[str, Any],
+    age_seconds: float,
+) -> dict[str, Any] | None:
+    # Converte somente SENT pendente antigo em veredito inconclusivo terminal.
+    if (
+        str(status or "") != "sent"
+        or not bool(response.get("confirmation_pending"))
+        or float(age_seconds) < COMMAND_CONFIRMATION_STATUS_CEILING_SECONDS
+    ):
+        return None
+    terminal = dict(response)
+    terminal.update({
+        "ok": True,
+        "accepted": True,
+        "queued": False,
+        "status": "sent",
+        "command_dispatched": bool(terminal.get("command_dispatched", True)),
+        "cloud_accepted": bool(terminal.get("cloud_accepted", True)),
+        "confirmation_pending": False,
+        "verified_by_gateway": False,
+        "vehicle_confirmed": False,
+        "not_applied": False,
+        "applied": None,
+        "final_outcome": "unconfirmed",
+        "confirmation_reason": str(terminal.get("confirmation_reason") or "confirmation_window_expired")[:80],
+        "retry_after_seconds": 0,
+        "poll_after_seconds": 0,
+        "message": "O comando foi enviado, mas o estado do veiculo nao pode ser confirmado dentro da janela segura.",
+        "connector_version": connector.CONNECTOR_VERSION,
+    })
+    return terminal
+
 def command_journal_status(environment: str, payload: dict[str, Any]) -> dict[str, Any]:
     request_id = request_identifier(payload)
     if not request_id:
@@ -729,6 +765,30 @@ def command_journal_status(environment: str, payload: dict[str, Any]) -> dict[st
         except (OSError, sqlite3.Error):
             pass
         return stale_response
+    confirmation_age = max(0.0, time.time() - float(row.get("updated_at") or row.get("created_at") or 0))
+    terminal_unconfirmed = command_confirmation_terminal_payload(status, response, confirmation_age)
+    if terminal_unconfirmed is not None:
+        raw_terminal = json.dumps(terminal_unconfirmed, ensure_ascii=False, separators=(",", ":"), default=connector.json_default)
+        now = time.time()
+        cache_command(
+            request_hash,
+            str(row.get("payload_hash") or ""),
+            "sent",
+            raw_terminal,
+            float(row.get("created_at") or now),
+            now,
+            now + 900,
+        )
+        try:
+            with command_db(0.3) as db:
+                db.execute(
+                    "UPDATE command_requests SET status='sent',response_json=?,updated_at=?,expires_at=? WHERE request_hash=?",
+                    (raw_terminal[:16000], now, now + 900, request_hash),
+                )
+                db.commit()
+        except (OSError, sqlite3.Error):
+            pass
+        return terminal_unconfirmed
     response.setdefault("ok", status not in {"failed", "cancelled"})
     response["status"] = status
     response["request_id"] = request_id
