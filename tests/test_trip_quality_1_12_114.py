@@ -216,4 +216,19 @@ def test_frozen_physical_and_confirmation_contracts_remain_present() -> None:
     assert 'if command in {"windows_open", "windows_close"} and window_native_scale == 10:' in connector_source
     assert 'params["wshld"] = "0"' in connector_source
     assert "COMMAND_POST_DISPATCH_EARLY_CADENCE = (5, 5, 8)" in engine_source
-    assert 'version: "1.12.113"' in config_source
+    release_target = (APP / "RELEASE_TARGET").read_text(encoding="utf-8").strip()
+    config_version_line = next(
+        line.strip()
+        for line in config_source.splitlines()
+        if line.strip().startswith("version:")
+    )
+    config_version = config_version_line.split('"', 2)[1]
+
+    def version_tuple(value: str) -> tuple[int, ...]:
+        return tuple(int(part) for part in value.split("."))
+
+    # Publicacao em duas fases:
+    # - branch staged: config pode estar atras do RELEASE_TARGET;
+    # - copia efemera do CI: config e promovido ao RELEASE_TARGET.
+    # O contrato nao pode carimbar a versao publicada anterior.
+    assert version_tuple(config_version) <= version_tuple(release_target)
