@@ -1,12 +1,11 @@
-## 1.12.113
+## 1.12.114
 
 A distribuição continua pré-compilada no GHCR oficial e mantém publicação em duas fases.
 
-- janelas e cortina deixam o ACK-first: o worker respeita o remoteCtlId antes de liberar outra ação mecânica na mesma conta;
-- nenhum comando físico é repetido; timeout do result/query continua como ACK aceito + confirmação FAST pendente;
-- janela FAST esgotada agora anuncia resultado terminal `unconfirmed`, sem marcar `not_applied` e sem reenvio;
-- diário local encerra `sent + confirmation_pending` após 210s se o anúncio best-effort ao site se perder;
-- diagnóstico `CONFIRM_STATE_DIAG` mostra apenas estados/percentuais seguros de janelas/cortina durante confirmação;
-- imagem continua baseada somente em telemetria confirmada; não existe atualização visual otimista;
-- preserva maintenance 1.12.112, SQLite writer, schedule_lock, auth/cooldown, OCPP, SAFE retry e cadências.
-- mantém config.yaml em 1.12.112 até a publicação normal via CI/GHCR.
+- adiciona sinais paralelos de viagem: velocidade bruta `1319`, hodometro bruto `1318` e timestamp do veiculo, sem substituir os campos legados;
+- persiste por veiculo os hemisferios GPS confirmados e protege contra quadros isolados que perdem o sinal negativo;
+- ativa burst de viagem em 8s somente quando ha evidencia de conducao;
+- snapshots repetidos recuam progressivamente ate o teto anterior, evitando chamadas rapidas inuteis quando a nuvem congela;
+- preserva exatamente confirmacao 5/5/8, tela interativa, auth/cooldown, OCPP, maintenance 1.12.112 e fila SQLite;
+- preserva fence mecanico 1.12.113, escala C10 0-10, defrost 2/0, Prepare, SAFE retry e todos os payloads fisicos;
+- mantem `config.yaml` em 1.12.113 ate a publicacao normal via CI/GHCR.
