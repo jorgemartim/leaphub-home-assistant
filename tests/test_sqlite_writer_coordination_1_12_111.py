@@ -86,7 +86,7 @@ class Harness:
                 event_id, sid, "staging", 1, "V1", old, b"x", f"hash-{index}", status,
                 0, 0.0, "old" if status == "failed" else None, old,
                 old if status == "delivered" else None,
-                index + 1, f"semantic-{index}", 0, "heartbeat",
+                0, f"semantic-{index}", 0, "heartbeat",
             ))
         with self.engine._db() as db:
             db.executemany(

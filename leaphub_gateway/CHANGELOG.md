@@ -1,13 +1,12 @@
-## 1.12.111
+## 1.12.112
 
 A distribuição continua pré-compilada no GHCR oficial e mantém publicação em duas fases.
 
-- corrige a contenção SQLite comprovada em campo na 1.12.110: manutencao chegou a 39-42 s, `/boost` devolveu 503 e a confirmacao acumulou mais de 32 s de atraso;
-- manutencao passa a ser best-effort, com 180 s de folga apos restart, intervalo de 60 s e busy timeout local de 150 ms;
-- limpeza de eventos antigos passa a descobrir IDs por SELECT e alterar no maximo 200 linhas por classe/passada, em vez de DELETE/UPDATE bulk ilimitado;
-- qualquer janela de comando ou confirmacao pendente faz a manutencao ceder antes de escrever;
-- falha/ocupacao da manutencao nao marca o scheduler inteiro como indisponivel;
-- adiciona `sqlite_writer_lock` dedicado, aplicado centralmente pelo `_db`: SELECTs seguem livres em WAL e todo write interno passa pelo mesmo coordenador;
-- preserva o `schedule_lock` e todos os guardrails da 1.12.110;
-- nao altera payload fisico, matriz de comandos, janelas, cortina, defrost, SAFE retry, auth/cooldown, OCPP nem cadencia 5/5/8;
-- mantem `config.yaml` em 1.12.110 ate a publicacao normal via CI/GHCR.
+- corrige a regressao de latencia medida na 1.12.111: maintenance ainda consumia 19-35 s apesar do lote de 200;
+- troca discovery por fatia incremental de no maximo 200 rowids, sem ORDER BY created_at/COALESCE global;
+- COUNT de capacidade deixa de rodar a cada minuto: no maximo a cada 15 min e com progress handler de ~40 ms;
+- maintenance espera no maximo ~20 ms pelo writer interno e cede a comando/confirmacao antes e depois da discovery;
+- preserva schedule_lock e sqlite_writer_lock, SELECT concorrente em WAL e _queue_event atomico;
+- preserva exatamente a rota de ACK do comando e todos os handlers fisicos, mudando neles somente a versao;
+- nao altera payload, SAFE retry, auth/cooldown, OCPP, janelas, defrost, Prepare nem cadencia 5/5/8;
+- mantem config.yaml em 1.12.111 ate a publicacao normal via CI/GHCR.
