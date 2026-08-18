@@ -1,0 +1,16 @@
+CHANGED-FILES-1.12.110.txt
+CONTINUIDADE_PROJETO_LEAPHUB.md
+GITHUB-RECOVERY-1.12.110.md
+RELEASE-1.12.110.md
+leaphub_gateway/CHANGELOG.md
+leaphub_gateway/Dockerfile
+leaphub_gateway/RELEASE-1.12.110.md
+leaphub_gateway/RELEASE_TARGET
+leaphub_gateway/connector.py
+leaphub_gateway/connector_server.py
+leaphub_gateway/gateway_manager.py
+leaphub_gateway/ocpp_gateway.py
+leaphub_gateway/official_trip_probe.py
+leaphub_gateway/privacy.py
+leaphub_gateway/telemetry_engine.py
+tests/test_confirmation_scheduler_isolation_1_12_110.py
