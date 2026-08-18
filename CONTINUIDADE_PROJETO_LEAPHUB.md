@@ -366,3 +366,15 @@ Nao houve mudanca de comando fisico. Janelas, cortina, defrost, retry, auth,
 OCPP e cadencias permanecem congelados. A proxima validacao de campo deve ser
 com veiculo parado e uma unica intencao por vez, medindo despacho, arme,
 primeira leitura e veredito antes de qualquer novo ajuste.
+
+## Gateway 1.12.111 — prioridade de comando sobre manutencao SQLite
+
+Base publicada: `a5561306fdc4b5a6cae9a81535bf84bc4c429e8a` (Gateway 1.12.110).
+
+O log de campo apos a 1.12.110 mostrou que o isolamento de `self.lock` funcionou,
+mas revelou a contencao real do escritor SQLite: manutencoes de 39-42 s geraram
+`database is locked`, HTTP 503 no boost e atraso de confirmacao acima de 32 s.
+A 1.12.111 nao reabre comandos fisicos. Ela coordena os writers internos em um lock dedicado e torna a poda local best-effort, adiada no startup, em lotes pequenos e subordinada a qualquer comando/confirmacao.
+
+Congelado: janelas, cortina, defrost, clima, SAFE retry, auth/cooldown, OCPP,
+matriz 40+12, cadencia 5/5/8 e backoff 8/15/25/40/60/90.

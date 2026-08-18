@@ -55,7 +55,7 @@ except ModuleNotFoundError:
         EVENT_TRANSPORT = _event_transport_module.EVENT_TRANSPORT
 
 LOG = logging.getLogger("leaphub.telemetry")
-ENGINE_VERSION = "1.12.110"  # windows C10 mapping + final confirmation push; retry/cadence preserved
+ENGINE_VERSION = "1.12.111"  # windows C10 mapping + final confirmation push; retry/cadence preserved
 
 # Hospedagem compartilhada (Apache/LiteSpeed) fecha a conexão ociosa em poucos
 # segundos. Reaproveitar depois disso escreve num socket já fechado e devolve
@@ -84,6 +84,16 @@ TELEMETRY_NETWORK_BLOCK_CEILING_SECONDS = 4.0
 # própria para que o próximo ajuste seja feito sobre a causa medida, não por
 # aproximação.
 TELEMETRY_STAGE_LOG_THRESHOLD_MS = 750
+
+# 1.12.111 — manutencao local e BEST EFFORT. Em campo a primeira limpeza da
+# 1.12.110 monopolizou o escritor SQLite por 39-42s; boost recebeu 503 e
+# a confirmacao FAST acumulou >32s de atraso. Estes tetos nao alteram
+# polling do carro, payload fisico, auth ou fila de entrega.
+MAINTENANCE_STARTUP_GRACE_SECONDS = 180.0
+MAINTENANCE_INTERVAL_SECONDS = 60.0
+MAINTENANCE_BUSY_TIMEOUT_SECONDS = 0.15
+MAINTENANCE_BATCH_SIZE = 200
+MAINTENANCE_WORKER_POLL_SECONDS = 30.0
 
 # 1.12.78 — o anúncio do fim do comando é melhor esforço, e o teto é curto de
 # propósito. Ele existe para o site não esperar a próxima volta do cron; se
@@ -196,6 +206,145 @@ def semantic_snapshot(value: Any, parent_key: str = "") -> Any:
     if isinstance(value, list):
         return [semantic_snapshot(item, parent_key) for item in value]
     return value
+
+
+class _SQLiteWriterConnection:
+    """Proxy reutilizavel por thread: SELECTs WAL livres; writers serializados."""
+
+    _WRITE_HEADS = frozenset({
+        "INSERT", "UPDATE", "DELETE", "REPLACE", "CREATE", "ALTER", "DROP",
+        "VACUUM", "REINDEX", "ANALYZE",
+    })
+    _TX_BEGIN = frozenset({"BEGIN", "SAVEPOINT"})
+    _TX_END = frozenset({"COMMIT", "ROLLBACK", "END"})
+
+    def __init__(self, db: sqlite3.Connection, writer_lock: threading.RLock) -> None:
+        self._db = db
+        self._writer_lock = writer_lock
+        self._writer_held = False
+        self._context_depth = 0
+
+    def matches(self, db: sqlite3.Connection) -> bool:
+        return self._db is db
+
+    def enter_context(self) -> None:
+        self._context_depth += 1
+
+    def leave_context(self) -> None:
+        if self._context_depth > 0:
+            self._context_depth -= 1
+        if self._context_depth == 0:
+            self.release_writer_guard()
+
+    @staticmethod
+    def _head(sql: str) -> str:
+        text = str(sql or "").lstrip()
+        while text.startswith("--"):
+            _line, _sep, text = text.partition("\n")
+            text = text.lstrip()
+        if text.startswith("/*"):
+            end = text.find("*/")
+            if end >= 0:
+                text = text[end + 2:].lstrip()
+        return text.split(None, 1)[0].upper() if text else ""
+
+    @classmethod
+    def _is_write(cls, sql: str) -> bool:
+        head = cls._head(sql)
+        if head in cls._WRITE_HEADS:
+            return True
+        if head == "PRAGMA":
+            text = str(sql or "")
+            return "=" in text or "(" in text
+        if head == "WITH":
+            upper = " " + str(sql or "").upper().replace("\n", " ") + " "
+            return any(f" {token} " in upper for token in ("INSERT", "UPDATE", "DELETE", "REPLACE"))
+        return False
+
+    def _begin_writer(self) -> None:
+        if not self._writer_held:
+            self._writer_lock.acquire()
+            self._writer_held = True
+
+    def _end_writer(self) -> None:
+        if self._writer_held:
+            self._writer_held = False
+            self._writer_lock.release()
+
+    def execute(self, sql: str, parameters: object = ()):
+        head = self._head(sql)
+        if head in self._TX_BEGIN:
+            self._begin_writer()
+            try:
+                return self._db.execute(sql, parameters)
+            except BaseException:
+                self._end_writer()
+                raise
+        if head in self._TX_END:
+            try:
+                return self._db.execute(sql, parameters)
+            finally:
+                self._end_writer()
+        if head == "RELEASE":
+            try:
+                result = self._db.execute(sql, parameters)
+            finally:
+                if not self._db.in_transaction:
+                    self._end_writer()
+            return result
+        if self._is_write(sql):
+            if self._writer_held:
+                return self._db.execute(sql, parameters)
+            with self._writer_lock:
+                return self._db.execute(sql, parameters)
+        return self._db.execute(sql, parameters)
+
+    def executemany(self, sql: str, seq_of_parameters: object):
+        if self._is_write(sql):
+            if self._writer_held:
+                return self._db.executemany(sql, seq_of_parameters)
+            with self._writer_lock:
+                return self._db.executemany(sql, seq_of_parameters)
+        return self._db.executemany(sql, seq_of_parameters)
+
+    def executescript(self, sql_script: str):
+        if self._writer_held:
+            try:
+                return self._db.executescript(sql_script)
+            finally:
+                if not self._db.in_transaction:
+                    self._end_writer()
+        with self._writer_lock:
+            return self._db.executescript(sql_script)
+
+    def commit(self) -> None:
+        try:
+            self._db.commit()
+        finally:
+            self._end_writer()
+
+    def rollback(self) -> None:
+        try:
+            self._db.rollback()
+        finally:
+            self._end_writer()
+
+    def abort_writer_transaction(self) -> None:
+        if not self._writer_held:
+            return
+        try:
+            if self._db.in_transaction:
+                self._db.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+        finally:
+            self._end_writer()
+
+    def release_writer_guard(self) -> None:
+        self.abort_writer_transaction()
+
+    def __getattr__(self, name: str):
+        return getattr(self._db, name)
 
 
 class TelemetryYieldForManual(RuntimeError):
@@ -337,7 +486,13 @@ class TelemetryEngine:
         # 1.12.110 — agenda/confirmacao nao divide a trava global com fila, entrega,
         # auth ou manutencao. SQLite continua sendo a autoridade transacional.
         self.schedule_lock = threading.RLock()
+        # 1.12.111-R6 — apenas writers do telemetry.sqlite passam aqui;
+        # SELECTs continuam concorrentes em WAL. Nunca envolver rede.
+        self.sqlite_writer_lock = threading.RLock()
         self._connections: dict[int, sqlite3.Connection] = {}
+        # 1.12.111-R6 — o proxy de cada conexao tambem e reutilizado por thread;
+        # preserva o contrato de identidade da 1.12.50/51 sem abrir writer paralelo.
+        self._writer_connections: dict[int, _SQLiteWriterConnection] = {}
         self._busy_ms: dict[int, int] = {}
         self._connections_guard = threading.RLock()
         self._storage_checked_at = 0.0
@@ -665,7 +820,11 @@ class TelemetryEngine:
     def _drop_connection(self, key: int) -> None:
         with self._connections_guard:
             db = self._connections.pop(key, None)
+            coordinated = self._writer_connections.pop(key, None)
             self._busy_ms.pop(key, None)
+        if coordinated is not None:
+            # _drop_connection e chamado pela propria thread da conexao.
+            coordinated.abort_writer_transaction()
         if db is not None:
             try:
                 db.close()
@@ -673,16 +832,14 @@ class TelemetryEngine:
                 pass
 
     def close_storage(self) -> None:
-        """Fecha as conexões SQLite abertas por todas as threads.
-
-        Chamado por ``stop()`` depois que worker, entrega e pool já terminaram.
-        Como a conexão passou a ser reaproveitada, sem isto o arquivo da fila
-        permaneceria aberto até o processo encerrar.
-        """
+        """Fecha as conexoes SQLite abertas por todas as threads."""
         with self._connections_guard:
             connections = list(self._connections.values())
             self._connections.clear()
+            self._writer_connections.clear()
             self._busy_ms.clear()
+        # stop() encerra workers antes deste ponto; nao tentamos liberar RLock
+        # pertencente a outra thread durante shutdown.
         for db in connections:
             try:
                 db.close()
@@ -732,14 +889,25 @@ class TelemetryEngine:
             db.execute(f"PRAGMA busy_timeout={milliseconds}")
             with self._connections_guard:
                 self._busy_ms[key] = milliseconds
+
+        with self._connections_guard:
+            coordinated = self._writer_connections.get(key)
+            if coordinated is None or not coordinated.matches(db):
+                coordinated = _SQLiteWriterConnection(db, self.sqlite_writer_lock)
+                self._writer_connections[key] = coordinated
+
+        coordinated.enter_context()
         try:
-            yield db
+            yield coordinated
         except sqlite3.Error:
-            # Uma conexão que falhou pode ter transação pendente. Descartar aqui
-            # garante que a próxima consulta abra uma limpa, sem herdar estado.
+            coordinated.abort_writer_transaction()
             self._drop_connection(key)
             raise
-
+        except BaseException:
+            coordinated.abort_writer_transaction()
+            raise
+        finally:
+            coordinated.leave_context()
 
     def _configure_journal(self, db: sqlite3.Connection) -> None:
         """Prefere WAL e mantém DELETE como fallback quando o volume não o aceita.
@@ -3598,23 +3766,35 @@ class TelemetryEngine:
             self.wake_event.clear()
 
     def _run_maintenance(self) -> None:
-        """Executa retencao/limpeza fora do scheduler de confirmacao."""
-        # Pequena folga no startup evita disputar o primeiro sync/comando depois
-        # de uma atualizacao. O proprio _maintenance mantem throttle de 60s.
-        if self.stop_event.wait(5.0):
+        """Retencao best-effort: nunca compete de forma perceptivel com comando."""
+        # Depois de restart, sincronizacao, login e primeiros comandos sao mais
+        # importantes que podar eventos antigos. A fila continua persistente.
+        if self.stop_event.wait(MAINTENANCE_STARTUP_GRACE_SECONDS):
             return
         while not self.stop_event.is_set():
             started = time.monotonic()
+            outcome = "unknown"
             try:
-                self._maintenance()
+                outcome = str(self._maintenance() or "ok")
             except (OSError, sqlite3.Error) as exc:
-                LOG.debug("Manutencao local cedeu por SQLite ocupado: %s", connector.clean_message(str(exc)))
+                # Manutencao nao representa saude do scheduler. SQLite ocupado
+                # significa apenas ceder e tentar depois; nao dispara 503 global.
+                outcome = "sqlite_busy"
+                LOG.debug(
+                    "Manutencao local cedeu por SQLite ocupado: %s",
+                    connector.clean_message(str(exc)),
+                )
             except Exception:  # noqa: BLE001
+                outcome = "error"
                 LOG.exception("Falha no worker isolado de manutencao")
             elapsed_ms = int(round((time.monotonic() - started) * 1000))
             if elapsed_ms >= TELEMETRY_STAGE_LOG_THRESHOLD_MS:
-                LOG.info("TELEMETRY_MAINTENANCE_DIAG elapsed_ms=%s", elapsed_ms)
-            if self.stop_event.wait(5.0):
+                LOG.info(
+                    "TELEMETRY_MAINTENANCE_DIAG elapsed_ms=%s outcome=%s",
+                    elapsed_ms,
+                    outcome,
+                )
+            if self.stop_event.wait(MAINTENANCE_WORKER_POLL_SECONDS):
                 break
 
     def _run_delivery(self) -> None:
@@ -6288,63 +6468,92 @@ class TelemetryEngine:
             self._close_session(subscription_id)
 
 
-    def _maintenance(self) -> None:
+    def _maintenance(self) -> str:
+        """Limpeza local limitada, interrompivel e subordinada a comandos."""
         now_epoch = time.time()
-        # A expiração de sessão é barata e precisa continuar acontecendo em todo
-        # ciclo. Só a retenção da fila, que toca o disco, entra no throttle.
+        # Sessao ociosa e memoria; nao precisa esperar a janela da poda em disco.
         self._expire_idle_sessions(now_epoch)
-        if now_epoch - self._maintenance_last_at < 60.0:
-            return
-        self._maintenance_last_at = now_epoch
-        # Executada de forma barata; o SQLite ignora as remoções quando não há registros antigos.
-        cutoff = time.time() - self.retention_days * 86400
+        if now_epoch - self._maintenance_last_at < MAINTENANCE_INTERVAL_SECONDS:
+            return "throttled"
+
+        cutoff = now_epoch - self.retention_days * 86400
         cutoff_iso = datetime.fromtimestamp(cutoff, timezone.utc).isoformat().replace("+00:00", "Z")
-        expired_windows: list[str] = []
-        with self._db(timeout_seconds=2.0) as db:
+        batch = int(MAINTENANCE_BATCH_SIZE)
+
+        # Toda descoberta e SELECT pode levar o tempo que o volume precisar sem
+        # possuir writer lock. WAL mantem os comandos/escritas livres. So as
+        # mutacoes finais recebem listas pequenas de PKs.
+        with self._db(timeout_seconds=MAINTENANCE_BUSY_TIMEOUT_SECONDS) as db:
+            command_active = db.execute(
+                "SELECT 1 FROM subscriptions WHERE enabled=1 AND command_until>? LIMIT 1",
+                (now_epoch,),
+            ).fetchone()
+            confirmation_active = db.execute(
+                "SELECT 1 FROM command_confirmations WHERE status='pending' AND expires_at>? LIMIT 1",
+                (now_epoch,),
+            ).fetchone()
+            if command_active is not None or confirmation_active is not None:
+                return "command_priority"
+
             expired_windows = [str(row[0]) for row in db.execute(
                 "SELECT subscription_id FROM subscriptions WHERE enabled=1 AND active_until<=? "
-                "AND status NOT IN ('idle','background','disabled','auth_required','cooldown')",
-                (now_epoch,),
+                "AND status NOT IN ('idle','background','disabled','auth_required','cooldown') LIMIT ?",
+                (now_epoch, batch),
             ).fetchall()]
             if expired_windows:
                 placeholders = ",".join("?" for _ in expired_windows)
                 expired_status = "background" if self.background_enabled else "idle"
                 db.execute(
-                    f"UPDATE subscriptions SET status=?, interactive_until=0, command_until=0, last_error=NULL, updated_at=? WHERE subscription_id IN ({placeholders})",
+                    f"UPDATE subscriptions SET status=?,interactive_until=0,command_until=0,last_error=NULL,updated_at=? "
+                    f"WHERE subscription_id IN ({placeholders})",
                     (expired_status, utc_iso(), *expired_windows),
                 )
-            # 1.12.74 — evento NAO entregue também tem horizonte.
-            #
-            # Até aqui a retenção só apagava o que já tinha sido entregue, então
-            # um evento que o site recusasse indefinidamente ficava na fila para
-            # sempre, tentando a cada 120 s. Foi assim que ~700 tentativas por
-            # dia se sustentaram por horas sem nada envelhecer.
-            #
-            # Esta é a metade que NÃO depende do site: mesmo com um site antigo,
-            # que não sabe marcar recusa permanente, a fila desiste sozinha na
-            # mesma janela em que já descartava o entregue. Telemetria com dias
-            # de atraso não tem valor — o próprio site poda o histórico dela.
-            desistidos = db.execute(
-                "UPDATE events SET status='failed', last_error=? WHERE status='pending' AND created_at<?",
-                ("A fila desistiu: nao entregue dentro da janela de retencao.", cutoff_iso),
-            ).rowcount
-            if desistidos:
+
+            stale_pending = [str(row[0]) for row in db.execute(
+                "SELECT event_id FROM events WHERE status='pending' AND created_at<? ORDER BY created_at ASC LIMIT ?",
+                (cutoff_iso, batch),
+            ).fetchall()]
+            if stale_pending:
+                placeholders = ",".join("?" for _ in stale_pending)
+                db.execute(
+                    f"UPDATE events SET status='failed',last_error=? WHERE event_id IN ({placeholders})",
+                    ("A fila desistiu: nao entregue dentro da janela de retencao.", *stale_pending),
+                )
                 LOG.warning(
                     "Fila de telemetria desistiu de %s evento(s) nao entregue(s) ha mais de %s dia(s).",
-                    desistidos,
+                    len(stale_pending),
                     self.retention_days,
                 )
-            # Terminal e velho sai do disco, tenha sido entregue ou descartado.
-            # Sem incluir 'failed' aqui, o descarte apenas trocaria um vazamento
-            # de repeticao por um vazamento de linhas.
-            db.execute(
-                "DELETE FROM events WHERE status IN ('delivered','failed') AND COALESCE(delivered_at, created_at)<?",
-                (cutoff_iso,),
-            )
+
+            old_delivered = [str(row[0]) for row in db.execute(
+                "SELECT event_id FROM events WHERE status='delivered' "
+                "AND COALESCE(delivered_at,created_at)<? ORDER BY created_at ASC LIMIT ?",
+                (cutoff_iso, batch),
+            ).fetchall()]
+            if old_delivered:
+                placeholders = ",".join("?" for _ in old_delivered)
+                db.execute(f"DELETE FROM events WHERE event_id IN ({placeholders})", old_delivered)
+
+            old_failed = [str(row[0]) for row in db.execute(
+                "SELECT event_id FROM events WHERE status='failed' AND created_at<? ORDER BY created_at ASC LIMIT ?",
+                (cutoff_iso, batch),
+            ).fetchall()]
+            if old_failed:
+                placeholders = ",".join("?" for _ in old_failed)
+                db.execute(f"DELETE FROM events WHERE event_id IN ({placeholders})", old_failed)
+
             total = int(db.execute("SELECT COUNT(*) FROM events").fetchone()[0])
             if total > self.queue_max:
-                excess = total - self.queue_max
-                db.execute(
-                    "DELETE FROM events WHERE event_id IN (SELECT event_id FROM events WHERE status IN ('delivered','failed') ORDER BY COALESCE(delivered_at, created_at) ASC LIMIT ?)",
-                    (excess,),
-                )
+                trim_limit = min(batch, total - self.queue_max)
+                terminal = [str(row[0]) for row in db.execute(
+                    "SELECT event_id FROM events WHERE status IN ('delivered','failed') "
+                    "ORDER BY created_at ASC LIMIT ?",
+                    (trim_limit,),
+                ).fetchall()]
+                if terminal:
+                    placeholders = ",".join("?" for _ in terminal)
+                    db.execute(f"DELETE FROM events WHERE event_id IN ({placeholders})", terminal)
+
+        # So uma passada realmente concluida abre o throttle historico de 60 segundos.
+        self._maintenance_last_at = time.time()
+        return "cleaned"
