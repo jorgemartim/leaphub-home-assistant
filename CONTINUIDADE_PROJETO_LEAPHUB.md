@@ -439,3 +439,10 @@ Proximo passo depois da suite: revisar o branch candidato, conferir CI e somente
 entao mesclar/publicar. Depois da publicacao, validar uma viagem real comparando:
 pontos unicos, intervalo entre timestamps do veiculo, velocidade maxima 1319,
 hodometro 1318 e geometria da rota.
+
+
+## Gateway 1.12.115 — Realtime Proximity Safety
+
+Base exata `89b47eca28f23b64c20f371dc3a9b6a2515c005e` (1.12.114 publicada). Ações `lock`, `unlock` e `trunk_open` originadas do Mobile por presença agora carregam deadline curto e não podem esperar conta/slot, sobreviver a cooldown de autenticação ou alcançar o dispatch depois de expiradas. Comandos manuais normais preservam a fila anterior. Nenhum payload físico, cadência, Trips/OCPP ou política de retry normal foi alterado.
+
+A publicação continua em duas fases: branch candidata -> CI/revisão -> merge/publicação. `config.yaml` permanece 1.12.114 no candidato.

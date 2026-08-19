@@ -55,7 +55,7 @@ except ModuleNotFoundError:
         EVENT_TRANSPORT = _event_transport_module.EVENT_TRANSPORT
 
 LOG = logging.getLogger("leaphub.telemetry")
-ENGINE_VERSION = "1.12.114"  # trip telemetry quality; command/physical contracts preserved
+ENGINE_VERSION = "1.12.115"  # realtime proximity expiry fence; cadence/physical contracts preserved
 
 # Hospedagem compartilhada (Apache/LiteSpeed) fecha a conexão ociosa em poucos
 # segundos. Reaproveitar depois disso escreve num socket já fechado e devolve
@@ -1902,6 +1902,7 @@ class TelemetryEngine:
     ) -> dict[str, Any]:
         self.begin_account_auth(environment, account_id, "command")
         try:
+            connector.ensure_realtime_proximity_fresh(payload)
             result = connector.handle_command(payload, progress=progress)
             self.record_account_auth_success(environment, account_id, "command")
             return result
@@ -2078,6 +2079,7 @@ class TelemetryEngine:
         except (TypeError, ValueError):
             account_id = 0
         if account_id < 1:
+            connector.ensure_realtime_proximity_fresh(payload)
             return connector.handle_command(payload, progress=progress)
 
         # 1.12.56 — nada entre a entrada do método e a trava de sessão tinha
@@ -2168,6 +2170,7 @@ class TelemetryEngine:
             try:
                 handle_started = time.monotonic()
                 try:
+                    connector.ensure_realtime_proximity_fresh(payload)
                     with self._dispatch_timeout(session["client"]):
                         result = connector.handle_command(
                             payload,
@@ -2241,6 +2244,7 @@ class TelemetryEngine:
                         "command_recovery",
                     )
                     try:
+                        connector.ensure_realtime_proximity_fresh(payload)
                         recovered = connector.handle_command(
                             payload,
                             progress=progress,

@@ -65,7 +65,7 @@ except ModuleNotFoundError:
         _event_transport_spec.loader.exec_module(_event_transport_module)
         EVENT_TRANSPORT = _event_transport_module.EVENT_TRANSPORT
 
-VERSION = "1.12.114"
+VERSION = "1.12.115"
 API_VERSION = 2
 CAPABILITY_SCHEMA_VERSION = 1
 MIN_SUPPORTED_CLIENT_API_VERSION = 1
@@ -262,6 +262,10 @@ def command_payload_hash(payload: dict[str, Any]) -> str:
         "vehicle_vin": str(payload.get("vehicle_vin") or "")[:40],
         "command": str(payload.get("command") or "")[:80],
         "parameters": payload.get("parameters") if isinstance(payload.get("parameters"), dict) else {},
+        # 1.12.115 — a idempotência inclui a natureza efêmera do pedido.
+        "request_origin": str(payload.get("request_origin") or "")[:40],
+        "realtime_proximity": bool(payload.get("realtime_proximity")),
+        "realtime_expires_at_epoch": int(payload.get("realtime_expires_at_epoch") or 0),
     }
     raw = json.dumps(safe, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=connector.json_default)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
@@ -966,6 +970,12 @@ def run_command_job(
             if command_cancel_requested(environment, request_id):
                 raise CommandCancelled("Solicitação cancelada antes do envio ao veículo.")
 
+        realtime_deadline = connector.realtime_proximity_deadline(payload)
+        realtime_proximity = realtime_deadline is not None
+
+        def ensure_realtime_fresh() -> None:
+            connector.ensure_realtime_proximity_fresh(payload)
+
         def progress(stage: str, message: str, extra: dict[str, Any] | None = None) -> None:
             command_journal_progress(request_hash, request_id, stage, message, extra)
 
@@ -974,61 +984,79 @@ def run_command_job(
         # andamento termina no próximo ponto seguro e libera a mesma sessão.
         ensure_not_cancelled()
         account_lock = account_operation_lock(environment, payload)
-        next_progress_at = 0.0
-        next_log_at = 15.0
-        progress(
-            "waiting_account",
-            "Aguardando a leitura atual terminar. O comando está na fila prioritária.",
-            {"queue_wait_seconds": 0, "waiting_for": "telemetry_or_account_operation"},
-        )
-        TELEMETRY.wake_event.set()
-        while not account_lock.acquire(timeout=0.5):
-            ensure_not_cancelled()
-            elapsed = time.monotonic() - queue_started
+        if realtime_proximity:
+            ensure_realtime_fresh()
+            if not account_lock.acquire(blocking=False):
+                raise connector.RealtimeProximityExpired(
+                    "A conta está ocupada; a intenção de proximidade foi descartada sem envio."
+                )
+        else:
+            next_progress_at = 0.0
+            next_log_at = 15.0
+            progress(
+                "waiting_account",
+                "Aguardando a leitura atual terminar. O comando está na fila prioritária.",
+                {"queue_wait_seconds": 0, "waiting_for": "telemetry_or_account_operation"},
+            )
             TELEMETRY.wake_event.set()
-            if elapsed >= next_progress_at:
-                holder = account_lock.snapshot()
-                owner = str(holder.get("owner") or "").lower()
-                waiting_for = "telemetry" if "telemetry" in owner else "account_operation"
-                progress(
-                    "waiting_account",
-                    "Aguardando a leitura atual terminar. O comando está na fila prioritária.",
-                    {"queue_wait_seconds": int(elapsed), "waiting_for": waiting_for},
-                )
-                next_progress_at = elapsed + 2.0
-            if elapsed >= next_log_at:
-                holder = account_lock.snapshot()
-                LOG.info(
-                    "Comando %s aguardando conta há %ss; ocupante=%s, ocupado_há=%ss.",
-                    request_id[:12],
-                    int(elapsed),
-                    str(holder.get("owner") or "desconhecido")[:80],
-                    int(float(holder.get("held_for_seconds") or 0)),
-                )
-                next_log_at = elapsed + 15.0
-            if elapsed >= MANUAL_QUEUE_SECONDS:
-                raise connector.ConnectorTemporaryError(
-                    "A leitura anterior excedeu a janela segura. O comando não foi enviado e pode ser tentado novamente."
-                )
+            while not account_lock.acquire(timeout=0.5):
+                ensure_not_cancelled()
+                elapsed = time.monotonic() - queue_started
+                TELEMETRY.wake_event.set()
+                if elapsed >= next_progress_at:
+                    holder = account_lock.snapshot()
+                    owner = str(holder.get("owner") or "").lower()
+                    waiting_for = "telemetry" if "telemetry" in owner else "account_operation"
+                    progress(
+                        "waiting_account",
+                        "Aguardando a leitura atual terminar. O comando está na fila prioritária.",
+                        {"queue_wait_seconds": int(elapsed), "waiting_for": waiting_for},
+                    )
+                    next_progress_at = elapsed + 2.0
+                if elapsed >= next_log_at:
+                    holder = account_lock.snapshot()
+                    LOG.info(
+                        "Comando %s aguardando conta há %ss; ocupante=%s, ocupado_há=%ss.",
+                        request_id[:12],
+                        int(elapsed),
+                        str(holder.get("owner") or "desconhecido")[:80],
+                        int(float(holder.get("held_for_seconds") or 0)),
+                    )
+                    next_log_at = elapsed + 15.0
+                if elapsed >= MANUAL_QUEUE_SECONDS:
+                    raise connector.ConnectorTemporaryError(
+                        "A leitura anterior excedeu a janela segura. O comando não foi enviado e pode ser tentado novamente."
+                    )
         account_acquired = True
         account_acquired_at = time.monotonic()
         ensure_not_cancelled()
+        ensure_realtime_fresh()
 
         progress(
             "waiting_slot",
             "Conta liberada. Aguardando uma vaga no Connector.",
             {"queue_wait_seconds": int(time.monotonic() - queue_started), "waiting_for": "connector_slot"},
         )
-        acquired = SEMAPHORE.acquire(timeout=max(30, MANUAL_WAIT_SECONDS), priority=True)
+        if realtime_proximity:
+            ensure_realtime_fresh()
+            acquired = SEMAPHORE.acquire(blocking=False, priority=True)
+        else:
+            acquired = SEMAPHORE.acquire(timeout=max(30, MANUAL_WAIT_SECONDS), priority=True)
         if not acquired:
+            if realtime_proximity:
+                raise connector.RealtimeProximityExpired(
+                    "O Connector está ocupado; a intenção de proximidade foi descartada sem envio."
+                )
             raise connector.ConnectorTemporaryError(
                 "A conta foi liberada, mas o Connector permaneceu ocupado. O comando não foi enviado."
             )
         slot_acquired_at = time.monotonic()
 
         ensure_not_cancelled()
+        ensure_realtime_fresh()
         progress("preparing", "Preparando a sessão autenticada para a ação.")
         ensure_not_cancelled()
+        ensure_realtime_fresh()
         execute_started_at = time.monotonic()
         result = TELEMETRY.execute_command(environment, payload, progress=progress)
         execute_finished_at = time.monotonic()
@@ -1173,14 +1201,26 @@ def run_command_job(
         defer_seconds = 0
         retry_after_seconds = 0
     except connector.ConnectorLoginCooldownError as exc:
-        retry_after_seconds = max(30, min(1800, int(exc.retry_after_seconds or 300)))
-        command_journal_wait_auth(request_hash, request_id, retry_after_seconds)
-        defer_seconds = 1
-        LOG.info(
-            "Comando %s aguardará %ss pelo desbloqueio temporário de autenticação; nenhuma nova tentativa será feita antes disso.",
-            request_id[:12],
-            retry_after_seconds,
-        )
+        if realtime_proximity:
+            retry_after_seconds = 0
+            defer_seconds = 0
+            command_journal_fail(
+                request_hash,
+                request_id,
+                connector.RealtimeProximityExpired(
+                    "Autenticação indisponível neste instante; presença descartada sem reenvio."
+                ),
+            )
+            LOG.info("Comando %s de proximidade descartado durante cooldown; sem retry.", request_id[:12])
+        else:
+            retry_after_seconds = max(30, min(1800, int(exc.retry_after_seconds or 300)))
+            command_journal_wait_auth(request_hash, request_id, retry_after_seconds)
+            defer_seconds = 1
+            LOG.info(
+                "Comando %s aguardará %ss pelo desbloqueio temporário de autenticação; nenhuma nova tentativa será feita antes disso.",
+                request_id[:12],
+                retry_after_seconds,
+            )
     except BaseException as exc:  # noqa: BLE001
         if connector.is_transient_cloud_error(exc) or isinstance(exc, connector.ConnectorTemporaryError):
             ORCHESTRATOR.record_cloud_failure(environment, payload.get("account_id") or payload.get("vehicle_id"))
