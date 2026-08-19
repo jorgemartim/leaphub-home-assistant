@@ -31,7 +31,7 @@ def test_probe_logs_each_raw_change(monkeypatch):
 
 def test_probe_is_wired_immediately_after_window_diag():
     source = (APP / "connector.py").read_text(encoding="utf-8")
-    window = source.index("log_window_telemetry_diag(window_positions, window_state, raw_window_signals)")
+    window = source.index("log_window_telemetry_diag(window_positions, window_state, raw_window_signals, vehicle_key=remote_id or vin)")
     probe_extract = source.index('raw_climate_probe = safe_climate_comfort_raw_signals(attribute(status, "raw"))', window)
     probe_log = source.index("log_climate_comfort_raw_probe(raw_climate_probe)", probe_extract)
     roof = source.index("roof_opening =", probe_log)
@@ -49,5 +49,6 @@ def test_physical_command_and_retry_guardrails():
 
 def test_window_guardrails():
     source = (APP / "connector.py").read_text(encoding="utf-8")
-    assert "WINDOW_TELEMETRY_DIAG positions=%s states=%s raw_candidates=%s" in source
+    assert "WINDOW_TELEMETRY_DIAG vehicle=%s positions=%s states=%s raw_candidates=%s" in source
+    assert "vehicle_key=remote_id or vin" in source
     assert 'native = 10 if command == "windows_open" else 0' in source

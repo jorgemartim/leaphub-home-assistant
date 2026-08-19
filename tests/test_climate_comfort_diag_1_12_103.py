@@ -118,5 +118,6 @@ def test_windows_and_sunshade_guardrails_are_unchanged():
     assert connector.SAFE_STATE_RETRY_COMMANDS == {"climate_on", "climate_off"}
     assert 'native = 10 if command == "windows_open" else 0' in source
     assert 'def effective_window_open(' in source
-    assert 'WINDOW_TELEMETRY_DIAG positions=%s states=%s raw_candidates=%s' in source
+    assert 'WINDOW_TELEMETRY_DIAG vehicle=%s positions=%s states=%s raw_candidates=%s' in source
+    assert 'vehicle_key=remote_id or vin' in source
     assert 'native = (percent + 5) // 10' in source

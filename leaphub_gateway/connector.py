@@ -1331,6 +1331,15 @@ WINDOW_DIAG_SIGNAL_IDS = frozenset({
     "1695", "1696",
 })
 _WINDOW_RAW_DIAG_LAST_SIGNATURE: str | None = None
+_WINDOW_RAW_DIAG_LAST_SIGNATURES: dict[str, str] = {}
+
+
+def window_diag_vehicle_token(remote_id: Any) -> str:
+    """Return a stable non-reversible label for window diagnostics."""
+    value = str(remote_id or "").strip()
+    if not value:
+        return "veh_unknown"
+    return "veh_" + hashlib.sha256(value.encode("utf-8")).hexdigest()[:10]
 
 
 def _window_diag_scalar(value: Any) -> bool | int | float | str | None:
@@ -1392,8 +1401,10 @@ def log_window_telemetry_diag(
     window_positions: dict[str, Any],
     window_state: dict[str, Any],
     raw_signals: dict[str, Any],
+    vehicle_key: Any | None = None,
 ) -> bool:
     global _WINDOW_RAW_DIAG_LAST_SIGNATURE
+    vehicle_token = window_diag_vehicle_token(vehicle_key)
     snapshot = {
         "positions": compact_mapping(window_positions),
         "states": compact_mapping(window_state),
@@ -1401,12 +1412,18 @@ def log_window_telemetry_diag(
     }
     encoded = json.dumps(snapshot, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=json_default)
     signature = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
-    if signature == _WINDOW_RAW_DIAG_LAST_SIGNATURE:
-        return False
-    _WINDOW_RAW_DIAG_LAST_SIGNATURE = signature
+    if vehicle_key is None:
+        if signature == _WINDOW_RAW_DIAG_LAST_SIGNATURE:
+            return False
+        _WINDOW_RAW_DIAG_LAST_SIGNATURE = signature
+    else:
+        if signature == _WINDOW_RAW_DIAG_LAST_SIGNATURES.get(vehicle_token):
+            return False
+        _WINDOW_RAW_DIAG_LAST_SIGNATURES[vehicle_token] = signature
     connector_log(
         logging.INFO,
-        "WINDOW_TELEMETRY_DIAG positions=%s states=%s raw_candidates=%s",
+        "WINDOW_TELEMETRY_DIAG vehicle=%s positions=%s states=%s raw_candidates=%s",
+        vehicle_token,
         json.dumps(snapshot["positions"], ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=json_default),
         json.dumps(snapshot["states"], ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=json_default),
         json.dumps(snapshot["raw_candidates"], ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=json_default),
@@ -2940,7 +2957,7 @@ def serialize_vehicle(
     }
 
     raw_window_signals = safe_window_raw_signals(attribute(status, "raw"))
-    log_window_telemetry_diag(window_positions, window_state, raw_window_signals)
+    log_window_telemetry_diag(window_positions, window_state, raw_window_signals, vehicle_key=remote_id or vin)
 
     # 1.12.105: probe no mesmo ponto comprovado pelas janelas.
     raw_climate_probe = safe_climate_comfort_raw_signals(attribute(status, "raw"))
