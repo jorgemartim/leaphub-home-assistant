@@ -44,7 +44,7 @@ except ImportError:
         _privacy_spec.loader.exec_module(_privacy_module)
         sanitize_log = _privacy_module.sanitize_log
 
-CONNECTOR_VERSION = "1.12.114"
+CONNECTOR_VERSION = "1.12.115"
 MAX_INPUT_BYTES = 1024 * 1024
 logging.getLogger("leapmotor_api").setLevel(logging.WARNING)
 LOGGER = logging.getLogger("leaphub.connector")
@@ -56,6 +56,39 @@ def connector_log(level: int, message: str, *args: Any) -> None:
         LOGGER.log(level, message, *args)
     except Exception:
         pass
+
+
+# 1.12.115 — comandos derivados de presença física são efêmeros.
+# Eles não podem sobreviver a fila, cooldown de autenticação ou preparação longa.
+REALTIME_PROXIMITY_COMMANDS = frozenset({"lock", "unlock", "trunk_open"})
+REALTIME_PROXIMITY_MAX_FUTURE_SECONDS = 20.0
+
+
+class RealtimeProximityExpired(RuntimeError):
+    """A presença que autorizou a ação deixou de ser temporalmente válida."""
+
+
+def realtime_proximity_deadline(payload: dict[str, Any]) -> float | None:
+    if not bool(payload.get("realtime_proximity")):
+        return None
+    command = str(payload.get("command") or "").strip().lower()
+    origin = str(payload.get("request_origin") or "").strip().lower()
+    if command not in REALTIME_PROXIMITY_COMMANDS or origin != "mobile_proximity":
+        raise RealtimeProximityExpired("Contexto de proximidade inválido; comando não enviado.")
+    try:
+        deadline = float(payload.get("realtime_expires_at_epoch") or 0)
+    except (TypeError, ValueError):
+        deadline = 0.0
+    now = time.time()
+    if deadline <= now:
+        raise RealtimeProximityExpired("A presença física expirou; comando não enviado.")
+    if deadline > now + REALTIME_PROXIMITY_MAX_FUTURE_SECONDS:
+        raise RealtimeProximityExpired("Janela de presença inválida; comando não enviado.")
+    return deadline
+
+
+def ensure_realtime_proximity_fresh(payload: dict[str, Any]) -> None:
+    realtime_proximity_deadline(payload)
 
 
 CLIMATE_VERIFY_COMMANDS = {"climate_on", "climate_off", "quick_cool", "quick_heat"}
@@ -4667,6 +4700,7 @@ def handle_command(
     borrowed_client: Any | None = None,
     borrowed_vehicles: list[Any] | None = None,
 ) -> dict[str, Any]:
+    ensure_realtime_proximity_fresh(payload)
     """Execute one remote action with a wake-aware climate sequence.
 
     Locking and access commands are never repeated automatically. Climate on/off
@@ -4874,6 +4908,9 @@ def handle_command(
         })
         command_attempts = max(command_attempts, attempt)
         try:
+            # Último fence antes da escrita física na nuvem. Sessão/login/resolve
+            # podem ter consumido a janela desde que o Site recebeu a presença.
+            ensure_realtime_proximity_fresh(payload)
             dispatched = timed_remote_call(
                 execute_vehicle_command_ack_first,
                 method,
@@ -5071,6 +5108,7 @@ def handle_command(
                 safe_retry_performed = True
                 retry_error: Exception | None = None
                 try:
+                    ensure_realtime_proximity_fresh(payload)
                     retry_dispatched = timed_remote_call(
                         execute_vehicle_command_ack_first,
                         method,
