@@ -1,24 +1,34 @@
 from pathlib import Path
+import re
 
 ROOT = Path(__file__).resolve().parents[1]
-CONNECTOR = (ROOT / "leaphub_gateway" / "connector.py").read_text(encoding="utf-8")
-SERVER = (ROOT / "leaphub_gateway" / "connector_server.py").read_text(encoding="utf-8")
-TELEMETRY = (ROOT / "leaphub_gateway" / "telemetry_engine.py").read_text(encoding="utf-8")
-CONFIG = (ROOT / "leaphub_gateway" / "config.yaml").read_text(encoding="utf-8")
+APP = ROOT / "leaphub_gateway"
+CONNECTOR = (APP / "connector.py").read_text(encoding="utf-8")
+SERVER = (APP / "connector_server.py").read_text(encoding="utf-8")
+TELEMETRY = (APP / "telemetry_engine.py").read_text(encoding="utf-8")
+CONFIG = (APP / "config.yaml").read_text(encoding="utf-8")
+TARGET = (APP / "RELEASE_TARGET").read_text(encoding="utf-8").strip()
+
+
+def _version_tuple(value: str) -> tuple[int, ...]:
+    return tuple(int(part) for part in value.split("."))
 
 
 def test_release_version_and_staged_publication():
-    assert 'CONNECTOR_VERSION = "1.12.115"' in CONNECTOR
-    assert 'VERSION = "1.12.115"' in SERVER
-    assert 'ENGINE_VERSION = "1.12.115"' in TELEMETRY
-    # O repositorio candidato permanece em 1.12.114 ate a imagem GHCR ficar
-    # publica. validate_repository.py, porem, roda os contratos historicos em
-    # uma copia efemera promovida para 1.12.115. O guard de publicacao do
-    # validador principal garante que o config real nunca seja adiantado.
-    assert (
-        'version: "1.12.114"' in CONFIG
-        or 'version: "1.12.115"' in CONFIG
+    # 1.12.116: release metadata follows RELEASE_TARGET instead of pinning
+    # this feature regression test forever to 1.12.115. All proximity and
+    # physical-safety assertions below remain unchanged.
+    assert f'CONNECTOR_VERSION = "{TARGET}"' in CONNECTOR
+    assert f'VERSION = "{TARGET}"' in SERVER
+    assert f'ENGINE_VERSION = "{TARGET}"' in TELEMETRY
+
+    match = re.search(
+        r'^version:\s*"([^"]+)"\s*$',
+        CONFIG,
+        flags=re.MULTILINE,
     )
+    assert match is not None
+    assert _version_tuple(match.group(1)) <= _version_tuple(TARGET)
 
 
 def test_realtime_scope_is_only_mobile_presence_commands():

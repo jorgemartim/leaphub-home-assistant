@@ -446,3 +446,26 @@ hodometro 1318 e geometria da rota.
 Base exata `89b47eca28f23b64c20f371dc3a9b6a2515c005e` (1.12.114 publicada). Ações `lock`, `unlock` e `trunk_open` originadas do Mobile por presença agora carregam deadline curto e não podem esperar conta/slot, sobreviver a cooldown de autenticação ou alcançar o dispatch depois de expiradas. Comandos manuais normais preservam a fila anterior. Nenhum payload físico, cadência, Trips/OCPP ou política de retry normal foi alterado.
 
 A publicação continua em duas fases: branch candidata -> CI/revisão -> merge/publicação. `config.yaml` permanece 1.12.114 no candidato.
+
+## Gateway 1.12.116 - Window Diagnostics Per Vehicle
+
+Published 1.12.115 base: `ee77a67d3a1db6b1893a5b0940ca1bdfe6444635`. D1 was merged into main by PR #17
+at `6a601c35212e460d9ae1b8e7eda76d98614eb93c` (functional head `533ee61fe800bbbe43b0770d66b4590f92f4c562`).
+
+Done: WINDOW_TELEMETRY_DIAG now uses a stable `veh_<hash>` vehicle token and
+per-vehicle deduplication. The legacy three-argument API is preserved.
+The stale release-number assertion in the 1.12.115 proximity regression test
+now derives runtime metadata from RELEASE_TARGET; all proximity safety checks
+remain unchanged.
+
+Frozen: physical payloads, C10 scaling, ACK_FIRST, SAFE retry, mechanical
+fence, FAST confirmation, proximity 1.12.115, Trips, OCPP, maintenance,
+SQLite writer and the single Leapmotor session/client architecture.
+
+Publication: RELEASE_TARGET is staged at 1.12.116 while config.yaml remains
+1.12.115. GitHub Actions must build/test the GHCR 1.12.116 image and verify
+anonymous access before the bot promotes config.yaml to 1.12.116.
+
+Next field step after installation: repeat window/sunshade commands, collect
+`vehicle=veh_*` logs and separate library dispatch latency from physical state
+confirmation latency. No physical acceleration is included in this release.
