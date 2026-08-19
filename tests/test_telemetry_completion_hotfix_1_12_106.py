@@ -44,7 +44,7 @@ def test_broken_preassignment_call_is_gone():
 
 def test_raw_probe_remains_at_early_proven_point():
     src = source()
-    window = src.index("log_window_telemetry_diag(window_positions, window_state, raw_window_signals)")
+    window = src.index("log_window_telemetry_diag(window_positions, window_state, raw_window_signals, vehicle_key=remote_id or vin)")
     probe = src.index("log_climate_comfort_raw_probe(raw_climate_probe)", window)
     roof = src.index("roof_opening =", probe)
     assert window < probe < roof
@@ -59,5 +59,6 @@ def test_retry_and_physical_routes_unchanged():
 
 def test_window_guardrails_preserved():
     src = source()
-    assert "WINDOW_TELEMETRY_DIAG positions=%s states=%s raw_candidates=%s" in src
+    assert "WINDOW_TELEMETRY_DIAG vehicle=%s positions=%s states=%s raw_candidates=%s" in src
+    assert "vehicle_key=remote_id or vin" in src
     assert 'native = 10 if command == "windows_open" else 0' in src
