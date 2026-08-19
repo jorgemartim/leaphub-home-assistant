@@ -11,7 +11,14 @@ def test_release_version_and_staged_publication():
     assert 'CONNECTOR_VERSION = "1.12.115"' in CONNECTOR
     assert 'VERSION = "1.12.115"' in SERVER
     assert 'ENGINE_VERSION = "1.12.115"' in TELEMETRY
-    assert 'version: "1.12.114"' in CONFIG
+    # O repositorio candidato permanece em 1.12.114 ate a imagem GHCR ficar
+    # publica. validate_repository.py, porem, roda os contratos historicos em
+    # uma copia efemera promovida para 1.12.115. O guard de publicacao do
+    # validador principal garante que o config real nunca seja adiantado.
+    assert (
+        'version: "1.12.114"' in CONFIG
+        or 'version: "1.12.115"' in CONFIG
+    )
 
 
 def test_realtime_scope_is_only_mobile_presence_commands():
