@@ -469,3 +469,19 @@ anonymous access before the bot promotes config.yaml to 1.12.116.
 Next field step after installation: repeat window/sunshade commands, collect
 `vehicle=veh_*` logs and separate library dispatch latency from physical state
 confirmation latency. No physical acceleration is included in this release.
+
+## Gateway 1.12.117 - correcao do fechamento da cortina
+
+Base publicada: `70e045d77682db800ef19b72c2b8111bcada989b` (1.12.116).
+
+Correcao: sunshade_close passa pelo control_sunshade com 0%, reutilizando o
+caminho de posicao existente e gerando uma unica chamada com valor nativo "0".
+A linha historica `if command == "sunshade_position":` permanece intacta;
+o fechamento e normalizado imediatamente antes dela para preservar os
+contratos 1.12.98, 1.12.99 e 1.12.100.
+
+Congelado: abertura da cortina, posicao intermediaria, janelas, ACK_FIRST,
+SAFE retry, fence mecanico, clima, trunk, proximidade, Trips, OCPP, SQLite
+writer, confirmacao FAST e cadencias.
+
+Gate: publicar somente se validator local e Actions/Linux ficarem verdes.

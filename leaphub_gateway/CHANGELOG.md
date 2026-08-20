@@ -1,18 +1,17 @@
-## 1.12.116
+## 1.12.117
 
-A distribuição continua pré-compilada no GHCR oficial e mantém a
-publicação em duas fases.
+A distribuição continua pré-compilada no GHCR oficial e mantém a publicação em duas fases.
 
-- WINDOW_TELEMETRY_DIAG passa a incluir um token estável por veículo
-  veh_<hash>, sem gravar o identificador bruto do veículo nos logs;
-- a deduplicação do diagnóstico de janelas passa a ser isolada por
-  veículo, em vez de global;
-- a API legada de 3 argumentos de log_window_telemetry_diag permanece
-  compatível;
-- escala nativa C10 das janelas, fence mecânico, ACK_FIRST e SAFE retry
-  permanecem inalterados;
-- nenhum payload físico, timeout de atuação, quantidade de transmissões,
-  Trips, OCPP, SQLite writer, regra de proximidade ou cadência de confirmação
-  foi alterado;
-- config.yaml permanece intencionalmente em 1.12.115 até o CI construir,
-  testar e confirmar acesso anônimo à imagem GHCR 1.12.116.
+- corrige somente o fechamento da cortina do teto;
+- sunshade_close passa pelo mesmo control_sunshade usado pela posição,
+  enviando explicitamente o valor nativo 0;
+- sunshade_open permanece em open_sunshade;
+- sunshade_position e sua conversão 0-100 -> 0-10 permanecem inalterados;
+- continua existindo uma unica transmissão por intencao de cortina;
+- nenhum retry fisico novo foi adicionado;
+- janelas e cortina continuam fora de ACK_FIRST e preservam o fence mecanico;
+- SAFE_STATE_RETRY_COMMANDS continua somente climate_on/climate_off;
+- proximidade, janelas, trunk, clima, Trips, OCPP, SQLite writer e cadencias
+  permanecem congelados;
+- config.yaml permanece em 1.12.116 ate o CI construir, testar, fazer smoke
+  test e confirmar acesso anonimo a imagem GHCR 1.12.117.

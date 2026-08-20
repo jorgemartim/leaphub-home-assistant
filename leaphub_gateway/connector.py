@@ -44,7 +44,7 @@ except ImportError:
         _privacy_spec.loader.exec_module(_privacy_module)
         sanitize_log = _privacy_module.sanitize_log
 
-CONNECTOR_VERSION = "1.12.116"
+CONNECTOR_VERSION = "1.12.117"
 MAX_INPUT_BYTES = 1024 * 1024
 logging.getLogger("leapmotor_api").setLevel(logging.WARNING)
 LOGGER = logging.getLogger("leaphub.connector")
@@ -116,7 +116,7 @@ COMMAND_METHODS: dict[str, str] = {
     "windows_open": "open_windows",
     "windows_close": "close_windows",
     "sunshade_open": "open_sunshade",
-    "sunshade_close": "close_sunshade",
+    "sunshade_close": "control_sunshade",
     # 1.12.69 — cortina numa posição intermediária, no mesmo cmd 161 e direito
     # 161 dos dois acima. A ESCALA NÃO É A MESMA DAS JANELAS: a biblioteca
     # documenta a cortina em 0-10 (`SunshadeValue.OPEN = "10"`), enquanto a
@@ -4003,6 +4003,11 @@ def execute_vehicle_command(
             )
             return method(vehicle_id, value=str(native))
         return method(vehicle_id, value=str(position))
+    # 1.12.117 - close uses the proven native position path.
+    if command == "sunshade_close":
+        parameters = dict(parameters or {})
+        parameters["sunshade_position"] = 0
+        command = "sunshade_position"
     if command == "sunshade_position":
         # A cortina é o único comando desta matriz em que a escala de LEITURA e a
         # de ESCRITA não coincidem, e é por isso que a conversão vive aqui e não

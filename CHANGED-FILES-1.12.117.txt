@@ -1,0 +1,17 @@
+CHANGED-FILES-1.12.117.txt
+CONTINUIDADE_PROJETO_LEAPHUB.md
+GITHUB-RECOVERY-1.12.117.md
+RELEASE-1.12.117.md
+leaphub_gateway/CHANGELOG.md
+leaphub_gateway/Dockerfile
+leaphub_gateway/RELEASE-1.12.117.md
+leaphub_gateway/RELEASE_TARGET
+leaphub_gateway/connector.py
+leaphub_gateway/connector_server.py
+leaphub_gateway/gateway_manager.py
+leaphub_gateway/ocpp_gateway.py
+leaphub_gateway/official_trip_probe.py
+leaphub_gateway/privacy.py
+leaphub_gateway/telemetry_engine.py
+tests/test_remote_command_matrix.py
+tests/test_sunshade_close_explicit_zero_1_12_117.py

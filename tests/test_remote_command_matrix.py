@@ -21,7 +21,7 @@ expected_methods = {
     "windows_open": "open_windows",
     "windows_close": "close_windows",
     "sunshade_open": "open_sunshade",
-    "sunshade_close": "close_sunshade",
+    "sunshade_close": "control_sunshade",
     # 1.12.69 — mesmo cmd 161 dos dois acima, numa posição intermediária.
     # `control_sunshade` é o método que aceita `value`; `open_sunshade` também o
     # aceita, mas mandar o extremo com valor confundiria os dois papéis.
