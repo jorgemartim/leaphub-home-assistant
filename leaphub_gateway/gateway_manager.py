@@ -18,13 +18,14 @@ import threading
 import time
 import urllib.request
 from collections import deque
+from contextlib import closing
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-VERSION = "1.12.117"
+VERSION = "1.12.118"
 OPTIONS_PATH = Path(os.getenv("LEAPHUB_OPTIONS_PATH", "/data/options.json"))
 RUNTIME = Path(os.getenv("LEAPHUB_RUNTIME_DIR", "/data/runtime"))
 LOG_DIR = Path(os.getenv("LEAPHUB_LOG_DIR", "/data/logs"))
@@ -536,7 +537,7 @@ def telemetry_summary() -> dict[str, Any]:
     try:
         import sqlite3
         uri = f"file:{db_path.as_posix()}?mode=ro"
-        with sqlite3.connect(uri, uri=True, timeout=0.5) as db:
+        with closing(sqlite3.connect(uri, uri=True, timeout=0.5)) as db:
             db.execute("PRAGMA query_only=ON")
             db.execute("PRAGMA busy_timeout=500")
             subscriptions = int(db.execute("SELECT COUNT(*) FROM subscriptions WHERE enabled=1").fetchone()[0])

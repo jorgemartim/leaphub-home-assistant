@@ -65,7 +65,7 @@ except ModuleNotFoundError:
         _event_transport_spec.loader.exec_module(_event_transport_module)
         EVENT_TRANSPORT = _event_transport_module.EVENT_TRANSPORT
 
-VERSION = "1.12.117"
+VERSION = "1.12.118"
 API_VERSION = 2
 CAPABILITY_SCHEMA_VERSION = 1
 MIN_SUPPORTED_CLIENT_API_VERSION = 1
@@ -278,10 +278,20 @@ def _chmod_private(path: Path) -> None:
         pass
 
 
+class ClosingSQLiteConnection(sqlite3.Connection):
+    """Preserve commit/rollback semantics and close when leaving ``with``."""
+
+    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> bool:
+        try:
+            return bool(super().__exit__(exc_type, exc_value, traceback))
+        finally:
+            self.close()
+
+
 def initialize_command_db() -> None:
     """Prepare the journal once; request threads must never renegotiate journal mode."""
     COMMAND_DB_PATH.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    with sqlite3.connect(COMMAND_DB_PATH, timeout=10.0) as db:
+    with sqlite3.connect(COMMAND_DB_PATH, timeout=10.0, factory=ClosingSQLiteConnection) as db:
         db.execute("PRAGMA busy_timeout = 10000")
         db.execute("PRAGMA journal_mode = WAL")
         db.execute("PRAGMA synchronous = NORMAL")
@@ -298,7 +308,7 @@ def initialize_command_db() -> None:
 def command_db(timeout: float = 0.75) -> sqlite3.Connection:
     COMMAND_DB_PATH.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     timeout = max(0.05, min(5.0, float(timeout)))
-    db = sqlite3.connect(COMMAND_DB_PATH, timeout=timeout)
+    db = sqlite3.connect(COMMAND_DB_PATH, timeout=timeout, factory=ClosingSQLiteConnection)
     db.row_factory = sqlite3.Row
     db.execute(f"PRAGMA busy_timeout = {max(50, int(timeout * 1000))}")
     db.execute("PRAGMA synchronous = NORMAL")
@@ -1549,7 +1559,7 @@ def cleanup_nonces(now: float) -> None:
 
 def initialize_nonce_db() -> None:
     NONCE_DB_PATH.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    with sqlite3.connect(NONCE_DB_PATH, timeout=10.0) as db:
+    with sqlite3.connect(NONCE_DB_PATH, timeout=10.0, factory=ClosingSQLiteConnection) as db:
         db.execute("PRAGMA busy_timeout = 10000")
         db.execute("PRAGMA journal_mode = WAL")
         db.execute("PRAGMA synchronous = NORMAL")
@@ -1576,7 +1586,11 @@ def remember_nonce(environment: str, nonce: str, now: float) -> None:
         if delay > 0:
             time.sleep(delay)
         try:
-            with NONCE_DB_LOCK, sqlite3.connect(NONCE_DB_PATH, timeout=2.5) as db:
+            with NONCE_DB_LOCK, sqlite3.connect(
+                NONCE_DB_PATH,
+                timeout=2.5,
+                factory=ClosingSQLiteConnection,
+            ) as db:
                 db.execute("PRAGMA busy_timeout = 2500")
                 db.execute("PRAGMA journal_mode = WAL")
                 db.execute("PRAGMA synchronous = NORMAL")

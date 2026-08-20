@@ -8,6 +8,7 @@ import sys
 import tempfile
 import threading
 import time
+from contextlib import closing
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -29,6 +30,17 @@ connector = load_module("leaphub_connector", APP / "connector.py")
 telemetry = load_module("leaphub_telemetry_resilience", APP / "telemetry_engine.py")
 
 failures: list[str] = []
+
+_ENV_KEYS = (
+    "LEAPHUB_TELEMETRY_DIR",
+    "LEAPHUB_RUNTIME_DIR",
+    "LEAPHUB_OCPP_STATE_DB",
+    "LEAPHUB_LOG_FILE",
+    "LEAPHUB_STATUS_FILE",
+    "LEAPHUB_PID_FILE",
+    "LEAPHUB_OCPP_QUEUE_MAX",
+)
+_ORIGINAL_ENV = {key: os.environ.get(key) for key in _ENV_KEYS}
 
 
 def check(condition: bool, message: str) -> None:
@@ -201,13 +213,13 @@ with tempfile.TemporaryDirectory(prefix="leaphub-ocpp-resilience-") as tmp:
     for index in range(105):
         action = "Heartbeat" if index < 80 else "StatusNotification"
         ocpp.queue_event(target, "CP-SYNTHETIC", f"msg-{index}", action, {"n": index}, "offline")
-    with ocpp.state_db() as db:
+    with closing(ocpp.state_db()) as db:
         rows = db.execute("SELECT message_id,ocpp_action FROM event_queue ORDER BY id").fetchall()
     check(len(rows) <= 100, "Fila OCPP ultrapassou o limite configurado")
     check(ocpp.has_pending_event(target, "CP-SYNTHETIC"), "Backlog OCPP não foi detectado")
     for index in range(105):
         ocpp.queue_command_result(target, "CP-SYNTHETIC", index + 1, "completed", {"n": index}, "", "offline")
-    with ocpp.state_db() as db:
+    with closing(ocpp.state_db()) as db:
         result_count = int(db.execute("SELECT COUNT(*) FROM command_result_queue").fetchone()[0])
     check(result_count <= 100, "Fila de resultados OCPP ultrapassou o limite configurado")
 
@@ -242,6 +254,12 @@ with tempfile.TemporaryDirectory(prefix="leaphub-ocpp-resilience-") as tmp:
         check(isinstance(future.exception(), ConnectionError), "Comando pendente não recebeu erro de conexão")
 
     asyncio.run(pending_disconnect_test())
+
+for key, value in _ORIGINAL_ENV.items():
+    if value is None:
+        os.environ.pop(key, None)
+    else:
+        os.environ[key] = value
 
 if failures:
     raise SystemExit("resilience 1.12.15 failed:\n- " + "\n- ".join(failures))
