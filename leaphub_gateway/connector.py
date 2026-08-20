@@ -44,7 +44,7 @@ except ImportError:
         _privacy_spec.loader.exec_module(_privacy_module)
         sanitize_log = _privacy_module.sanitize_log
 
-CONNECTOR_VERSION = "1.12.118"
+CONNECTOR_VERSION = "1.12.119"
 MAX_INPUT_BYTES = 1024 * 1024
 logging.getLogger("leapmotor_api").setLevel(logging.WARNING)
 LOGGER = logging.getLogger("leaphub.connector")
@@ -223,6 +223,18 @@ RAW_PAYLOAD_COMMANDS = frozenset({"seat_adjust", "piloted_parking"})
 # sonda do Sentinela nem carregue os campos de diagnóstico dele.
 SENTRY_COMMANDS = frozenset({"sentry_on", "sentry_off"})
 ALL_COMMAND_METHODS: dict[str, str] = {**COMMAND_METHODS, **EXPERIMENTAL_COMMAND_METHODS}
+
+# Payloads capturados do aplicativo internacional e validados pela integração
+# kerniger/leapmotor-ha. A leapmotor-api 0.3.2 ainda usa "on"/"off" nesses
+# quatro comandos; a nuvem aceita esse envelope legado, mas o C10 não atua.
+# O override fica no gateway para preservar a dependência fixada e limitar a
+# mudança exatamente aos dois controles homologados em campo.
+VERIFIED_COMFORT_COMMAND_CONTENT: dict[str, str] = {
+    "steering_wheel_heat_on": '{"level":"2"}',
+    "steering_wheel_heat_off": '{"level":"1"}',
+    "rearview_mirror_heat_on": '{"value":"2"}',
+    "rearview_mirror_heat_off": '{"value":"1"}',
+}
 
 # Direito (VehicleRight) exigido por cada comando. Serve para filtrar a matriz
 # conforme a capacidade real de cada veículo (um C10 REEV expõe fuel_heating; um
@@ -3946,6 +3958,28 @@ def execute_vehicle_command(
     climate_profile: str = "generic",
     window_native_scale: int = 100,
 ) -> Any:
+    if command in VERIFIED_COMFORT_COMMAND_CONTENT:
+        # 1.12.119 — a API pública da biblioteca não expõe cmd_content, mas o
+        # primitivo interno usado pelos próprios métodos aceita override. Falhar
+        # fechado é mais seguro do que voltar silenciosamente ao payload legado
+        # que já produziu ACK sem efeito físico no C10.
+        client = getattr(method, "__self__", None)
+        remote_control = getattr(client, "_remote_control", None)
+        if not callable(remote_control):
+            raise RuntimeError(
+                "A versão instalada da biblioteca não permite o payload de conforto verificado."
+            )
+        cmd_content = VERIFIED_COMFORT_COMMAND_CONTENT[command]
+        connector_log(
+            logging.INFO,
+            "CLIMATE_DIAG event=comfort_dispatch comando=%s payload_verificado=True tentativas_fisicas=1",
+            command,
+        )
+        return remote_control(
+            vin=vehicle_id,
+            action=ALL_COMMAND_METHODS[command],
+            cmd_content=cmd_content,
+        )
     # 1.12.79 — C10/B10/B05: AUTO é um cmd 170 completo e OFF é ac_switch
     # operate=off. O parâmetro climate_profile permanece apenas por compatibilidade
     # de chamada nesta release; ele não participa mais do despacho.

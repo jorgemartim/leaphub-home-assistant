@@ -13,16 +13,19 @@ from PIL import Image
 
 ROOT = Path(__file__).resolve().parents[1]
 APP = ROOT / "leaphub_gateway"
-TARGET = "1.12.118"
+TARGET = (APP / "RELEASE_TARGET").read_text(encoding="utf-8").strip()
 
 
 def test_release_versions_and_dependency_pins() -> None:
     requirements = (APP / "requirements.txt").read_text(encoding="utf-8").splitlines()
     assert "cryptography==50.0.0" in requirements
     assert "Pillow==12.3.0" in requirements
+    assert tuple(map(int, TARGET.split("."))) >= (1, 12, 118)
     assert (APP / "RELEASE_TARGET").read_text(encoding="utf-8").strip() == TARGET
     config = (APP / "config.yaml").read_text(encoding="utf-8")
-    assert ('version: "1.12.117"' in config) != ('version: "1.12.118"' in config)
+    target_parts = list(map(int, TARGET.split(".")))
+    previous = ".".join(map(str, (*target_parts[:2], target_parts[2] - 1)))
+    assert (f'version: "{previous}"' in config) != (f'version: "{TARGET}"' in config)
 
     expected = {
         "connector.py": f'CONNECTOR_VERSION = "{TARGET}"',

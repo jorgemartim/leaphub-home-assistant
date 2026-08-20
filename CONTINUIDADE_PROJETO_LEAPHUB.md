@@ -503,3 +503,14 @@ Validação: `pip check` limpo; dependências exatas importadas; `13/13` contrat
 direcionados; gate do CI com `608/608` testes principais e `5/5` legados.
 
 Estado: candidato local, ainda sem push, build GHCR ou instalação.
+## Gateway 1.12.119 — payloads verificados de volante e retrovisores
+
+Teste físico de 20/08/2026: `steering_wheel_heat_on` da 1.12.118 terminou sem
+exceção, mas o volante não aqueceu e a telemetria continuou em zero. A causa é o
+payload legado da leapmotor-api 0.3.2 (`value=on/off`). A captura verificada do
+aplicativo internacional usa `level=2/1` no cmd 320 e `value=2/1` no cmd 440.
+
+A 1.12.119 sobrescreve somente o `cmd_content` desses quatro comandos. Não há
+retry, migration, exclusão, recálculo ou mudança em dados coletados. Próxima
+homologação, sempre com o veículo parado: volante ON, volante OFF, retrovisor ON
+e retrovisor OFF, uma transmissão por vez, comparando efeito físico e telemetria.
