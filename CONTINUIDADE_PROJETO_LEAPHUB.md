@@ -514,3 +514,14 @@ A 1.12.119 sobrescreve somente o `cmd_content` desses quatro comandos. Não há
 retry, migration, exclusão, recálculo ou mudança em dados coletados. Próxima
 homologação, sempre com o veículo parado: volante ON, volante OFF, retrovisor ON
 e retrovisor OFF, uma transmissão por vez, comparando efeito físico e telemetria.
+
+## Gateway 1.12.120 — confirmação rápida de conforto
+
+Evidência de 20/08/2026: `quick_heat` foi despachado em 606 ms e anunciado ao
+site em menos de um segundo, mas a confirmação física demorou 40 s. A causa foi
+o salto da cadência FAST entre as leituras acumuladas de 18 s e 42 s.
+
+A 1.12.120 mantém a escada histórica para comandos mecânicos e usa
+5/5/8/10/10/12/... somente para clima, desembaçador, volante e retrovisores.
+É releitura de telemetria, sem retry ou reenvio físico. Não há migration,
+exclusão, recálculo, alteração de schema ou perda de dados coletados.

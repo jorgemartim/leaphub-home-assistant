@@ -57,7 +57,9 @@ def test_runtime_early_confirmation_is_command_only() -> None:
             # API historica permanece estrutural; o front-load e aplicado apenas no scheduler.
             assert observed == list(engine.command_cadence)
             poll_source = SOURCE[SOURCE.index("    def _poll_subscription("):SOURCE.index("    def _mark_auth_required(", SOURCE.index("    def _poll_subscription("))]
-            assert "interval = int(self.command_effective_cadence[cadence_index])" in poll_source
+            # 1.12.120 seleciona a escada por família; o valor histórico
+            # continua em `engine.command_effective_cadence` e foi validado acima.
+            assert "interval = int(active_cadence[cadence_index])" in poll_source
             for state in ("parked", "sleep", "charge_watch"):
                 interval, _state, _streak = engine._adaptive_interval([state], 0, interactive=True)
                 assert 5 <= interval <= 6

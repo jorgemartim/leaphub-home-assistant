@@ -55,7 +55,7 @@ except ModuleNotFoundError:
         EVENT_TRANSPORT = _event_transport_module.EVENT_TRANSPORT
 
 LOG = logging.getLogger("leaphub.telemetry")
-ENGINE_VERSION = "1.12.119"  # verified C10 steering-wheel and mirror-heating payloads
+ENGINE_VERSION = "1.12.120"  # bounded FAST cadence for comfort confirmation
 
 # Hospedagem compartilhada (Apache/LiteSpeed) fecha a conexão ociosa em poucos
 # segundos. Reaproveitar depois disso escreve num socket já fechado e devolve
@@ -176,6 +176,18 @@ CONFIRMATION_SUPERSESSION_GROUP = {
     for family, commands in CONFIRMATION_SUPERSESSION_FAMILIES.items()
     for command in commands
 }
+
+# 1.12.120 — clima e aquecimentos do C10 compartilham a mesma propagação mais
+# lenta de estado na nuvem. Em campo, `quick_heat` foi despachado em 606 ms,
+# mas a confirmação só foi lida aos 40 s porque a escada FAST saltava de 18 s
+# para 42 s. Esta família recebe uma cadência própria e limitada; trava,
+# vidros, cortina, porta-malas e recarga preservam integralmente a escada já
+# homologada. É somente releitura: nunca reenvia o comando físico.
+COMFORT_FAST_CONFIRMATION_COMMANDS = frozenset().union(
+    CONFIRMATION_SUPERSESSION_FAMILIES["climate"],
+    CONFIRMATION_SUPERSESSION_FAMILIES["steering_heat"],
+    CONFIRMATION_SUPERSESSION_FAMILIES["mirror_heat"],
+)
 
 
 def utc_iso() -> str:
@@ -441,6 +453,7 @@ class TelemetryEngine:
     # contradizendo o código logo abaixo dele.
     COMMAND_FIRST_POLL_CEILING_SECONDS = 6
     COMMAND_POST_DISPATCH_EARLY_CADENCE = (5, 5, 8)  # 1.12.96: somente janela pós-despacho
+    COMMAND_COMFORT_POST_DISPATCH_CADENCE = (5, 5, 8, 10, 10, 12, 24, 34, 45, 60, 90)
 
     # 1.12.77 — teto da cadência com a tela aberta.
     #
@@ -645,6 +658,7 @@ class TelemetryEngine:
             *self.COMMAND_POST_DISPATCH_EARLY_CADENCE,
             *self.command_cadence[len(self.COMMAND_POST_DISPATCH_EARLY_CADENCE):],
         )
+        self.command_comfort_effective_cadence = self.COMMAND_COMFORT_POST_DISPATCH_CADENCE
         self.charging_seconds = self._bounded("telemetry_charging_seconds", 25, 15, 600)
         self.parked_seconds = self._bounded("telemetry_parked_seconds", 90, 60, 3600)
         self.sleep_seconds = self._bounded("telemetry_sleep_seconds", 600, 300, 14400)
@@ -3573,7 +3587,9 @@ class TelemetryEngine:
             "command_confirmation": profile == "command",
             "confirmation_window_reused": same_command_window if profile == "command" else False,
             "adaptive_polling": profile == "command",
-            "poll_schedule_seconds": list(self.command_effective_cadence) if profile == "command" else [self.interactive_seconds],
+            "poll_schedule_seconds": list(
+                self._command_confirmation_poll_schedule((command_key,))
+            ) if profile == "command" else [self.interactive_seconds],
             "max_command_polls": self.command_max_polls if profile == "command" else None,
             # Quantos comandos esperam veredito nesta assinatura, contando este.
             # Mais de um deixou de significar que o anterior foi esquecido.
@@ -3765,6 +3781,7 @@ class TelemetryEngine:
                 "command_seconds": self.command_seconds,
                 "command_cadence_seconds": list(self.command_cadence),
                 "command_effective_cadence_seconds": list(self.command_effective_cadence),
+                "command_comfort_effective_cadence_seconds": list(self.command_comfort_effective_cadence),
                 "command_max_polls": self.command_max_polls,
                 "manual_priority": self.manual_pending_provider is not None,
                 "collection_profiles": {
@@ -4511,9 +4528,13 @@ class TelemetryEngine:
         )
         # 1.12.96: _adaptive_interval preserva a cadencia estrutural historica.
         # Somente o agendamento real da janela pos-comando recebe 5/5/8.
+        # 1.12.120: conforto elimina apenas o salto 18s -> 42s observado em
+        # campo; outras famílias continuam byte a byte na escada anterior.
         if effective_command_mode:
-            cadence_index = min(max(1, int(next_command_poll)) - 1, len(self.command_effective_cadence) - 1)
-            interval = int(self.command_effective_cadence[cadence_index])
+            active_command_keys = (item["command_key"] for item in remaining_outcomes)
+            active_cadence = self._command_confirmation_poll_schedule(active_command_keys)
+            cadence_index = min(max(1, int(next_command_poll)) - 1, len(active_cadence) - 1)
+            interval = int(active_cadence[cadence_index])
         aggregate_state, candidate_state, candidate_count = self._confirm_state_transition(
             str(subscription["last_state"] or ""),
             str(subscription["candidate_state"] or ""),
@@ -5754,6 +5775,14 @@ class TelemetryEngine:
         if count >= required:
             return observed, "", 0
         return previous, observed, count
+
+    def _command_confirmation_poll_schedule(
+        self, command_keys: Iterator[str] | tuple[str, ...] | list[str]
+    ) -> tuple[int, ...]:
+        """Escolhe a escada de releitura sem alterar despacho, retry ou prazo."""
+        if any(str(command_key or "") in COMFORT_FAST_CONFIRMATION_COMMANDS for command_key in command_keys):
+            return self.command_comfort_effective_cadence
+        return self.command_effective_cadence
 
     def _adaptive_interval(
         self,

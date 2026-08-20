@@ -83,9 +83,14 @@ def test_comfort_commands_keep_physical_safety_contracts() -> None:
 
 
 def test_release_does_not_touch_persistence_or_dependencies() -> None:
-    assert (APP / "RELEASE_TARGET").read_text(encoding="utf-8").strip() == "1.12.119"
+    target = (APP / "RELEASE_TARGET").read_text(encoding="utf-8").strip()
+    target_parts = tuple(int(part) for part in target.split("."))
+    assert target_parts >= (1, 12, 119)
     config = (APP / "config.yaml").read_text(encoding="utf-8")
-    assert ('version: "1.12.118"' in config) != ('version: "1.12.119"' in config)
+    version_line = next(line for line in config.splitlines() if line.startswith("version:"))
+    advertised = version_line.split('"', 2)[1]
+    advertised_parts = tuple(int(part) for part in advertised.split("."))
+    assert advertised_parts <= target_parts
     assert (APP / "requirements.txt").read_text(encoding="utf-8").splitlines() == [
         "leapmotor-api==0.3.2",
         "cryptography==50.0.0",
