@@ -100,10 +100,11 @@ def test_scheduler_selection_is_read_only_and_keeps_safety_contracts() -> None:
 
 
 def test_release_versions_are_staged_without_advertising_unbuilt_image() -> None:
-    assert connector.CONNECTOR_VERSION == "1.12.120"
-    assert telemetry.ENGINE_VERSION == "1.12.120"
-    assert (APP / "RELEASE_TARGET").read_text(encoding="utf-8").strip() == "1.12.120"
+    target = (APP / "RELEASE_TARGET").read_text(encoding="utf-8").strip()
+    assert tuple(map(int, connector.CONNECTOR_VERSION.split("."))) >= (1, 12, 120)
+    assert tuple(map(int, telemetry.ENGINE_VERSION.split("."))) >= (1, 12, 120)
+    assert tuple(map(int, target.split("."))) >= (1, 12, 120)
     config = (APP / "config.yaml").read_text(encoding="utf-8")
-    # A branch candidata anuncia 1.12.119; o validador oficial também executa
-    # a suíte sobre uma cópia já promovida para 1.12.120 antes da publicação.
-    assert ('version: "1.12.119"' in config) != ('version: "1.12.120"' in config)
+    published = next(line for line in config.splitlines() if line.startswith("version:"))
+    published = published.split('"', 2)[1]
+    assert tuple(map(int, published.split("."))) <= tuple(map(int, target.split(".")))

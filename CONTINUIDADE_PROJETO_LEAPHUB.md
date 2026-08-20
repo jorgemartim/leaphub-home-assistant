@@ -525,3 +525,8 @@ A 1.12.120 mantém a escada histórica para comandos mecânicos e usa
 5/5/8/10/10/12/... somente para clima, desembaçador, volante e retrovisores.
 É releitura de telemetria, sem retry ou reenvio físico. Não há migration,
 exclusão, recálculo, alteração de schema ou perda de dados coletados.
+A atualização Gateway 1.12.121 corrige os comandos 301/370 dos bancos. Os testes
+físicos com posições numéricas receberam ACK sem efeito; por isso o Gateway agora
+envia apenas `position=driver|copilot` e `level=0..3`, conforme o contrato C10
+atual, e recusa o envelope numérico legado antes da rede. Não há alteração de
+persistência nem de dados coletados.

@@ -44,7 +44,7 @@ except ImportError:
         _privacy_spec.loader.exec_module(_privacy_module)
         sanitize_log = _privacy_module.sanitize_log
 
-CONNECTOR_VERSION = "1.12.120"
+CONNECTOR_VERSION = "1.12.121"
 MAX_INPUT_BYTES = 1024 * 1024
 logging.getLogger("leapmotor_api").setLevel(logging.WARNING)
 LOGGER = logging.getLogger("leaphub.connector")
@@ -148,7 +148,7 @@ COMMAND_METHODS: dict[str, str] = {
     "healthy_charging_on": "healthy_charging_on",
     "healthy_charging_off": "healthy_charging_off",
     "ble_key_restart": "ble_key_restart",
-    # Conforto de assento: recebem posição (1-6) e nível (0-3) em `parameters`.
+    # Conforto de assento: recebem lado semântico e nível (0-3) em `parameters`.
     # Ver SEAT_COMFORT_COMMANDS e o tratamento em execute_vehicle_command.
     "seat_heat": "seat_heat",
     "seat_ventilation": "seat_ventilation",
@@ -166,10 +166,9 @@ COMMAND_METHODS: dict[str, str] = {
     "video": "video",
 }
 
-# Comandos que exigem posição e nível de assento. Mantidos em conjunto próprio
-# porque são os primeiros da matriz estável que não são de argumento zero.
-# Posições, conforme a biblioteca: 1=dianteiro esquerdo, 2=passageiro,
-# 3=motorista, 4=dianteiro direito, 5=traseiro esquerdo, 6=traseiro direito.
+# Comandos que exigem lado e nível de assento. A leapmotor-api 0.3.2 ainda
+# publica posições numéricas 1-6, porém esse envelope recebe ACK sem efeito
+# físico no C10. O protocolo efetivo usa `driver` e `copilot`.
 SEAT_COMFORT_COMMANDS = frozenset({"seat_heat", "seat_ventilation"})
 
 # Comandos de mídia, que compartilham o mesmo vocabulário de operação.
@@ -3950,6 +3949,30 @@ def windshield_defrost_off_parameters() -> dict[str, str]:
     params["wshld"] = "0"
     return params
 
+
+def seat_comfort_command_content(parameters: dict[str, Any]) -> str:
+    """Monta o payload efetivo dos comandos 301/370 sem aceitar posições legadas."""
+    position_raw = parameters.get("seat_position", parameters.get("position"))
+    position = str(position_raw or "").strip().lower()
+    if position not in {"driver", "copilot"}:
+        raise ValueError("Assento inválido. Escolha motorista ou passageiro.")
+
+    level_raw = parameters.get("seat_level", parameters.get("level"))
+    if isinstance(level_raw, bool):
+        raise ValueError("Nível de assento inválido.")
+    try:
+        level = int(level_raw)
+    except (TypeError, ValueError):
+        raise ValueError("Informe o nível do assento.") from None
+    if level < 0 or level > 3:
+        raise ValueError("Nível de assento inválido.")
+
+    return json.dumps(
+        {"position": position, "level": str(level)},
+        separators=(",", ":"),
+        ensure_ascii=True,
+    )
+
 def execute_vehicle_command(
     method: Any,
     command: str,
@@ -3958,6 +3981,28 @@ def execute_vehicle_command(
     climate_profile: str = "generic",
     window_native_scale: int = 100,
 ) -> Any:
+    if command in SEAT_COMFORT_COMMANDS:
+        # 1.12.121 — os wrappers públicos 0.3.2 serializam {"value":"N,L"}.
+        # A nuvem responde com sucesso, mas o C10 ignora esse formato. O app e a
+        # integração C10 validada usam dois campos: position=driver/copilot e
+        # level="0".."3". Falhar fechado impede novas tentativas sem efeito.
+        client = getattr(method, "__self__", None)
+        remote_control = getattr(client, "_remote_control", None)
+        if not callable(remote_control):
+            raise RuntimeError(
+                "A versão instalada da biblioteca não permite o payload de banco verificado."
+            )
+        cmd_content = seat_comfort_command_content(parameters)
+        connector_log(
+            logging.INFO,
+            "CLIMATE_DIAG event=seat_comfort_dispatch comando=%s payload_verificado=True tentativas_fisicas=1",
+            command,
+        )
+        return remote_control(
+            vin=vehicle_id,
+            action=ALL_COMMAND_METHODS[command],
+            cmd_content=cmd_content,
+        )
     if command in VERIFIED_COMFORT_COMMAND_CONTENT:
         # 1.12.119 — a API pública da biblioteca não expõe cmd_content, mas o
         # primitivo interno usado pelos próprios métodos aceita override. Falhar
@@ -4115,22 +4160,6 @@ def execute_vehicle_command(
         except ValueError:
             raise ValueError("Data ou hora inexistente.") from None
         return method(vehicle_id, task_id=fota_task_id(parameters), schedule_time=schedule_time)
-    if command in SEAT_COMFORT_COMMANDS:
-        # A biblioteca codifica o par como "posição,nível" (posição 1-6, nível 0-3)
-        # e exige os dois por palavra-chave. Recusar fora de faixa aqui evita
-        # gastar uma ida à nuvem para o carro rejeitar o comando.
-        position_raw = parameters.get("seat_position", parameters.get("position"))
-        level_raw = parameters.get("seat_level", parameters.get("level"))
-        try:
-            position = int(position_raw)
-            level = int(level_raw)
-        except (TypeError, ValueError):
-            raise ValueError("Informe a posição e o nível do assento.") from None
-        if position < 1 or position > 6:
-            raise ValueError("Posição de assento inválida.")
-        if level < 0 or level > 3:
-            raise ValueError("Nível de assento inválido.")
-        return method(vehicle_id, position=position, level=level)
     if command == "send_destination":
         name = str(parameters.get("name") or "Destino")[:100]
         address = str(parameters.get("address") or "")[:240]

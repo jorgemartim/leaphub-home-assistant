@@ -3,9 +3,9 @@
 Duas garantias entram aqui.
 
 A primeira é a matriz ganhar os dois primeiros comandos estáveis que não são de
-argumento zero: `seat_heat` (301) e `seat_ventilation` (370). A biblioteca os
-declara como `(vin, *, position, level)` — posição 1-6, nível 0-3, keyword-only.
-Validar a faixa no gateway evita gastar uma ida à nuvem para o carro recusar.
+argumento zero: `seat_heat` (301) e `seat_ventilation` (370). Desde a 1.12.121
+o gateway não usa mais o wrapper numérico da biblioteca: ele envia o envelope
+efetivo `position=driver|copilot` e `level=0..3` pelo primitivo remoto.
 
 A segunda é uma regressão de campo: `send_destination` falhava sempre com
 "Parâmetro de destino ainda não suportado pela biblioteca: address_name",
@@ -48,17 +48,22 @@ def version_tuple(value: str) -> tuple[int, ...]:
 
 
 class SeatClient:
-    """Reproduz a assinatura keyword-only da leapmotor_api 0.3.2."""
+    """Reproduz os wrappers legados e o primitivo da leapmotor_api 0.3.2."""
 
     def __init__(self) -> None:
-        self.calls: list[tuple[str, str, int, int]] = []
+        self.calls: list[dict[str, str]] = []
+        self.legacy_calls = 0
 
     def seat_heat(self, vin: str, *, position: int, level: int) -> dict[str, bool]:
-        self.calls.append(("seat_heat", vin, position, level))
+        self.legacy_calls += 1
         return {"accepted": True}
 
     def seat_ventilation(self, vin: str, *, position: int, level: int) -> dict[str, bool]:
-        self.calls.append(("seat_ventilation", vin, position, level))
+        self.legacy_calls += 1
+        return {"accepted": True}
+
+    def _remote_control(self, *, vin: str, action: str, cmd_content: str) -> dict[str, bool]:
+        self.calls.append({"vin": vin, "action": action, "cmd_content": cmd_content})
         return {"accepted": True}
 
 
@@ -126,47 +131,68 @@ def test_hardware_ability_implies_the_seat_rights():
 
 
 @pytest.mark.parametrize("command", ["seat_heat", "seat_ventilation"])
-def test_seat_command_passes_position_and_level_by_keyword(command):
+def test_seat_command_sends_verified_semantic_payload(command):
     client = SeatClient()
     result = connector.execute_vehicle_command(
-        getattr(client, command), command, "TESTVIN0000000001", {"position": 2, "level": 3}
+        getattr(client, command), command, "TESTVIN0000000001", {"position": "copilot", "level": 3}
     )
     assert result == {"accepted": True}
-    assert client.calls == [(command, "TESTVIN0000000001", 2, 3)]
+    assert client.legacy_calls == 0
+    assert client.calls == [{
+        "vin": "TESTVIN0000000001",
+        "action": command,
+        "cmd_content": '{"position":"copilot","level":"3"}',
+    }]
 
 
 def test_seat_command_accepts_the_seat_prefixed_aliases():
     client = SeatClient()
     connector.execute_vehicle_command(
-        client.seat_heat, "seat_heat", "TESTVIN0000000001", {"seat_position": 1, "seat_level": 0}
+        client.seat_heat,
+        "seat_heat",
+        "TESTVIN0000000001",
+        {"seat_position": "driver", "seat_level": 0},
     )
-    assert client.calls == [("seat_heat", "TESTVIN0000000001", 1, 0)]
+    assert client.calls == [{
+        "vin": "TESTVIN0000000001",
+        "action": "seat_heat",
+        "cmd_content": '{"position":"driver","level":"0"}',
+    }]
 
 
 @pytest.mark.parametrize(
     "parameters",
     [
-        {"position": 0, "level": 1},
-        {"position": 7, "level": 1},
-        {"position": -1, "level": 1},
+        {"position": 1, "level": 1},
+        {"position": 2, "level": 1},
+        {"position": 3, "level": 1},
+        {"position": 6, "level": 1},
+        {"position": "passenger", "level": 1},
+        {"position": "rear_left", "level": 1},
     ],
 )
-def test_seat_command_rejects_position_out_of_range(parameters):
+def test_seat_command_rejects_legacy_or_unknown_position(parameters):
     client = SeatClient()
     with pytest.raises(ValueError):
         connector.execute_vehicle_command(client.seat_heat, "seat_heat", "VIN", parameters)
-    assert client.calls == [], "nada pode chegar à nuvem com posição inválida"
+    assert client.calls == [], "nada pode chegar à nuvem com posição não comprovada"
+    assert client.legacy_calls == 0
 
 
 @pytest.mark.parametrize("level", [-1, 4, 9])
 def test_seat_command_rejects_level_out_of_range(level):
     client = SeatClient()
     with pytest.raises(ValueError):
-        connector.execute_vehicle_command(client.seat_heat, "seat_heat", "VIN", {"position": 1, "level": level})
+        connector.execute_vehicle_command(
+            client.seat_heat, "seat_heat", "VIN", {"position": "driver", "level": level}
+        )
     assert client.calls == []
 
 
-@pytest.mark.parametrize("parameters", [{}, {"position": 1}, {"level": 1}, {"position": "x", "level": 1}])
+@pytest.mark.parametrize(
+    "parameters",
+    [{}, {"position": "driver"}, {"level": 1}, {"position": "x", "level": 1}],
+)
 def test_seat_command_requires_both_values(parameters):
     client = SeatClient()
     with pytest.raises(ValueError):

@@ -1,16 +1,11 @@
-## 1.12.120
+## 1.12.121
 
-A distribuição continua pré-compilada no GHCR oficial e mantém a publicação em duas fases.
-
-- reduz a demora percebida na confirmação de clima e aquecimentos do C10;
-- elimina, somente para conforto, o salto de releitura entre 18 s e 42 s que foi
-  medido em campo após um `quick_heat`;
-- mantém 5/5/8 s no início e passa a reler em 28/38/50 s quando o estado ainda
-  não apareceu, sem reenviar o comando físico;
-- trava, vidros, cortina, porta-malas, recarga, Trips e OCPP preservam a cadência
-  anterior sem nenhuma leitura adicional;
-- payloads verificados de volante e retrovisores, ACK-first, limites, prazo e
-  confirmação por telemetria permanecem inalterados;
-- nenhuma migration, exclusão, recálculo ou alteração de dado coletado é executada;
-- `config.yaml` permanece em `1.12.119` até o CI construir, testar, executar o
-  smoke test e confirmar acesso anônimo à imagem GHCR `1.12.120`.
+- mantém a distribuição pré-compilada no GHCR oficial e a publicação em duas fases;
+- corrige os comandos 301/370 de aquecimento e ventilação dos bancos no C10;
+- substitui o envelope legado aceito sem efeito (`{"value":"posição,nível"}`)
+  pelo contrato efetivo `{"position":"driver|copilot","level":"0..3"}`;
+- recusa posições numéricas antigas para impedir ACK falso e novas tentativas
+  físicas sem efeito;
+- preserva clima, desembaçador, volante, retrovisores, cadência 1.12.120,
+  dependências, banco de dados e todos os dados já coletados;
+- `config.yaml` anuncia 1.12.120 até o CI validar e publicar a imagem 1.12.121.
