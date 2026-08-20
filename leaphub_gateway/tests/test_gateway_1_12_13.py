@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-import fcntl
 import os
 import sqlite3
 import sys
@@ -10,6 +9,11 @@ import threading
 import time
 import unittest
 from pathlib import Path
+
+try:
+    import fcntl
+except ModuleNotFoundError:  # Windows usa o lock nativo do próprio engine.
+    fcntl = None
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -65,7 +69,8 @@ class GatewayRegressionTests(unittest.TestCase):
         handle = getattr(cls.engine, "_instance_lock_handle", None)
         if handle is not None:
             try:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                if fcntl is not None:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
                 handle.close()
             except OSError:
                 pass

@@ -38,7 +38,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-GATEWAY_VERSION = "1.12.117"
+GATEWAY_VERSION = "1.12.118"
 IS_RAILWAY = bool(os.getenv("RAILWAY_ENVIRONMENT_NAME") or os.getenv("RAILWAY_SERVICE_ID"))
 RUNTIME_DIR = Path(os.getenv("LEAPHUB_RUNTIME_DIR", "/tmp/leaphub-ocpp" if IS_RAILWAY else "."))
 BIND = os.getenv("LEAPHUB_OCPP_BIND", "0.0.0.0")
@@ -200,10 +200,20 @@ RESILIENT_ACTIONS = {
 }
 
 
+class ClosingSQLiteConnection(sqlite3.Connection):
+    """Commit/rollback como sqlite3.Connection e feche ao sair de ``with``."""
+
+    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> bool:
+        try:
+            return bool(super().__exit__(exc_type, exc_value, traceback))
+        finally:
+            self.close()
+
+
 def state_db() -> sqlite3.Connection:
     global STATE_DB_INITIALIZED
     STATE_DB.parent.mkdir(parents=True, exist_ok=True)
-    db = sqlite3.connect(STATE_DB, timeout=5.0)
+    db = sqlite3.connect(STATE_DB, timeout=5.0, factory=ClosingSQLiteConnection)
     db.execute("PRAGMA busy_timeout=5000")
     db.execute("PRAGMA foreign_keys=ON")
     db.execute("PRAGMA synchronous=NORMAL")

@@ -27,6 +27,14 @@ def load_module(name: str, path: Path):
 
 failures: list[str] = []
 
+_ENV_KEYS = (
+    "LEAPHUB_OPTIONS_PATH",
+    "LEAPHUB_TELEMETRY_DIR",
+    "LEAPHUB_COMMAND_DB_PATH",
+    "LEAPHUB_NONCE_DB_PATH",
+)
+_ORIGINAL_ENV = {key: os.environ.get(key) for key in _ENV_KEYS}
+
 
 def check(condition: bool, message: str) -> None:
     if not condition:
@@ -200,6 +208,12 @@ with tempfile.TemporaryDirectory(prefix="leaphub-connection-1-12-15-") as tmp:
     real_telemetry.close_storage()
     if real_telemetry._instance_lock_handle is not None:
         real_telemetry._instance_lock_handle.close()
+
+for key, value in _ORIGINAL_ENV.items():
+    if value is None:
+        os.environ.pop(key, None)
+    else:
+        os.environ[key] = value
 
 if failures:
     raise SystemExit("connection resilience 1.12.15 failed:\n- " + "\n- ".join(failures))

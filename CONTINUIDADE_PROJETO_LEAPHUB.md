@@ -485,3 +485,21 @@ SAFE retry, fence mecanico, clima, trunk, proximidade, Trips, OCPP, SQLite
 writer, confirmacao FAST e cadencias.
 
 Gate: publicar somente se validator local e Actions/Linux ficarem verdes.
+
+## Gateway 1.12.118 - dependências e fechamento SQLite
+
+Base publicada: `fa5c5c9` (1.12.117).
+
+Implementado localmente: pins `cryptography==50.0.0` e `Pillow==12.3.0`;
+fechamento determinístico das conexões OCPP usadas em contexto; isolamento do
+limite da fila no teste e restauração do ambiente alterado pelo contrato de
+resiliência.
+
+Preservado: bancos operacionais, filas, eventos, cursores e dados coletados.
+Sem migration, DELETE ou recálculo. Comandos físicos, Trips, telemetria,
+proximidade e cadências não foram alterados.
+
+Validação: `pip check` limpo; dependências exatas importadas; `13/13` contratos
+direcionados; gate do CI com `608/608` testes principais e `5/5` legados.
+
+Estado: candidato local, ainda sem push, build GHCR ou instalação.
