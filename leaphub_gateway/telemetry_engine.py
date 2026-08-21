@@ -55,7 +55,7 @@ except ModuleNotFoundError:
         EVENT_TRANSPORT = _event_transport_module.EVENT_TRANSPORT
 
 LOG = logging.getLogger("leaphub.telemetry")
-ENGINE_VERSION = "1.12.121"  # semantic seat-comfort payloads; cadence preserved
+ENGINE_VERSION = "1.12.122"  # physical seat telemetry confirmation; cadence preserved
 
 # Hospedagem compartilhada (Apache/LiteSpeed) fecha a conexão ociosa em poucos
 # segundos. Reaproveitar depois disso escreve num socket já fechado e devolve
@@ -142,6 +142,8 @@ TELEMETRY_CONFIRMABLE_COMMANDS = frozenset({
     "steering_wheel_heat_off",
     "rearview_mirror_heat_on",
     "rearview_mirror_heat_off",
+    "seat_heat",
+    "seat_ventilation",
     "trunk_open",
     "trunk_close",
     "sunshade_open",
@@ -5944,6 +5946,8 @@ class TelemetryEngine:
         "steering_wheel_heat_off": ("seat_comfort.steering_wheel_heating",),
         "rearview_mirror_heat_on": ("mirrors.left_heating", "mirrors.right_heating"),
         "rearview_mirror_heat_off": ("mirrors.left_heating", "mirrors.right_heating"),
+        "seat_heat": ("seat_comfort",),
+        "seat_ventilation": ("seat_comfort",),
         "trunk_open": ("doors.trunk",),
         "trunk_close": ("doors.trunk",),
         "sunshade_open": ("sunshade_open",),
@@ -6146,6 +6150,29 @@ class TelemetryEngine:
             active = any(known)
             expected = command == "rearview_mirror_heat_on"
             return (active is expected, True)
+        if command in {"seat_heat", "seat_ventilation"}:
+            seat = telemetry.get("seat_comfort") if isinstance(telemetry.get("seat_comfort"), dict) else {}
+            raw_position = parameters.get("seat_position", parameters.get("position"))
+            position = str(raw_position or "").strip().lower()
+            position = {"passenger": "copilot"}.get(position, position)
+            field = {
+                ("seat_heat", "driver"): "driver_heating",
+                ("seat_heat", "copilot"): "passenger_heating",
+                ("seat_ventilation", "driver"): "driver_ventilation",
+                ("seat_ventilation", "copilot"): "passenger_ventilation",
+            }.get((command, position))
+            raw_level = parameters.get("seat_level", parameters.get("level"))
+            try:
+                expected_level = int(raw_level)
+            except (TypeError, ValueError):
+                return False, False
+            if field is None or expected_level < 0 or expected_level > 3:
+                return False, False
+            try:
+                observed_level = int(float(seat.get(field)))
+            except (TypeError, ValueError):
+                return False, False
+            return observed_level == expected_level, True
         if command in {"trunk_open", "trunk_close"}:
             doors = telemetry.get("doors") if isinstance(telemetry.get("doors"), dict) else {}
             state = self._command_bool(doors.get("trunk"))

@@ -530,3 +530,13 @@ físicos com posições numéricas receberam ACK sem efeito; por isso o Gateway 
 envia apenas `position=driver|copilot` e `level=0..3`, conforme o contrato C10
 atual, e recusa o envelope numérico legado antes da rede. Não há alteração de
 persistência nem de dados coletados.
+
+## Gateway 1.12.122 — confirmação física dos bancos
+
+Os logs de 20/08/2026 provaram que a nuvem aceitava e o carro executava os
+payloads semânticos, mas o Gateway não armava confirmação. Os sinais brutos
+2100/2101/2118/2119 já publicavam os níveis reais dos dois bancos.
+
+A 1.12.122 os serializa apenas quando o campo tipado estiver ausente e confirma
+comando, lado e nível exatos, inclusive zero. Não há reenvio físico, migration,
+exclusão, recálculo nem mudança em dados históricos.

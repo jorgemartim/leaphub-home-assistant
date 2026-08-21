@@ -100,8 +100,10 @@ def test_missing_raw_primitive_fails_closed() -> None:
 
 
 def test_release_is_staged_without_dependency_or_data_changes() -> None:
-    assert connector.CONNECTOR_VERSION == "1.12.121"
-    assert (APP / "RELEASE_TARGET").read_text(encoding="utf-8").strip() == "1.12.121"
+    version = tuple(int(part) for part in connector.CONNECTOR_VERSION.split("."))
+    target = tuple(int(part) for part in (APP / "RELEASE_TARGET").read_text(encoding="utf-8").strip().split("."))
+    assert version >= (1, 12, 121)
+    assert target >= (1, 12, 121)
     assert (APP / "requirements.txt").read_text(encoding="utf-8").splitlines() == [
         "leapmotor-api==0.3.2",
         "cryptography==50.0.0",

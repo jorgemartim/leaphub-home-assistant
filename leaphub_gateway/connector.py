@@ -44,7 +44,7 @@ except ImportError:
         _privacy_spec.loader.exec_module(_privacy_module)
         sanitize_log = _privacy_module.sanitize_log
 
-CONNECTOR_VERSION = "1.12.121"
+CONNECTOR_VERSION = "1.12.122"
 MAX_INPUT_BYTES = 1024 * 1024
 logging.getLogger("leapmotor_api").setLevel(logging.WARNING)
 LOGGER = logging.getLogger("leaphub.connector")
@@ -1210,6 +1210,32 @@ CLIMATE_COMFORT_SIGNAL_IDS = frozenset({
     "2100", "2101", "2118", "2119",
     "2183", "2184", "2669", "2681", "3713",
 })
+
+SEAT_COMFORT_RAW_SIGNAL_FIELDS = {
+    "signal.2100": "driver_heating",
+    "signal.2101": "driver_ventilation",
+    "signal.2118": "passenger_heating",
+    "signal.2119": "passenger_ventilation",
+}
+
+
+def enrich_seat_comfort_from_raw(
+    seat_state: dict[str, Any], raw_signals: dict[str, Any]
+) -> dict[str, Any]:
+    """Preenche estados de banco que a leapmotor-api 0.3.2 não tipa no C10.
+
+    Campos tipados continuam tendo precedência. O fallback usa somente sinais
+    já presentes na mesma leitura do veículo; não cria chamada, não altera
+    histórico e não adivinha estado ausente.
+    """
+    result = dict(seat_state or {})
+    for signal, field in SEAT_COMFORT_RAW_SIGNAL_FIELDS.items():
+        if field in result:
+            continue
+        value = first_numeric((raw_signals or {}).get(signal))
+        if value is not None:
+            result[field] = value
+    return result
 
 def safe_climate_comfort_raw_signals(raw: Any, max_items: int = 32) -> dict[str, Any]:
     result: dict[str, Any] = {}
@@ -3060,6 +3086,7 @@ def serialize_vehicle(
     # do diagnostico tipado. Isso restaura a conclusao de serialize_vehicle()
     # e, consequentemente, collection_total + fila/entrega de telemetria.
     raw_climate_comfort_signals = safe_climate_comfort_raw_signals(attribute(status, "raw"))
+    seat_state = enrich_seat_comfort_from_raw(seat_state, raw_climate_comfort_signals)
     log_climate_comfort_diag(climate_state, seat_state, mirrors_state, raw_climate_comfort_signals)
 
     charge_plan = attribute(battery, "charge_plan")
