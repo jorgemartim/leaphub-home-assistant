@@ -98,7 +98,7 @@ def test_versions_and_global_guardrails() -> None:
     assert version_tuple(connector.CONNECTOR_VERSION) >= (1, 12, 109)
     assert version_tuple(telemetry.ENGINE_VERSION) >= (1, 12, 109)
     assert connector.SAFE_STATE_RETRY_COMMANDS == {"climate_on", "climate_off"}
-    assert "windshield_defrost" not in connector.ACK_FIRST_COMMANDS
+    assert "windshield_defrost" in connector.ACK_FIRST_COMMANDS
     assert tuple(telemetry.TelemetryEngine.COMMAND_POST_DISPATCH_EARLY_CADENCE) == (5, 5, 8)
     assert tuple(telemetry.TelemetryEngine.COMMAND_TRANSIENT_BACKOFF) == (8, 15, 25, 40, 60, 90)
 

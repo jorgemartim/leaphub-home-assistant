@@ -44,7 +44,7 @@ except ImportError:
         _privacy_spec.loader.exec_module(_privacy_module)
         sanitize_log = _privacy_module.sanitize_log
 
-CONNECTOR_VERSION = "1.12.123"
+CONNECTOR_VERSION = "1.12.124"
 MAX_INPUT_BYTES = 1024 * 1024
 logging.getLogger("leapmotor_api").setLevel(logging.WARNING)
 LOGGER = logging.getLogger("leaphub.connector")
@@ -105,7 +105,7 @@ SAFE_STATE_RETRY_COMMANDS = {"climate_on", "climate_off"}
 # leapmotor-api. Isso SERIALIZA o mecanismo por conta, sem reenviar a acao.
 # Timeout do result/query continua classificado como ACK aceito + confirmacao
 # FAST pendente pelo classify_accepted_ambiguity existente.
-ACK_FIRST_COMMANDS = {"lock", "unlock", "climate_on", "climate_off", "quick_cool", "quick_heat", "trunk_open", "trunk_close"}
+ACK_FIRST_COMMANDS = {"lock", "unlock", "climate_on", "climate_off", "quick_cool", "quick_heat", "trunk_open", "trunk_close", "windshield_defrost", "seat_heat", "seat_ventilation"}
 
 COMMAND_METHODS: dict[str, str] = {
     "lock": "lock_vehicle",

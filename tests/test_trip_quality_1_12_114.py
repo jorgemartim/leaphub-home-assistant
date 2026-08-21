@@ -212,6 +212,9 @@ def test_frozen_physical_and_confirmation_contracts_remain_present() -> None:
         "quick_heat",
         "trunk_open",
         "trunk_close",
+        "windshield_defrost",
+        "seat_heat",
+        "seat_ventilation",
     }
     assert 'if command in {"windows_open", "windows_close"} and window_native_scale == 10:' in connector_source
     assert 'return {"operate": "off", "wshld": "0"}' in connector_source

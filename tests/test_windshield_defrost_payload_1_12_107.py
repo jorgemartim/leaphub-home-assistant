@@ -74,5 +74,5 @@ def test_auto_payload_and_retry_guards_are_unchanged() -> None:
     }
     assert connector.SAFE_STATE_RETRY_COMMANDS == {"climate_on", "climate_off"}
     assert "windshield_defrost" not in connector.SAFE_STATE_RETRY_COMMANDS
-    assert "windshield_defrost" not in connector.ACK_FIRST_COMMANDS
+    assert "windshield_defrost" in connector.ACK_FIRST_COMMANDS
     assert connector.COMMAND_METHODS["windshield_defrost"] == "windshield_defrost"

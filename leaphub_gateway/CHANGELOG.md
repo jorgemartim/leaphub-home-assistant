@@ -1,9 +1,10 @@
-## 1.12.123
+## 1.12.124
 
 - mantém a distribuição pré-compilada no GHCR oficial e a publicação em duas fases;
-- corrige o OFF do desembaçador dianteiro para não restaurar aquecimento em
-  32 °C com ventilador no nível 7;
-- envia um único cmd 170 com `operate=off` e `wshld=0`, sem comando físico
-  complementar e sem repetição;
-- preserva confirmação FAST, filas, telemetria e todos os dados coletados;
-- `config.yaml` anuncia 1.12.122 até o CI validar e publicar a imagem 1.12.123.
+- devolve ACK rápido para desembacador e bancos, sem esperar a consulta interna
+  lenta da biblioteca Leapmotor;
+- cada gesto continua emitindo exatamente um comando físico e nunca entra na
+  matriz de repetição automática;
+- a confirmação por telemetria permanece autoritativa e segue em segundo plano;
+- preserva o OFF mínimo do desembaçador, filas, telemetria e todos os dados coletados;
+- `config.yaml` anuncia 1.12.123 até o CI validar e publicar a imagem 1.12.124.

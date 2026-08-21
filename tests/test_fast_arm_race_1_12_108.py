@@ -115,7 +115,7 @@ def test_release_and_physical_guardrails_are_unchanged() -> None:
     assert tuple(telemetry.TelemetryEngine.COMMAND_TRANSIENT_BACKOFF) == (8, 15, 25, 40, 60, 90)
     assert connector.SAFE_STATE_RETRY_COMMANDS == {"climate_on", "climate_off"}
     assert "windshield_defrost" not in connector.SAFE_STATE_RETRY_COMMANDS
-    assert "windshield_defrost" not in connector.ACK_FIRST_COMMANDS
+    assert "windshield_defrost" in connector.ACK_FIRST_COMMANDS
     assert connector.windshield_defrost_parameters()["wshld"] == "2"
     assert connector.climate_auto_parameters({"target_temperature": 24})["wshld"] == "0"
 

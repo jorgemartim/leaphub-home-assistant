@@ -50,7 +50,7 @@ def test_control_guardrails_remain_exact():
     assert 'SAFE_STATE_RETRY_COMMANDS = {"climate_on", "climate_off"}' in C
     assert 'return method(vehicle_id, params={"operate": "off"})' in C
     assert "command_attempts < 2" in C
-    assert 'ACK_FIRST_COMMANDS = {"lock", "unlock", "climate_on", "climate_off", "quick_cool", "quick_heat", "trunk_open", "trunk_close"}' in C
+    assert 'ACK_FIRST_COMMANDS = {"lock", "unlock", "climate_on", "climate_off", "quick_cool", "quick_heat", "trunk_open", "trunk_close", "windshield_defrost", "seat_heat", "seat_ventilation"}' in C
     assert 'numeric_map = {0: "auto", 1: "cooling", 3: "heating"}' in T
 
 

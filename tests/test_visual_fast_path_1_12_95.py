@@ -54,7 +54,7 @@ def test_polling_and_controls_are_deliberately_frozen():
     assert 'SAFE_STATE_RETRY_COMMANDS = {"climate_on", "climate_off"}' in C
     assert 'return method(vehicle_id, params={"operate": "off"})' in C
     assert "command_attempts < 2" in C
-    assert 'ACK_FIRST_COMMANDS = {"lock", "unlock", "climate_on", "climate_off", "quick_cool", "quick_heat", "trunk_open", "trunk_close"}' in C
+    assert 'ACK_FIRST_COMMANDS = {"lock", "unlock", "climate_on", "climate_off", "quick_cool", "quick_heat", "trunk_open", "trunk_close", "windshield_defrost", "seat_heat", "seat_ventilation"}' in C
 
 def test_visual_timing_is_log_only():
     body = function_source(C, "official_visual_image_payload")

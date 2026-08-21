@@ -43,7 +43,7 @@ def test_async_helpers_are_local_only_and_cannot_dispatch_vehicle_command():
 
 
 def test_regression_guardrails_for_fast_and_slow_commands_are_unchanged():
-    assert 'ACK_FIRST_COMMANDS = {"lock", "unlock", "climate_on", "climate_off", "quick_cool", "quick_heat", "trunk_open", "trunk_close"}' in CONNECTOR
+    assert 'ACK_FIRST_COMMANDS = {"lock", "unlock", "climate_on", "climate_off", "quick_cool", "quick_heat", "trunk_open", "trunk_close", "windshield_defrost", "seat_heat", "seat_ventilation"}' in CONNECTOR
     assert 'return method(vehicle_id, params={"operate": "off"})' in CONNECTOR
     assert "repeat_exact_state_command" in CONNECTOR
     assert "command_attempts < 2" in CONNECTOR

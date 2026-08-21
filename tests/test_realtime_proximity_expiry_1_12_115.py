@@ -68,7 +68,7 @@ def test_telemetry_has_fences_on_all_command_routes():
 
 def test_physical_and_cadence_contracts_remain_frozen():
     assert 'SAFE_STATE_RETRY_COMMANDS = {"climate_on", "climate_off"}' in CONNECTOR
-    assert 'ACK_FIRST_COMMANDS = {"lock", "unlock", "climate_on", "climate_off", "quick_cool", "quick_heat", "trunk_open", "trunk_close"}' in CONNECTOR
+    assert 'ACK_FIRST_COMMANDS = {"lock", "unlock", "climate_on", "climate_off", "quick_cool", "quick_heat", "trunk_open", "trunk_close", "windshield_defrost", "seat_heat", "seat_ventilation"}' in CONNECTOR
     assert 'COMMAND_POST_DISPATCH_EARLY_CADENCE = (5, 5, 8)' in TELEMETRY
     assert 'TRIP_DRIVING_SECONDS_DEFAULT = 8' in TELEMETRY
     assert 'if command in {"windows_open", "windows_close"} and window_native_scale == 10:' in CONNECTOR
