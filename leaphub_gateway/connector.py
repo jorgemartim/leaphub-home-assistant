@@ -44,7 +44,7 @@ except ImportError:
         _privacy_spec.loader.exec_module(_privacy_module)
         sanitize_log = _privacy_module.sanitize_log
 
-CONNECTOR_VERSION = "1.12.124"
+CONNECTOR_VERSION = "1.12.125"
 MAX_INPUT_BYTES = 1024 * 1024
 logging.getLogger("leapmotor_api").setLevel(logging.WARNING)
 LOGGER = logging.getLogger("leaphub.connector")
@@ -3551,7 +3551,12 @@ def create_client(credentials: dict[str, Any], temp_dir: Path, operation_passwor
         app_cert_path=cert_path,
         app_key_path=key_path,
         operation_password=operation_password,
-        timeout=max(12, min(45, int(request_timeout_seconds))),
+        # A telemetria automática chama esta fábrica com o teto curto de 4 s.
+        # O piso antigo de 12 s anulava esse teto durante o login e podia reter
+        # a trava da conta por vários blocos de 12 s antes de um comando manual.
+        # Comandos continuam recebendo 15–30 s do TelemetryEngine e 32 s nos
+        # fluxos isolados; somente leituras automáticas podem usar o piso baixo.
+        timeout=max(1, min(45, int(request_timeout_seconds))),
         verify_ssl=strict_tls,
         language="en-GB",
     )

@@ -1,10 +1,10 @@
-## 1.12.124
+## 1.12.125
 
 - mantém a distribuição pré-compilada no GHCR oficial e a publicação em duas fases;
-- devolve ACK rápido para desembacador e bancos, sem esperar a consulta interna
-  lenta da biblioteca Leapmotor;
-- cada gesto continua emitindo exatamente um comando físico e nunca entra na
-  matriz de repetição automática;
-- a confirmação por telemetria permanece autoritativa e segue em segundo plano;
-- preserva o OFF mínimo do desembaçador, filas, telemetria e todos os dados coletados;
-- `config.yaml` anuncia 1.12.123 até o CI validar e publicar a imagem 1.12.124.
+- corrige o piso interno do cliente que transformava o teto de 4 s da
+  telemetria automática em 12 s durante a autenticação;
+- impede que uma primeira sessão fria retenha a conta por vários blocos longos
+  antes de liberar um comando manual;
+- preserva os timeouts maiores do despacho físico e a confirmação autoritativa
+  por telemetria;
+- não altera, migra, recalcula nem remove dados coletados.
