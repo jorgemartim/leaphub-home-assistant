@@ -72,4 +72,4 @@ def test_physical_and_cadence_contracts_remain_frozen():
     assert 'COMMAND_POST_DISPATCH_EARLY_CADENCE = (5, 5, 8)' in TELEMETRY
     assert 'TRIP_DRIVING_SECONDS_DEFAULT = 8' in TELEMETRY
     assert 'if command in {"windows_open", "windows_close"} and window_native_scale == 10:' in CONNECTOR
-    assert 'params["wshld"] = "0"' in CONNECTOR
+    assert 'return {"operate": "off", "wshld": "0"}' in CONNECTOR

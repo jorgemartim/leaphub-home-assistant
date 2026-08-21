@@ -44,7 +44,7 @@ except ImportError:
         _privacy_spec.loader.exec_module(_privacy_module)
         sanitize_log = _privacy_module.sanitize_log
 
-CONNECTOR_VERSION = "1.12.122"
+CONNECTOR_VERSION = "1.12.123"
 MAX_INPUT_BYTES = 1024 * 1024
 logging.getLogger("leapmotor_api").setLevel(logging.WARNING)
 LOGGER = logging.getLogger("leaphub.connector")
@@ -3971,10 +3971,15 @@ def windshield_defrost_enabled(parameters: dict[str, Any]) -> bool:
 
 
 def windshield_defrost_off_parameters() -> dict[str, str]:
-    """Mesmo pacote homologado de ON, mudando somente wshld para OFF."""
-    params = dict(windshield_defrost_parameters())
-    params["wshld"] = "0"
-    return params
+    """Desliga para-brisa e climatizacao em um unico pacote seguro.
+
+    Reaproveitar o pacote de ON com apenas ``wshld=0`` realmente removia o
+    desembaçamento, mas também reenviava ``mode=hot``, 32 °C e ventilador 7.
+    No C10 isso religava o aquecimento logo depois do OFF. ``operate=off`` já
+    é o desligamento homologado do cmd 170; ``wshld=0`` torna explícita a
+    direção do para-brisa sem criar um segundo comando físico.
+    """
+    return {"operate": "off", "wshld": "0"}
 
 
 def seat_comfort_command_content(parameters: dict[str, Any]) -> str:
@@ -4061,7 +4066,8 @@ def execute_vehicle_command(
         return method(vehicle_id, params={"operate": "off"})
     if command == "windshield_defrost":
         # 1.12.109 — um único comando público, dois sentidos.
-        # Sem `enabled` = ON legado (wshld=2). OFF = enabled=false (wshld=0).
+        # Sem `enabled` = ON legado (wshld=2). OFF = enabled=false em um
+        # único pacote operate=off + wshld=0, sem restaurar HOT/32 °C/fan 7.
         enabled = windshield_defrost_enabled(parameters)
         params = windshield_defrost_parameters() if enabled else windshield_defrost_off_parameters()
         connector_log(

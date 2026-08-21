@@ -214,7 +214,7 @@ def test_frozen_physical_and_confirmation_contracts_remain_present() -> None:
         "trunk_close",
     }
     assert 'if command in {"windows_open", "windows_close"} and window_native_scale == 10:' in connector_source
-    assert 'params["wshld"] = "0"' in connector_source
+    assert 'return {"operate": "off", "wshld": "0"}' in connector_source
     assert "COMMAND_POST_DISPATCH_EARLY_CADENCE = (5, 5, 8)" in engine_source
     release_target = (APP / "RELEASE_TARGET").read_text(encoding="utf-8").strip()
     config_version_line = next(

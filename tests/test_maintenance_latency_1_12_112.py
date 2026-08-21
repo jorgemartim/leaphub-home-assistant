@@ -129,7 +129,7 @@ def test_versions_and_physical_contracts_are_frozen() -> None:
     assert tuple(telemetry.TelemetryEngine.COMMAND_POST_DISPATCH_EARLY_CADENCE) == (5, 5, 8)
     assert tuple(telemetry.TelemetryEngine.COMMAND_TRANSIENT_BACKOFF) == (8, 15, 25, 40, 60, 90)
     assert connector.windshield_defrost_parameters()["wshld"] == "2"
-    assert connector.windshield_defrost_off_parameters()["wshld"] == "0"
+    assert connector.windshield_defrost_off_parameters() == {"operate": "off", "wshld": "0"}
     source = inspect.getsource(connector)
     assert 'native = 10 if command == "windows_open" else 0' in source
 

@@ -41,7 +41,7 @@ def test_mechanical_open_close_wait_for_library_remote_result_fence() -> None:
 def test_physical_payloads_and_retry_matrix_are_frozen() -> None:
     assert 'SAFE_STATE_RETRY_COMMANDS = {"climate_on", "climate_off"}' in CONNECTOR
     assert 'native = 10 if command == "windows_open" else 0' in CONNECTOR
-    assert 'params["wshld"] = "0"' in CONNECTOR
+    assert 'return {"operate": "off", "wshld": "0"}' in CONNECTOR
     assert '"windshield_defrost_off":' not in CONNECTOR
     assert 'COMMAND_POST_DISPATCH_EARLY_CADENCE = (5, 5, 8)' in TELEMETRY
     assert 'COMMAND_TRANSIENT_BACKOFF = (8, 15, 25, 40, 60, 90)' in TELEMETRY

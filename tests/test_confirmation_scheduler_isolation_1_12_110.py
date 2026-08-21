@@ -115,10 +115,7 @@ def test_defrost_and_window_payload_semantics_are_unchanged() -> None:
     on = connector.windshield_defrost_parameters()
     off = connector.windshield_defrost_off_parameters()
     assert on["wshld"] == "2"
-    assert off["wshld"] == "0"
-    assert {k: v for k, v in on.items() if k != "wshld"} == {
-        k: v for k, v in off.items() if k != "wshld"
-    }
+    assert off == {"operate": "off", "wshld": "0"}
     source = inspect.getsource(connector)
     assert 'native = 10 if command == "windows_open" else 0' in source
     assert 'SAFE_STATE_RETRY_COMMANDS = {"climate_on", "climate_off"}' in source

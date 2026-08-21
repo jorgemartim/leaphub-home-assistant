@@ -117,10 +117,10 @@ def test_defrost_off_changes_only_wshld_and_uses_same_public_command() -> None:
     on = connector.windshield_defrost_parameters()
     off = connector.windshield_defrost_off_parameters()
     assert on["wshld"] == "2"
-    assert off["wshld"] == "0"
-    assert {k: v for k, v in on.items() if k != "wshld"} == {
-        k: v for k, v in off.items() if k != "wshld"
-    }
+    assert off == {"operate": "off", "wshld": "0"}
+    assert "mode" not in off
+    assert "temperature" not in off
+    assert "windlevel" not in off
     calls = []
 
     def method(*args, **kwargs):
