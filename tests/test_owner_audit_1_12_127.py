@@ -3,7 +3,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 APP = ROOT / "leaphub_gateway"
-TARGET = "1.12.127"
+TARGET = (APP / "RELEASE_TARGET").read_text(encoding="utf-8").strip()
 
 
 def test_release_versions_are_aligned():

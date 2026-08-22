@@ -1,9 +1,8 @@
-## 1.12.127
+## 1.12.128
 
-- inclui aquecimento e ventilação dos bancos na cadência rápida e limitada de
-  confirmação, sem reenviar comandos físicos;
-- mantém os diagnósticos brutos `CLIMATE_RAW_PROBE` e `CLIMATE_COMFORT_DIAG`
-  disponíveis em DEBUG, retirando o ruído do log operacional padrão;
-- preserva o pulso redundante do scheduler, fila persistente, telemetria,
-  comandos, banco SQLite, distribuição pré-compilada no GHCR e todo o histórico
-  coletado.
+- corrige, somente no Leapmotor C10, a orientação dos quatro valores de pressão
+  conforme comparação simultânea com o aplicativo oficial;
+- amplia aliases opcionais de temperatura sem estimar valores ausentes;
+- preserva B10 e outros modelos sem remapeamento, além de manter fila,
+  telemetria, comandos, OCPP e dados persistidos sem migração;
+- mantém a distribuição pré-compilada no GHCR e a promoção em duas fases.

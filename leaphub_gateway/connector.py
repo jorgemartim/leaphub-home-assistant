@@ -44,7 +44,7 @@ except ImportError:
         _privacy_spec.loader.exec_module(_privacy_module)
         sanitize_log = _privacy_module.sanitize_log
 
-CONNECTOR_VERSION = "1.12.127"
+CONNECTOR_VERSION = "1.12.128"
 MAX_INPUT_BYTES = 1024 * 1024
 logging.getLogger("leapmotor_api").setLevel(logging.WARNING)
 LOGGER = logging.getLogger("leaphub.connector")
@@ -1017,19 +1017,35 @@ def tire_temperature_c(value: Any) -> float | None:
     return round(parsed, 1) if -60 <= parsed <= 150 else None
 
 
-def tire_metrics(tires: Any, status: Any) -> tuple[dict[str, float | None], dict[str, float]]:
-    """Keep pressure compatibility and publish optional per-wheel temperature."""
+def tire_metrics(tires: Any, status: Any, model: str = "") -> tuple[dict[str, float | None], dict[str, float]]:
+    """Normalize the cloud wheel order and optional per-wheel temperature.
+
+    leapmotor-api 0.3.2 exposes ``all_bar`` in a mixed orientation for the C10.
+    Compared with the official app on the same live sample (228/230 kPa front,
+    247/244 kPa rear), only front-right was already in its physical position.
+    Keep this correction at the gateway boundary so every consumer receives the
+    canonical vehicle-oriented names.
+    """
     pressures = attribute(tires, "all_bar", {})
     if not isinstance(pressures, dict):
         pressures = {}
+    if "c10" in normalized_key(model):
+        pressures = {
+            "front_left": numeric(pressures.get("rear_left")),
+            "front_right": numeric(pressures.get("front_right")),
+            "rear_left": numeric(pressures.get("rear_right")),
+            "rear_right": numeric(pressures.get("front_left")),
+        }
+    else:
+        pressures = {key: numeric(value) for key, value in pressures.items()}
     scalars = object_scalar_map(tires)
     for key, value in object_scalar_map(attribute(status, "raw", {})).items():
         scalars.setdefault(key, value)
     aliases = {
-        "front_left": ("leftFrontTireTemperature", "frontLeftTireTemperature", "leftFrontTireTemp", "frontLeftTireTemp", "lfTireTemperature", "lfTireTemp"),
-        "front_right": ("rightFrontTireTemperature", "frontRightTireTemperature", "rightFrontTireTemp", "frontRightTireTemp", "rfTireTemperature", "rfTireTemp"),
-        "rear_left": ("leftRearTireTemperature", "rearLeftTireTemperature", "leftRearTireTemp", "rearLeftTireTemp", "lrTireTemperature", "rlTireTemp"),
-        "rear_right": ("rightRearTireTemperature", "rearRightTireTemperature", "rightRearTireTemp", "rearRightTireTemp", "rrTireTemperature", "rrTireTemp"),
+        "front_left": ("leftFrontTireTemperature", "frontLeftTireTemperature", "leftFrontTyreTemperature", "frontLeftTyreTemperature", "leftFrontTireTemp", "frontLeftTireTemp", "lfTireTemperature", "lfTireTemp", "tireTemperatureFL", "tyreTemperatureFL"),
+        "front_right": ("rightFrontTireTemperature", "frontRightTireTemperature", "rightFrontTyreTemperature", "frontRightTyreTemperature", "rightFrontTireTemp", "frontRightTireTemp", "rfTireTemperature", "rfTireTemp", "tireTemperatureFR", "tyreTemperatureFR"),
+        "rear_left": ("leftRearTireTemperature", "rearLeftTireTemperature", "leftRearTyreTemperature", "rearLeftTyreTemperature", "leftRearTireTemp", "rearLeftTireTemp", "lrTireTemperature", "rlTireTemp", "tireTemperatureRL", "tyreTemperatureRL"),
+        "rear_right": ("rightRearTireTemperature", "rearRightTireTemperature", "rightRearTyreTemperature", "rearRightTyreTemperature", "rightRearTireTemp", "rearRightTireTemp", "rrTireTemperature", "rrTireTemp", "tireTemperatureRR", "tyreTemperatureRR"),
     }
     temperatures: dict[str, float] = {}
     for position, names in aliases.items():
@@ -1037,7 +1053,7 @@ def tire_metrics(tires: Any, status: Any) -> tuple[dict[str, float | None], dict
         value = tire_temperature_c(direct if direct is not None else mapping_pick(scalars, names))
         if value is not None:
             temperatures[position] = value
-    return {key: numeric(value) for key, value in pressures.items()}, temperatures
+    return pressures, temperatures
 
 
 def maintenance_item(data: dict[str, Any], kind: str, source: str) -> dict[str, Any] | None:
@@ -2898,7 +2914,7 @@ def serialize_vehicle(
     security = attribute(status, "security")
     ignition = attribute(status, "ignition")
 
-    tire_data, tire_temperature_data = tire_metrics(tires, status)
+    tire_data, tire_temperature_data = tire_metrics(tires, status, model)
 
     speed_value = numeric(attribute(driving, "speed"))
     parked_value = bool_or_none(attribute(status, "is_parked")) if attribute(status, "is_parked") is not None else bool_or_none(attribute(driving, "is_parked"))
