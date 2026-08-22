@@ -1,5 +1,6 @@
 from pathlib import Path
 import ast
+import re
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -17,14 +18,18 @@ create_client = next(
 create_client_source = ast.get_source_segment(connector, create_client) or ""
 
 checks = {
-    "target_1_12_125": target == "1.12.125",
+    "target_preserves_1_12_125": tuple(int(part) for part in target.split(".")) >= (1, 12, 125),
     "connector_matches_target": f'CONNECTOR_VERSION = "{target}"' in connector,
     "engine_matches_target": f'ENGINE_VERSION = "{target}"' in telemetry,
     "automatic_ceiling_preserved": "TELEMETRY_NETWORK_BLOCK_CEILING_SECONDS = 4.0" in telemetry,
     "automatic_login_receives_ceiling": "self.telemetry_network_timeout_seconds" in telemetry,
     "factory_does_not_restore_12_second_floor": "max(12, min(45" not in create_client_source,
     "factory_accepts_short_telemetry_timeout": "max(1, min(45, int(request_timeout_seconds)))" in create_client_source,
-    "published_version_stays_previous_until_ci": 'version: "1.12.124"' in config,
+    "published_version_does_not_pass_target": (
+        (match := re.search(r'^version:\s*"([^"]+)"\s*$', config, flags=re.MULTILINE)) is not None
+        and tuple(int(part) for part in match.group(1).split("."))
+        <= tuple(int(part) for part in target.split("."))
+    ),
 }
 
 failed = [name for name, ok in checks.items() if not ok]

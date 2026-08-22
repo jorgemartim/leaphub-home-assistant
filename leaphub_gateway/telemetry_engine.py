@@ -55,7 +55,7 @@ except ModuleNotFoundError:
         EVENT_TRANSPORT = _event_transport_module.EVENT_TRANSPORT
 
 LOG = logging.getLogger("leaphub.telemetry")
-ENGINE_VERSION = "1.12.125"  # automatic login obeys the 4s manual-priority ceiling
+ENGINE_VERSION = "1.12.126"  # redundant scheduler pulse; telemetry/commands remain isolated
 
 # Hospedagem compartilhada (Apache/LiteSpeed) fecha a conexão ociosa em poucos
 # segundos. Reaproveitar depois disso escreve num socket já fechado e devolve
@@ -126,6 +126,9 @@ TRIP_GPS_FRESH_SECONDS = 120.0
 COMMAND_ANNOUNCE_TIMEOUT_SECONDS = 8.0
 COMMAND_ANNOUNCE_SOURCE_SUFFIX = "/api/internal/telemetry/events"
 COMMAND_ANNOUNCE_TARGET_SUFFIX = "/api/internal/commands/result"
+SCHEDULER_PULSE_INTERVAL_SECONDS = 55.0
+SCHEDULER_PULSE_TIMEOUT_SECONDS = 8.0
+SCHEDULER_PULSE_TARGET_SUFFIX = "/api/internal/scheduler/pulse"
 
 TELEMETRY_CONFIRMABLE_COMMANDS = frozenset({
     "lock",
@@ -573,6 +576,7 @@ class TelemetryEngine:
         self.delivery_event = threading.Event()
         self.delivery_worker: threading.Thread | None = None
         self.maintenance_worker: threading.Thread | None = None
+        self.scheduler_pulse_worker: threading.Thread | None = None
         # 1.12.51 — conexao TLS reaproveitada entre lotes de entrega.
         self._delivery_connection: http.client.HTTPConnection | None = None
         self._delivery_connection_key = ""
@@ -2623,6 +2627,10 @@ class TelemetryEngine:
             target=self._run_delivery, name="leaphub-telemetry-delivery", daemon=True
         )
         self.delivery_worker.start()
+        self.scheduler_pulse_worker = threading.Thread(
+            target=self._run_scheduler_pulse, name="leaphub-scheduler-pulse", daemon=True
+        )
+        self.scheduler_pulse_worker.start()
         LOG.info(
             "Telemetria contínua iniciada com fila persistente em %s; %s coletas paralelas e entrega dedicada.",
             self.db_path,
@@ -2639,6 +2647,8 @@ class TelemetryEngine:
             self.delivery_worker.join(timeout=12)
         if self.maintenance_worker and self.maintenance_worker.is_alive():
             self.maintenance_worker.join(timeout=6)
+        if self.scheduler_pulse_worker and self.scheduler_pulse_worker.is_alive():
+            self.scheduler_pulse_worker.join(timeout=10)
         pool, self._poll_pool = self._poll_pool, None
         if pool is not None:
             pool.shutdown(wait=True, cancel_futures=True)
@@ -3920,6 +3930,81 @@ class TelemetryEngine:
                 wait = 5.0
             self.delivery_event.wait(max(0.25, wait))
             self.delivery_event.clear()
+
+    def _run_scheduler_pulse(self) -> None:
+        """Segundo relógio do site, isolado de telemetria e comandos.
+
+        A hospedagem altera o crontab de um minuto para */15 ou */24. Este
+        worker envia somente um POST HMAC pequeno por ambiente habilitado. Ele
+        possui thread própria, conexão própria e nunca toca em sessão Leapmotor,
+        SQLite, fila de entrega, semáforo ou trava de conta.
+        """
+        if self.stop_event.wait(10.0):
+            return
+        last_status: dict[str, str] = {}
+        while not self.stop_event.is_set():
+            started = time.monotonic()
+            for environment in ("staging", "production"):
+                if not self.environment_enabled.get(environment, False):
+                    continue
+                ok, status = self._send_scheduler_pulse(environment)
+                previous = last_status.get(environment)
+                last_status[environment] = status
+                if ok and previous != "accepted":
+                    LOG.info("Pulso redundante do scheduler ativo em %s.", environment)
+                elif not ok and status not in {"unconfigured", "unsupported"} and status != previous:
+                    LOG.warning("Pulso redundante do scheduler indisponível em %s: %s", environment, status)
+            elapsed = max(0.0, time.monotonic() - started)
+            if self.stop_event.wait(max(5.0, SCHEDULER_PULSE_INTERVAL_SECONDS - elapsed)):
+                break
+
+    def _send_scheduler_pulse(self, environment: str) -> tuple[bool, str]:
+        url = self.delivery_urls.get(environment, "")
+        secret = self.secrets.get(environment, "")
+        if not url or len(secret) < 32 or not url.endswith(COMMAND_ANNOUNCE_SOURCE_SUFFIX):
+            return False, "unconfigured"
+        url = url[: -len(COMMAND_ANNOUNCE_SOURCE_SUFFIX)] + SCHEDULER_PULSE_TARGET_SUFFIX
+        try:
+            body = json.dumps(
+                {"gateway_version": ENGINE_VERSION, "sent_at": utc_iso()},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            parsed = urllib.parse.urlparse(url)
+            if parsed.scheme not in {"https", "http"} or not parsed.hostname:
+                return False, "invalid_url"
+            path = parsed.path or "/"
+            timestamp = str(int(time.time()))
+            nonce = os.urandom(16).hex()
+            canonical = f"POST\n{path}\n{timestamp}\n{nonce}\n{hashlib.sha256(body).hexdigest()}".encode()
+            headers = {
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "User-Agent": f"LeapHubGateway/{ENGINE_VERSION}",
+                "Content-Length": str(len(body)),
+                "Connection": "close",
+                "X-LeapHub-Timestamp": timestamp,
+                "X-LeapHub-Nonce": nonce,
+                "X-LeapHub-Environment": environment,
+                "X-LeapHub-Signature": hmac.new(secret.encode(), canonical, hashlib.sha256).hexdigest(),
+            }
+            target = f"{path}?{parsed.query}" if parsed.query else path
+            connection_class = http.client.HTTPSConnection if parsed.scheme == "https" else http.client.HTTPConnection
+            connection = connection_class(parsed.hostname, parsed.port, timeout=SCHEDULER_PULSE_TIMEOUT_SECONDS)
+            try:
+                connection.request("POST", target, body=body, headers=headers)
+                response = connection.getresponse()
+                status_code = int(response.status)
+                response.read(65536)
+            finally:
+                connection.close()
+            if status_code in {200, 202, 204}:
+                return True, "accepted"
+            if status_code == 404:
+                return False, "unsupported"
+            return False, f"http_{status_code}"
+        except (OSError, TimeoutError, ValueError, http.client.HTTPException) as exc:
+            return False, connector.clean_message(str(exc))[:160] or "transport_error"
 
     def _dispatch_due_subscriptions(self) -> bool:
         """Entrega ao pool as assinaturas vencidas que ainda não estão em coleta."""

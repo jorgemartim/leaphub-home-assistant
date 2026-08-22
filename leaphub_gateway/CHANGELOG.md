@@ -1,10 +1,12 @@
-## 1.12.125
+## 1.12.126
 
 - mantém a distribuição pré-compilada no GHCR oficial e a publicação em duas fases;
-- corrige o piso interno do cliente que transformava o teto de 4 s da
-  telemetria automática em 12 s durante a autenticação;
-- impede que uma primeira sessão fria retenha a conta por vários blocos longos
-  antes de liberar um comando manual;
-- preserva os timeouts maiores do despacho físico e a confirmação autoritativa
-  por telemetria;
+- adiciona um pulso HMAC independente a cada 55 segundos para manter o scheduler
+  do Site ativo mesmo quando a hospedagem reescreve o cron para `*/15` ou `*/24`;
+- isola o pulso em thread e conexão próprias, sem usar SQLite, sessão Leapmotor,
+  fila de telemetria, semáforo ou trava de comandos;
+- mantém o cron do cPanel como contingência, com os locks autoritativos do Site
+  impedindo execução sobreposta;
+- preserva integralmente as correções 1.12.117–1.12.125 de conforto, confirmação,
+  desembaçador e prioridade de comandos;
 - não altera, migra, recalcula nem remove dados coletados.
