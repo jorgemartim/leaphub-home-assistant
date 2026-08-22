@@ -38,7 +38,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-GATEWAY_VERSION = "1.12.128"
+GATEWAY_VERSION = "1.12.129"
 IS_RAILWAY = bool(os.getenv("RAILWAY_ENVIRONMENT_NAME") or os.getenv("RAILWAY_SERVICE_ID"))
 RUNTIME_DIR = Path(os.getenv("LEAPHUB_RUNTIME_DIR", "/tmp/leaphub-ocpp" if IS_RAILWAY else "."))
 BIND = os.getenv("LEAPHUB_OCPP_BIND", "0.0.0.0")
@@ -60,6 +60,8 @@ GATEWAY_PROVIDER = os.getenv("LEAPHUB_GATEWAY_PROVIDER", "home_assistant_tunnel"
 MAX_FRAME_BYTES = int(os.getenv("LEAPHUB_OCPP_MAX_FRAME_BYTES", str(1024 * 1024)))
 COMMAND_POLL_SECONDS = float(os.getenv("LEAPHUB_OCPP_COMMAND_POLL", "2.0"))
 COMMAND_IDLE_POLL_SECONDS = float(os.getenv("LEAPHUB_OCPP_COMMAND_IDLE_POLL", "10.0"))
+COMMAND_BATCH_SIZE = max(1, min(250, int(os.getenv("LEAPHUB_OCPP_COMMAND_BATCH_SIZE", "200"))))
+COMMAND_EXECUTION_PARALLELISM = max(1, min(32, int(os.getenv("LEAPHUB_OCPP_COMMAND_PARALLELISM", "16"))))
 STATUS_REPORT_SECONDS = max(15.0, float(os.getenv("LEAPHUB_OCPP_STATUS_INTERVAL", "30")))
 MAX_CONNECTIONS = max(1, int(os.getenv("LEAPHUB_OCPP_MAX_CONNECTIONS", "1000")))
 MAX_CONNECTIONS_PER_IP = max(1, int(os.getenv("LEAPHUB_OCPP_MAX_CONNECTIONS_PER_IP", "50")))
@@ -1237,7 +1239,6 @@ class ChargePointConnection:
                 await write_frame(self.writer, 0x9, os.urandom(4))
 
     async def run(self) -> None:
-        command_task = asyncio.create_task(self.command_loop())
         ping_task = asyncio.create_task(self.ping_loop())
         fragmented_opcode: int | None = None
         fragmented = bytearray()
@@ -1293,9 +1294,8 @@ class ChargePointConnection:
                 if not future.done():
                     future.set_exception(disconnect_error)
             self.pending_calls.clear()
-            command_task.cancel()
             ping_task.cancel()
-            for task in (command_task, ping_task):
+            for task in (ping_task,):
                 try:
                     await task
                 except (asyncio.CancelledError, Exception):
@@ -1788,6 +1788,124 @@ async def queue_loop() -> None:
             pass
 
 
+async def _execute_batched_identity_commands(
+    identity: str,
+    commands: list[dict[str, Any]],
+    semaphore: asyncio.Semaphore,
+) -> int:
+    """Executa em ordem os comandos de uma wallbox sem bloquear as demais."""
+    connection = CONNECTIONS.get(identity)
+    if connection is None or connection.closed:
+        return 0
+    executed = 0
+    async with semaphore:
+        for command in commands[:3]:
+            current = CONNECTIONS.get(identity)
+            if current is not connection or connection.closed:
+                break
+            await connection.execute_command(command)
+            executed += 1
+    return executed
+
+
+async def command_batch_loop() -> None:
+    """Um polling por lote substitui um loop HTTP por wallbox conectada.
+
+    Com 500 pontos e ciclo ocioso de 10 s, o desenho anterior podia produzir
+    cerca de 50 requests/s. Em lotes de 200, o mesmo trabalho usa três requests
+    por ciclo (aproximadamente 0,3 request/s), com no máximo 16 wallboxes
+    executando comandos simultaneamente.
+    """
+    target_failures = {target.name: 0 for target in API_TARGETS}
+    target_next_attempt = {target.name: 0.0 for target in API_TARGETS}
+    batch_supported = {target.name: True for target in API_TARGETS}
+    last_error: dict[str, str] = {}
+    last_logged: dict[str, float] = {}
+    while not STOP_EVENT.is_set():
+        now = time.monotonic()
+        commands_found = 0
+        for target in API_TARGETS:
+            if now < target_next_attempt.get(target.name, 0.0):
+                continue
+            identities = sorted(
+                identity for identity, connection in CONNECTIONS.items()
+                if not connection.closed and connection.target.name == target.name
+            )
+            if not identities:
+                target_failures[target.name] = 0
+                continue
+            try:
+                semaphore = asyncio.Semaphore(COMMAND_EXECUTION_PARALLELISM)
+                for start in range(0, len(identities), COMMAND_BATCH_SIZE):
+                    chunk = identities[start:start + COMMAND_BATCH_SIZE]
+                    if batch_supported.get(target.name, True):
+                        try:
+                            result = await asyncio.to_thread(
+                                api_call,
+                                target,
+                                {"action": "fetch_commands_batch", "identities": chunk},
+                                8.0,
+                            )
+                            grouped = result.get("commands_by_identity")
+                        except PermanentApiError as exc:
+                            if exc.error_code != "invalid_internal_action":
+                                raise
+                            # Compatibilidade de atualização: se o Gateway subir
+                            # antes do Site 1.12.417, mantém o contrato individual
+                            # até o Site ser instalado. A ordem recomendada segue
+                            # sendo Site primeiro para não criar pressão transitória.
+                            batch_supported[target.name] = False
+                            LOG.warning("Site %s ainda não oferece polling OCPP em lote; usando compatibilidade individual.", target.name)
+                            grouped = {}
+                    else:
+                        grouped = {}
+                    if not batch_supported.get(target.name, True):
+                        for identity in chunk:
+                            legacy = await asyncio.to_thread(
+                                api_call,
+                                target,
+                                {"action": "fetch_commands", "identity": identity},
+                                6.0,
+                            )
+                            commands = legacy.get("commands")
+                            if isinstance(commands, list) and commands:
+                                grouped[identity] = commands
+                    if not isinstance(grouped, dict):
+                        continue
+                    tasks = []
+                    for identity, raw_commands in grouped.items():
+                        if identity not in chunk or not isinstance(raw_commands, list):
+                            continue
+                        commands = [command for command in raw_commands if isinstance(command, dict)][:3]
+                        if commands:
+                            commands_found += len(commands)
+                            tasks.append(asyncio.create_task(
+                                _execute_batched_identity_commands(identity, commands, semaphore)
+                            ))
+                    if tasks:
+                        await asyncio.gather(*tasks, return_exceptions=True)
+                target_failures[target.name] = 0
+                target_next_attempt[target.name] = 0.0
+                last_error.pop(target.name, None)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                target_failures[target.name] = target_failures.get(target.name, 0) + 1
+                retry_after = float(getattr(exc, "retry_after_seconds", 0) or 0)
+                delay = max(retry_after, min(60.0, COMMAND_IDLE_POLL_SECONDS * (2 ** min(target_failures[target.name] - 1, 3))))
+                target_next_attempt[target.name] = now + delay
+                message = str(exc)
+                if message != last_error.get(target.name) or now - last_logged.get(target.name, 0.0) >= 900:
+                    LOG.warning("Batched command polling failed for %s; retry in %.0fs: %s", target.name, delay, message)
+                    last_error[target.name] = message
+                    last_logged[target.name] = now
+        wait = COMMAND_POLL_SECONDS if commands_found else COMMAND_IDLE_POLL_SECONDS
+        try:
+            await asyncio.wait_for(STOP_EVENT.wait(), timeout=max(1.0, wait))
+        except asyncio.TimeoutError:
+            pass
+
+
 
 def apply_route_overrides(source: ApiTarget, result: dict[str, Any]) -> None:
     if source.name != "production":
@@ -1832,6 +1950,11 @@ async def status_loop() -> None:
                 "ping_interval_seconds": int(PING_INTERVAL_SECONDS),
                 "liveness_timeout_seconds": int(LIVENESS_TIMEOUT_SECONDS),
             },
+            "command_polling": {
+                "mode": "batched",
+                "batch_size": COMMAND_BATCH_SIZE,
+                "parallelism": COMMAND_EXECUTION_PARALLELISM,
+            },
             "queue_diagnostics": queue_status,
             "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         }
@@ -1874,11 +1997,13 @@ async def main() -> None:
     LOG.info("Leap Hub OCPP gateway listening on %s", sockets)
     status_task = asyncio.create_task(status_loop())
     queue_task = asyncio.create_task(queue_loop())
+    command_batch_task = asyncio.create_task(command_batch_loop())
     async with server:
         await STOP_EVENT.wait()
     status_task.cancel()
     queue_task.cancel()
-    for task in (status_task, queue_task):
+    command_batch_task.cancel()
+    for task in (status_task, queue_task, command_batch_task):
         try:
             await task
         except asyncio.CancelledError:

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Read-only, redacted Leapmotor drivingRecord probe for Gateway 1.12.128.
+"""Read-only, redacted Leapmotor drivingRecord probe for Gateway 1.12.129.
 
 The caller MUST provide an already-authenticated persistent client. This module
 never logs in, refreshes a token, creates a second client, or returns raw vehicle
@@ -16,7 +16,7 @@ from urllib.parse import quote
 
 from leapmotor_api.crypto import build_signed_headers
 
-PROBE_VERSION = "1.12.128"
+PROBE_VERSION = "1.12.129"
 WINDOW_PATH = "/carownerservice/oversea/drivingRecord/v1/mileage/energy/detail"
 MAX_WINDOW_MS = 7 * 24 * 60 * 60 * 1000
 MIN_MILLISECONDS = 1_000_000_000_000

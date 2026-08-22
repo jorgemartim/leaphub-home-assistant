@@ -1,8 +1,9 @@
-## 1.12.128
+## 1.12.129
 
-- corrige, somente no Leapmotor C10, a orientação dos quatro valores de pressão
-  conforme comparação simultânea com o aplicativo oficial;
-- amplia aliases opcionais de temperatura sem estimar valores ausentes;
-- preserva B10 e outros modelos sem remapeamento, além de manter fila,
-  telemetria, comandos, OCPP e dados persistidos sem migração;
-- mantém a distribuição pré-compilada no GHCR e a promoção em duas fases.
+- troca o polling HTTP por wallbox por lotes de até 200 identidades;
+- limita a 16 execuções físicas paralelas e mantém ordem por equipamento;
+- com 500 wallboxes ociosas, reduz o polling de cerca de 50 requests/s para
+  aproximadamente 0,3 request/s;
+- preserva fallback individual durante atualização Site/Gateway e não altera
+  SQLite, filas, transações ou telemetria.
+- mantém a distribuição pré-compilada no GHCR e a promoção segura em duas fases.

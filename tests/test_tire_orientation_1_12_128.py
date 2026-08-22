@@ -1,9 +1,11 @@
 from types import SimpleNamespace
 
+from pathlib import Path
+
 from leaphub_gateway import connector
 
 
-TARGET = "1.12.128"
+TARGET = (Path(__file__).resolve().parents[1] / "leaphub_gateway" / "RELEASE_TARGET").read_text(encoding="utf-8").strip()
 
 
 def test_release_version_is_aligned():
