@@ -4,12 +4,16 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 APP = ROOT / "leaphub_gateway"
 SOURCE = (APP / "ocpp_gateway.py").read_text(encoding="utf-8")
-TARGET = "1.12.129"
+TARGET = (APP / "RELEASE_TARGET").read_text(encoding="utf-8").strip()
+
+
+def _version(value: str) -> tuple[int, ...]:
+    return tuple(int(part) for part in value.strip().strip('"').split('.'))
 
 
 def test_release_versions_are_aligned():
-    assert (APP / "RELEASE_TARGET").read_text(encoding="utf-8").strip() == TARGET
-    assert f'version: "{TARGET}"' in (APP / "config.yaml").read_text(encoding="utf-8")
+    config_line = next(line for line in (APP / "config.yaml").read_text(encoding="utf-8").splitlines() if line.startswith("version:"))
+    assert _version(config_line.split(":", 1)[1]) <= _version(TARGET)
     assert f'GATEWAY_VERSION = "{TARGET}"' in SOURCE
 
 

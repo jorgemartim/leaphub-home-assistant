@@ -14,6 +14,9 @@ configuration:
   connector_manual_wait_seconds:
     name: Manual operation wait
     description: Seconds a manual request may wait for an available cloud operation slot.
+  connector_manual_settle_seconds:
+    name: Post-command settling window
+    description: Maximum background confirmation window; it does not delay initial command acceptance.
   telemetry_beta_enabled:
     name: Enable Beta continuous telemetry
     description: Poll adaptively and deliver data to the Beta environment.
@@ -35,6 +38,15 @@ configuration:
   telemetry_active_seconds:
     name: Driving interval
     description: Polling frequency while driving or READY.
+  telemetry_interactive_seconds:
+    name: Leap Hub open interval
+    description: Temporary polling frequency while an authenticated vehicle page is visible.
+  telemetry_command_seconds:
+    name: Command confirmation interval
+    description: Delay between state reads that confirm an already dispatched command without repeating it.
+  telemetry_command_max_polls:
+    name: Maximum command confirmations
+    description: Maximum state reads used to confirm a new state. Recommended value is 5.
   telemetry_charging_seconds:
     name: Charging interval
     description: Polling frequency while charging.
@@ -46,7 +58,25 @@ configuration:
     description: Economy frequency after repeated parked readings.
   telemetry_rate_limit_cooldown_seconds:
     name: Leapmotor cloud protection cooldown
-    description: Automatic pause when request limiting is detected. Default is 30 minutes.
+    description: Automatic pause when request limiting is detected. Default is 15 minutes.
+  telemetry_presence_window_seconds:
+    name: Site presence window
+    description: How long interactive cadence stays active after the last authenticated presence.
+  telemetry_request_timeout_seconds:
+    name: Cloud request timeout
+    description: Maximum wait for a Leapmotor cloud response. Recommended value is 15 seconds.
+  telemetry_poll_workers:
+    name: Parallel account pollers
+    description: Different accounts can run in parallel while each account remains serialized.
+  telemetry_session_idle_seconds:
+    name: Reusable idle session
+    description: How long a healthy idle session remains reusable.
+  telemetry_vehicle_list_cache_seconds:
+    name: Vehicle list cache
+    description: Avoids requesting the same account vehicle list on every poll.
+  telemetry_message_cache_seconds:
+    name: Account message cache
+    description: Avoids repeating message calls when nothing relevant changed.
   telemetry_batch_size:
     name: Events per delivery
     description: Maximum readings sent to the site in one batch.
@@ -80,6 +110,21 @@ configuration:
   ocpp_production_max_connections:
     name: Production charger limit
     description: Maximum simultaneous OCPP connections.
+  ocpp_ping_interval_seconds:
+    name: OCPP ping interval
+    description: Charger connection keepalive frequency.
+  ocpp_liveness_timeout_seconds:
+    name: OCPP liveness timeout
+    description: Time without traffic before a connection is considered potentially inactive.
+  ocpp_disconnect_grace_seconds:
+    name: OCPP disconnect grace
+    description: Short window that prevents status flapping during an immediate reconnect.
+  ocpp_queue_max_events:
+    name: OCPP queue limit
+    description: Local protection for events and command results waiting for delivery.
+  ocpp_queue_retention_days:
+    name: OCPP queue retention
+    description: Days completed queue records remain in local storage.
   tunnel_enabled:
     name: Enable Cloudflare Tunnel
     description: Enable only after routes target local-leaphub-gateway.
@@ -89,6 +134,9 @@ configuration:
   tunnel_log_level:
     name: Tunnel log level
     description: cloudflared logging detail.
+  tunnel_protocol:
+    name: Tunnel protocol
+    description: HTTP/2 is the recommended stable mode; Auto allows automatic negotiation.
   log_level:
     name: Service log level
     description: Connector, OCPP and supervisor logging detail.

@@ -14,6 +14,9 @@ configuration:
   connector_manual_wait_seconds:
     name: Espera de operações manuais
     description: Segundos que uma ação manual pode aguardar vaga antes de retornar ocupado.
+  connector_manual_settle_seconds:
+    name: Janela de estabilização pós-comando
+    description: Tempo máximo reservado à confirmação em segundo plano; não atrasa o aceite inicial do comando.
   telemetry_beta_enabled:
     name: Ativar telemetria contínua Beta
     description: Coleta dados adaptativamente e entrega ao ambiente Beta.
@@ -35,6 +38,15 @@ configuration:
   telemetry_active_seconds:
     name: Intervalo durante viagem
     description: Consulta automática rápida durante viagem. O padrão é 20 segundos e usa proteção com recuo em caso de limite ou falha.
+  telemetry_interactive_seconds:
+    name: Intervalo com o Leap Hub aberto
+    description: Frequência temporária enquanto uma tela autenticada do veículo estiver visível.
+  telemetry_command_seconds:
+    name: Intervalo de confirmação de comando
+    description: Tempo entre leituras usadas para confirmar um comando já enviado, sem repetir a ação física.
+  telemetry_command_max_polls:
+    name: Máximo de confirmações por comando
+    description: "Limita quantas leituras podem tentar confirmar o novo estado. Recomendado: 5."
   telemetry_charging_seconds:
     name: Intervalo durante recarga
     description: Consulta automática durante carregamento. O padrão é 25 segundos para detectar o início e acompanhar a curva.
@@ -46,7 +58,25 @@ configuration:
     description: Frequência econômica após repouso prolongado. O padrão é 600 segundos, limitado pelo monitoramento em segundo plano quando ele estiver ativo.
   telemetry_rate_limit_cooldown_seconds:
     name: Pausa de proteção da nuvem Leapmotor
-    description: Tempo de espera automático quando o Gateway detectar limitação de requisições. O padrão é 30 minutos.
+    description: Tempo de espera automático quando o Gateway detectar limitação de requisições. O padrão é 15 minutos.
+  telemetry_presence_window_seconds:
+    name: Janela de presença do site
+    description: Por quanto tempo a cadência interativa permanece ativa após a última presença autenticada.
+  telemetry_request_timeout_seconds:
+    name: Timeout de cada chamada à nuvem
+    description: "Limite de espera por uma resposta da nuvem Leapmotor. Recomendado: 15 segundos."
+  telemetry_poll_workers:
+    name: Coletores de contas em paralelo
+    description: Contas diferentes podem ser consultadas em paralelo; uma mesma conta continua serializada.
+  telemetry_session_idle_seconds:
+    name: Sessão ociosa reutilizável
+    description: Tempo que uma sessão saudável pode ficar ociosa antes de ser encerrada.
+  telemetry_vehicle_list_cache_seconds:
+    name: Cache da lista de veículos
+    description: Evita pedir novamente a mesma lista de veículos a cada leitura.
+  telemetry_message_cache_seconds:
+    name: Cache de mensagens da conta
+    description: Evita repetir consultas de mensagens sem mudança relevante.
   telemetry_batch_size:
     name: Eventos por envio
     description: Quantidade máxima de leituras enviadas ao site em cada lote.
@@ -80,6 +110,21 @@ configuration:
   ocpp_production_max_connections:
     name: Limite de carregadores Produção
     description: Máximo de conexões OCPP simultâneas.
+  ocpp_ping_interval_seconds:
+    name: Intervalo de ping OCPP
+    description: Frequência do keepalive da conexão dos carregadores.
+  ocpp_liveness_timeout_seconds:
+    name: Timeout de presença OCPP
+    description: Tempo sem tráfego antes de considerar uma conexão possivelmente inativa.
+  ocpp_disconnect_grace_seconds:
+    name: Tolerância de desconexão OCPP
+    description: Janela curta para evitar oscilações de status durante uma reconexão imediata.
+  ocpp_queue_max_events:
+    name: Limite da fila OCPP
+    description: Proteção local para eventos e resultados aguardando entrega ao site.
+  ocpp_queue_retention_days:
+    name: Retenção da fila OCPP
+    description: Dias de retenção dos itens já encerrados no armazenamento local.
   tunnel_enabled:
     name: Ativar Cloudflare Tunnel
     description: Ative somente depois de apontar as rotas para local-leaphub-gateway.
@@ -89,6 +134,9 @@ configuration:
   tunnel_log_level:
     name: Nível de log do Tunnel
     description: Quantidade de detalhes do cloudflared.
+  tunnel_protocol:
+    name: Protocolo do Tunnel
+    description: HTTP/2 é o modo estável recomendado; Auto permite negociação automática.
   log_level:
     name: Nível de log dos serviços
     description: Quantidade de detalhes do Connector, OCPP e supervisor interno.

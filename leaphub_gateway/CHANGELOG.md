@@ -1,9 +1,7 @@
-## 1.12.129
+## 1.12.130
 
-- troca o polling HTTP por wallbox por lotes de até 200 identidades;
-- limita a 16 execuções físicas paralelas e mantém ordem por equipamento;
-- com 500 wallboxes ociosas, reduz o polling de cerca de 50 requests/s para
-  aproximadamente 0,3 request/s;
-- preserva fallback individual durante atualização Site/Gateway e não altera
-  SQLite, filas, transações ou telemetria.
-- mantém a distribuição pré-compilada no GHCR e a promoção segura em duas fases.
+- O painel Ingress usa a versão real do add-on, eliminando o rótulo fixo `v1.12.48`.
+- Novo cartão sanitizado compara apenas parâmetros numéricos não secretos com o perfil recomendado e explica valores legados que podem aumentar latência.
+- Todos os campos avançados de telemetria, OCPP e Tunnel passam a ter nomes e descrições em português e inglês.
+- A distribuição permanece pré-compilada no GHCR e só é anunciada ao Home Assistant depois do smoke test público.
+- Nenhuma fila, credencial, telemetria, transação ou banco local é alterado.

@@ -25,7 +25,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-VERSION = "1.12.129"
+VERSION = "1.12.130"
 OPTIONS_PATH = Path(os.getenv("LEAPHUB_OPTIONS_PATH", "/data/options.json"))
 RUNTIME = Path(os.getenv("LEAPHUB_RUNTIME_DIR", "/data/runtime"))
 LOG_DIR = Path(os.getenv("LEAPHUB_LOG_DIR", "/data/logs"))
@@ -702,6 +702,7 @@ def diagnostic_export_payload() -> dict[str, Any]:
         "telemetry": base.get("telemetry") if isinstance(base.get("telemetry"), dict) else {},
         "ocpp_queue": base.get("ocpp_queue") if isinstance(base.get("ocpp_queue"), dict) else {},
         "operation_limiter": limiter,
+        "configuration": configuration_profile(),
     }
 
 
@@ -709,6 +710,38 @@ def persist_status() -> None:
     temporary = STATUS_PATH.with_suffix(".tmp")
     temporary.write_text(json.dumps(status_payload(False), ensure_ascii=False), encoding="utf-8")
     temporary.replace(STATUS_PATH)
+
+
+def configuration_profile() -> dict[str, Any]:
+    """Expose only non-secret tuning advice for the local owner dashboard."""
+    expected = {
+        "connector_max_parallel": (4, "Consultas simultâneas", "Evita pressão desnecessária na nuvem Leapmotor."),
+        "telemetry_command_max_polls": (5, "Máximo de confirmações", "Encerra confirmações inconclusivas sem prolongar a espera."),
+        "telemetry_charging_seconds": (25, "Intervalo durante recarga", "Detecta alterações de carga com a cadência atual."),
+        "telemetry_parked_seconds": (90, "Intervalo estacionado", "Detecta cabo e início de viagem sem consulta excessiva."),
+        "telemetry_request_timeout_seconds": (15, "Timeout da nuvem", "Evita que uma chamada lenta segure as próximas operações."),
+    }
+    recommendations = []
+    values: dict[str, int] = {}
+    for key, (recommended, label, impact) in expected.items():
+        try:
+            current = int(OPTIONS.get(key) if OPTIONS.get(key) is not None else recommended)
+        except (TypeError, ValueError):
+            current = recommended
+        values[key] = current
+        if current != recommended:
+            recommendations.append({
+                "key": key,
+                "label": label,
+                "current": current,
+                "recommended": recommended,
+                "impact": impact,
+            })
+    return {
+        "status": "attention" if recommendations else "optimized",
+        "values": values,
+        "recommendations": recommendations,
+    }
 
 
 DASHBOARD_HTML = r'''<!doctype html>
@@ -722,7 +755,7 @@ main{max-width:1180px;margin:auto;padding:24px}.hero{display:flex;gap:18px;align
 details{margin-top:12px}summary{cursor:pointer;color:var(--muted)}pre{white-space:pre-wrap;word-break:break-word;background:#050c15;border:1px solid var(--line);border-radius:12px;padding:12px;max-height:260px;overflow:auto;color:#bcd0e8;font-size:12px}.wide{grid-column:1/-1}.routes{display:grid;grid-template-columns:1fr auto;gap:8px}.routes code{background:#050c15;border:1px solid var(--line);border-radius:10px;padding:9px;overflow:auto}.notice{border-left:3px solid var(--blue);padding:10px 12px;background:rgba(85,167,255,.08);border-radius:10px;color:#cfe4ff}.foot{color:var(--muted);text-align:center;padding:20px}
 @media(max-width:760px){main{padding:14px}.grid{grid-template-columns:1fr}.hero{align-items:flex-start}.badge{display:none}.meta{grid-template-columns:1fr 1fr}.routes{grid-template-columns:1fr}}
 </style></head><body><main>
-<div class="hero"><div class="mark">LH</div><div><h1>Leap Hub Gateway</h1><p class="sub">Telemetria resiliente, Connector, OCPP e Cloudflare em um único App</p></div><span class="badge">v1.12.48</span></div>
+<div class="hero"><div class="mark">LH</div><div><h1>Leap Hub Gateway</h1><p class="sub">Telemetria resiliente, Connector, OCPP e Cloudflare em um único App</p></div><span class="badge">v__VERSION__</span></div>
 <div class="grid" id="cards"></div>
 <section class="card wide" style="margin-top:16px"><div class="head"><div><h2>Rotas do Cloudflare Tunnel</h2><p>Como o Tunnel roda dentro do mesmo App, use 127.0.0.1 nas origens.</p></div><a class="btn secondary" href="api/diagnostics/export">Exportar diagnóstico</a></div><div class="routes"><code>connector.leaphub.com.br → http://127.0.0.1:8094</code><span>Connector</span><code>ocpp-wallbox.leaphub.com.br → http://127.0.0.1:8092</code><span>OCPP Wallbox · ambiente ativo</span></div><p class="notice">A fila de telemetria sobrevive a reinícios do App. Uma queda do Home Assistant inteiro ainda cria uma lacuna real, que nunca será preenchida com dados inventados.</p></section>
 <div class="foot">Tokens e chaves nunca são exibidos neste painel.</div></main><script>
@@ -732,7 +765,8 @@ async function action(name,kind){const b=document.querySelector(`[data-action="$
 function card(name,s){const health=s.health||{};const logs=(s.logs||[]).join('\n');return `<article class="card"><div class="head"><div><h2>${esc(labels[name]||s.label)}</h2><p>${s.configured?'Configuração pronta':'Configuração pendente'}</p></div><span class="state ${esc(s.state)}">${esc(s.state.replaceAll('_',' '))}</span></div><div class="meta"><div>Saúde<strong>${health.ok?'OK':'Atenção'}</strong></div><div>PID<strong>${esc(s.pid||'—')}</strong></div><div>Reinícios<strong>${esc(s.restarts)}</strong></div></div><div class="actions"><button class="btn" data-action="${name}-test" onclick="action('${name}','test')">Testar</button><button class="btn secondary" data-action="${name}-restart" onclick="action('${name}','restart')" ${!s.enabled||!s.configured?'disabled':''}>Reiniciar serviço</button></div><details><summary>Logs recentes</summary><pre>${esc(logs||'Sem logs nesta inicialização.')}</pre></details></article>`}
 function telemetryCard(t){return `<article class="card"><div class="head"><div><h2>Telemetria contínua</h2><p>Sincronização ordenada, deduplicação e fila persistente</p></div><span class="state ${t.status==='active'?'running':'disabled'}">${esc(t.status||'waiting')}</span></div><div class="meta"><div>Veículos<strong>${esc(t.tracked_vehicles||0)}</strong></div><div>Pendentes<strong>${esc(t.pending_events||0)}</strong></div><div>Confirmação de comando<strong>${esc(t.command_windows||0)}</strong></div></div><p class="notice">Última coleta: ${esc(t.last_success_at||'aguardando veículo')} · Leituras repetidas evitadas: ${esc(t.deduplicated_events||0)} · Falhas permanentes: ${esc(t.failed_events||0)}</p></article>`}
 function ocppQueueCard(q){const busy=(q.queued_events||0)+(q.queued_command_results||0)>0;return `<article class="card"><div class="head"><div><h2>Fila OCPP</h2><p>Replay justo por usuário, com FIFO preservado por wallbox</p></div><span class="state ${busy?'needs_configuration':'running'}">${busy?'processando':'isolada'}</span></div><div class="meta"><div>Eventos<strong>${esc(q.queued_events||0)}</strong></div><div>Resultados<strong>${esc(q.queued_command_results||0)}</strong></div><div>Usuários/escopos<strong>${esc(q.owner_scopes||0)}</strong></div></div><p class="notice">Maior backlog por usuário: ${esc(q.largest_owner_event_backlog||0)} · Maior backlog por wallbox: ${esc(q.largest_identity_event_backlog||0)} · Quarentena: ${esc(q.quarantined_deliveries||0)}. Round-robin persistente por usuário: mesmo com mais usuários que o tamanho do lote, o cursor continua da última vez e evita starvation.</p></article>`}
-async function load(){const r=await fetch('api/status',{cache:'no-store'});const j=await r.json();document.getElementById('cards').innerHTML=Object.entries(j.services).map(([n,s])=>card(n,s)).join('')+telemetryCard(j.telemetry||{})+ocppQueueCard(j.ocpp_queue||{})}
+function configurationCard(c){const items=Array.isArray(c.recommendations)?c.recommendations:[];const rows=items.map(i=>`<div class="notice"><strong>${esc(i.label)}</strong>: ${esc(i.current)} → ${esc(i.recommended)}<br><small>${esc(i.impact)}</small></div>`).join('');return `<article class="card"><div class="head"><div><h2>Configuração de desempenho</h2><p>Comparação segura com o perfil recomendado desta versão</p></div><span class="state ${items.length?'needs_configuration':'running'}">${items.length?'revisar':'otimizada'}</span></div>${rows||'<p class="notice">Os parâmetros não secretos estão alinhados com esta versão.</p>'}</article>`}
+async function load(){const r=await fetch('api/status',{cache:'no-store'});const j=await r.json();document.getElementById('cards').innerHTML=Object.entries(j.services).map(([n,s])=>card(n,s)).join('')+telemetryCard(j.telemetry||{})+ocppQueueCard(j.ocpp_queue||{})+configurationCard(j.configuration||{})}
 load();setInterval(load,5000);
 </script></body></html>'''
 
@@ -776,7 +810,7 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(raw)
             return
         if path == "/":
-            raw = DASHBOARD_HTML.replace("__TOKEN__", UI_TOKEN).encode()
+            raw = DASHBOARD_HTML.replace("__TOKEN__", UI_TOKEN).replace("__VERSION__", VERSION).encode()
             self.send_response(200)
             self.common_headers("text/html; charset=utf-8", len(raw))
             self.end_headers()

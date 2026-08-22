@@ -55,7 +55,7 @@ except ModuleNotFoundError:
         EVENT_TRANSPORT = _event_transport_module.EVENT_TRANSPORT
 
 LOG = logging.getLogger("leaphub.telemetry")
-ENGINE_VERSION = "1.12.129"  # batched OCPP polling; telemetry contract unchanged
+ENGINE_VERSION = "1.12.130"  # configuration diagnostics; telemetry contract unchanged
 
 # Hospedagem compartilhada (Apache/LiteSpeed) fecha a conexão ociosa em poucos
 # segundos. Reaproveitar depois disso escreve num socket já fechado e devolve
