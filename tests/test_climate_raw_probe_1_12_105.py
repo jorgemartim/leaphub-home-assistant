@@ -19,6 +19,7 @@ def test_probe_logs_empty_once(monkeypatch):
     assert connector.log_climate_comfort_raw_probe({}) is True
     assert connector.log_climate_comfort_raw_probe({}) is False
     assert len(seen) == 1
+    assert seen[0][0] == connector.logging.DEBUG
     assert seen[0][1] == "CLIMATE_RAW_PROBE raw_candidates=%s"
 
 def test_probe_logs_each_raw_change(monkeypatch):

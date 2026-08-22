@@ -1,12 +1,9 @@
-## 1.12.126
+## 1.12.127
 
-- mantém a distribuição pré-compilada no GHCR oficial e a publicação em duas fases;
-- adiciona um pulso HMAC independente a cada 55 segundos para manter o scheduler
-  do Site ativo mesmo quando a hospedagem reescreve o cron para `*/15` ou `*/24`;
-- isola o pulso em thread e conexão próprias, sem usar SQLite, sessão Leapmotor,
-  fila de telemetria, semáforo ou trava de comandos;
-- mantém o cron do cPanel como contingência, com os locks autoritativos do Site
-  impedindo execução sobreposta;
-- preserva integralmente as correções 1.12.117–1.12.125 de conforto, confirmação,
-  desembaçador e prioridade de comandos;
-- não altera, migra, recalcula nem remove dados coletados.
+- inclui aquecimento e ventilação dos bancos na cadência rápida e limitada de
+  confirmação, sem reenviar comandos físicos;
+- mantém os diagnósticos brutos `CLIMATE_RAW_PROBE` e `CLIMATE_COMFORT_DIAG`
+  disponíveis em DEBUG, retirando o ruído do log operacional padrão;
+- preserva o pulso redundante do scheduler, fila persistente, telemetria,
+  comandos, banco SQLite, distribuição pré-compilada no GHCR e todo o histórico
+  coletado.

@@ -78,6 +78,7 @@ def test_climate_comfort_diag_logs_only_when_snapshot_changes(monkeypatch):
     assert connector.log_climate_comfort_diag(climate, seat, mirrors) is True
     assert connector.log_climate_comfort_diag(climate, seat, mirrors) is False
     assert len(seen) == 1
+    assert seen[0][0] == connector.logging.DEBUG
     seat2 = dict(seat)
     seat2["steering_wheel_heating"] = 1
     assert connector.log_climate_comfort_diag(climate, seat2, mirrors) is True

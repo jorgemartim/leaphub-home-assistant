@@ -44,7 +44,7 @@ except ImportError:
         _privacy_spec.loader.exec_module(_privacy_module)
         sanitize_log = _privacy_module.sanitize_log
 
-CONNECTOR_VERSION = "1.12.126"
+CONNECTOR_VERSION = "1.12.127"
 MAX_INPUT_BYTES = 1024 * 1024
 logging.getLogger("leapmotor_api").setLevel(logging.WARNING)
 LOGGER = logging.getLogger("leaphub.connector")
@@ -1269,7 +1269,7 @@ def log_climate_comfort_raw_probe(raw_signals: dict[str, Any]) -> bool:
         return False
     _CLIMATE_COMFORT_RAW_PROBE_LAST_SIGNATURE = signature
     connector_log(
-        logging.INFO,
+        logging.DEBUG,
         "CLIMATE_RAW_PROBE raw_candidates=%s",
         json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=json_default),
     )
@@ -1306,7 +1306,7 @@ def log_climate_comfort_diag(
         return False
     _CLIMATE_COMFORT_DIAG_LAST_SIGNATURE = signature
     connector_log(
-        logging.INFO,
+        logging.DEBUG,
         "CLIMATE_COMFORT_DIAG climate=%s comfort=%s mirrors=%s raw_candidates=%s",
         json.dumps(snapshot["climate"], ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=json_default),
         json.dumps(snapshot["comfort"], ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=json_default),

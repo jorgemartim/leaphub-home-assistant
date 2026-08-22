@@ -77,7 +77,8 @@ def test_scheduler_pulse_is_signed_and_uses_dedicated_route():
     assert isinstance(headers, dict)
     payload = json.loads(body)
     assert set(payload) == {"gateway_version", "sent_at"}
-    assert payload["gateway_version"] == TARGET == "1.12.126"
+    assert payload["gateway_version"] == TARGET
+    assert tuple(int(part) for part in TARGET.split(".")) >= (1, 12, 126)
     timestamp = str(headers["X-LeapHub-Timestamp"])
     nonce = str(headers["X-LeapHub-Nonce"])
     canonical = (

@@ -55,7 +55,7 @@ except ModuleNotFoundError:
         EVENT_TRANSPORT = _event_transport_module.EVENT_TRANSPORT
 
 LOG = logging.getLogger("leaphub.telemetry")
-ENGINE_VERSION = "1.12.126"  # redundant scheduler pulse; telemetry/commands remain isolated
+ENGINE_VERSION = "1.12.127"  # fast seat confirmation and quiet opt-in comfort diagnostics
 
 # Hospedagem compartilhada (Apache/LiteSpeed) fecha a conexão ociosa em poucos
 # segundos. Reaproveitar depois disso escreve num socket já fechado e devolve
@@ -192,6 +192,7 @@ COMFORT_FAST_CONFIRMATION_COMMANDS = frozenset().union(
     CONFIRMATION_SUPERSESSION_FAMILIES["climate"],
     CONFIRMATION_SUPERSESSION_FAMILIES["steering_heat"],
     CONFIRMATION_SUPERSESSION_FAMILIES["mirror_heat"],
+    frozenset({"seat_heat", "seat_ventilation"}),
 )
 
 
