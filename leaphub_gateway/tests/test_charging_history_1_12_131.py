@@ -74,7 +74,7 @@ def test_no_parse_diagnostic_left_after_failure():
     c=Client()
     def failure(status,body,label):c.last_api_results[label]={'message':'private'};raise ValueError('synthetic failure')
     c._parse_api_body=failure
-    with pytest.raises(ValueError):read(c)
+    assert read(c)['reason']=='charging_response_invalid'
     assert c.last_api_results=={}
 
 @pytest.fixture

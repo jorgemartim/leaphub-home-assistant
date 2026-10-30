@@ -55,7 +55,7 @@ except ModuleNotFoundError:
         EVENT_TRANSPORT = _event_transport_module.EVENT_TRANSPORT
 
 LOG = logging.getLogger("leaphub.telemetry")
-ENGINE_VERSION = "1.12.131"  # configuration diagnostics; telemetry contract unchanged
+ENGINE_VERSION = "1.12.132"  # configuration diagnostics; telemetry contract unchanged
 
 # Hospedagem compartilhada (Apache/LiteSpeed) fecha a conexão ociosa em poucos
 # segundos. Reaproveitar depois disso escreve num socket já fechado e devolve
@@ -1757,6 +1757,10 @@ class TelemetryEngine:
                     "total_ms": elapsed_ms,
                 }
             current["last_used_at"] = time.time()
+            if charging_probe and result.get("ok") is False:
+                diagnostic = result.get("diagnostic") or {}
+                LOG.info("Histórico de recargas indisponível; motivo=%s http=%s codigo=%s; sem dados brutos.",
+                         result.get("reason"), diagnostic.get("cloud_http_status"), diagnostic.get("cloud_code"))
             result.update({
                 "low_priority": True, "session_reused": True, "engine_version": ENGINE_VERSION,
                 "connector_version": connector.CONNECTOR_VERSION, "library_version": connector.package_version(),

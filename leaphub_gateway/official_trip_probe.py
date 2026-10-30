@@ -9,14 +9,16 @@ any response field is promoted to an ``official_*`` semantic alias.
 from __future__ import annotations
 
 import math
+import json
 import re
 import time
 from typing import Any
 from urllib.parse import quote
 
 from leapmotor_api.crypto import build_signed_headers
+from leapmotor_api.exceptions import LeapmotorApiError
 
-PROBE_VERSION = "1.12.131"
+PROBE_VERSION = "1.12.132"
 WINDOW_PATH = "/carownerservice/oversea/drivingRecord/v1/mileage/energy/detail"
 MAX_WINDOW_MS = 7 * 24 * 60 * 60 * 1000
 MIN_MILLISECONDS = 1_000_000_000_000
@@ -256,9 +258,56 @@ def probe_windowed_mileage_energy(client: Any, *, vin: str, begin_ms: int, end_m
     return result
 
 # Separate, versioned contract: never interpret driving totals as charging kWh.
-CHARGING_PROBE_VERSION = "1.12.131"
+CHARGING_PROBE_VERSION = "1.12.132"
 CHARGING_PATH = "/carownerservice/charge/daily/detail/page"
 CHARGING_PAGE_SIZE = 25
+
+
+def _charging_failure(response: dict[str, Any] | None, reason: str) -> dict[str, Any]:
+    """Only bounded status codes and fixed shape enums leave the cloud reader."""
+    status = response.get("status_code") if isinstance(response, dict) else None
+    status = status if type(status) is int and 100 <= status <= 599 else None
+    body = None
+    if isinstance(response, dict) and isinstance(response.get("body"), str):
+        try:
+            body = json.loads(response["body"])
+        except (ValueError, TypeError):
+            pass
+    raw_code = body.get("code") if isinstance(body, dict) else None
+    code = None
+    if type(raw_code) is int and abs(raw_code) <= 99_999_999:
+        code = raw_code
+    elif isinstance(raw_code, str) and re.fullmatch(r"-?\d{1,8}", raw_code, flags=re.ASCII):
+        code = int(raw_code)
+    def shape(value: Any) -> str:
+        if isinstance(value, dict):
+            return "object"
+        if isinstance(value, list):
+            return "list"
+        return "missing" if value is None else "scalar"
+    data = body.get("data") if isinstance(body, dict) else None
+    records = data.get("list") if isinstance(data, dict) else None
+    diagnostic = {"cloud_http_status": status, "cloud_code": code,
+                  "response_format": shape(body), "data_format": shape(data), "records_format": shape(records)}
+    if reason == "charging_response_invalid":
+        message = body.get("message") if isinstance(body, dict) else None
+        expired = isinstance(message, str) and any(marker in message[:4096].lower() for marker in (
+            "token expired", "session expired", "invalid token", "token is invalid", "expired token"))
+        if status == 401 or expired:
+            reason = "charging_auth_unavailable"
+        elif status == 403:
+            reason = "charging_access_denied"
+        elif status == 429 or status is not None and status >= 500:
+            reason = "charging_cloud_temporary"
+        elif isinstance(body, dict) and raw_code is not None and raw_code != 0:
+            reason = "charging_cloud_rejected"
+    temporary = reason in {"charging_transport_error", "charging_cloud_temporary", "charging_auth_unavailable"}
+    result = {"ok": False, "temporary": temporary, "reason": reason,
+              "probe_kind": "charging_history", "probe_version": CHARGING_PROBE_VERSION,
+              "diagnostic": diagnostic, "raw_response_included": False}
+    if temporary:
+        result["retry_after_seconds"] = 20
+    return result
 
 
 def normalize_charging_options(payload: dict[str, Any]) -> tuple[int, int]:
@@ -294,20 +343,23 @@ def probe_charging_history(client: Any, *, vin: str, begin_ms: int, end_ms: int,
     headers.update(client._auth_headers())
     headers["Content-Type"] = "application/json"
     body = dict(signed, pageNum=page_num, pageSize=CHARGING_PAGE_SIZE)
-    response = client._post_json(path=CHARGING_PATH, headers=headers, json_body=body, cert=client.account_cert)
     label = "charging history bounded read"
+    response = None
     try:
-        parsed = client._parse_api_body(response["status_code"], response["body"], label)
+        response = client._post_json(path=CHARGING_PATH, headers=headers, json_body=body, cert=client.account_cert)
+        try:
+            parsed = client._parse_api_body(response["status_code"], response["body"], label)
+        except (LeapmotorApiError, AttributeError, TypeError, ValueError):
+            return _charging_failure(response, "charging_response_invalid")
+    except LeapmotorApiError:
+        return _charging_failure(response, "charging_response_invalid" if response is not None else "charging_transport_error")
     finally:
         results = getattr(client, "last_api_results", None)
         if isinstance(results, dict):
             results.pop(label, None)
     data = parsed.get("data") if isinstance(parsed, dict) else None
     if not isinstance(data, dict) or not isinstance(data.get("list"), list):
-        return {"ok": False, "temporary": False, "reason": "charging_shape_unavailable",
-                "probe_kind": "charging_history", "probe_version": CHARGING_PROBE_VERSION,
-                "message": "A nuvem não retornou o formato esperado do histórico de recargas.",
-                "raw_response_included": False}
+        return _charging_failure(response, "charging_shape_unavailable")
     raw = data["list"]
     records = []; invalid = 0; outside = 0; seen: set[tuple[int, int, str, float]] = set()
     for row in raw[:CHARGING_PAGE_SIZE]:
