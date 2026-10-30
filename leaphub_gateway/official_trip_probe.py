@@ -18,7 +18,7 @@ from urllib.parse import quote
 from leapmotor_api.crypto import build_signed_headers
 from leapmotor_api.exceptions import LeapmotorApiError
 
-PROBE_VERSION = "1.12.132"
+PROBE_VERSION = "1.12.133"
 WINDOW_PATH = "/carownerservice/oversea/drivingRecord/v1/mileage/energy/detail"
 MAX_WINDOW_MS = 7 * 24 * 60 * 60 * 1000
 MIN_MILLISECONDS = 1_000_000_000_000
@@ -258,21 +258,64 @@ def probe_windowed_mileage_energy(client: Any, *, vin: str, begin_ms: int, end_m
     return result
 
 # Separate, versioned contract: never interpret driving totals as charging kWh.
-CHARGING_PROBE_VERSION = "1.12.132"
+CHARGING_PROBE_VERSION = "1.12.133"
 CHARGING_PATH = "/carownerservice/charge/daily/detail/page"
 CHARGING_PAGE_SIZE = 25
+CHARGING_MAX_RESPONSE_BYTES = 2 * 1024 * 1024
+
+
+def _charging_content(response: dict[str, Any] | None) -> tuple[str | None, Any, dict[str, Any]]:
+    """Inspect content internally; expose only fixed format classes and key presence."""
+    raw = response.get("body") if isinstance(response, dict) else None
+    headers = response.get("headers") if isinstance(response, dict) else None
+    mime = ""
+    if isinstance(headers, dict):
+        for key, value in headers.items():
+            if str(key).lower() == "content-type" and isinstance(value, str):
+                mime = value[:128].lower().split(";", 1)[0].strip()
+                break
+    content_type = ("missing" if not mime else "json" if mime == "application/json" or mime.endswith("+json")
+                    else "html" if mime in {"text/html", "application/xhtml+xml"} else "text" if mime == "text/plain" else "other")
+    bom = isinstance(raw, str) and raw.startswith("\ufeff")
+    size = len(raw.encode("utf-8", errors="replace")) if isinstance(raw, str) else 0
+    bucket = "empty" if size == 0 else "small" if size <= 4096 else "medium" if size <= 65536 else "large" if size <= CHARGING_MAX_RESPONSE_BYTES else "oversized"
+    text = raw.removeprefix("\ufeff") if isinstance(raw, str) and size <= CHARGING_MAX_RESPONSE_BYTES else None
+    value = None
+    valid_json = False
+    if text is not None:
+        try:
+            value = json.loads(text)
+            valid_json = True
+        except (ValueError, TypeError, RecursionError):
+            pass
+    if not isinstance(raw, str):
+        body_format = "missing"
+    elif size > CHARGING_MAX_RESPONSE_BYTES:
+        body_format = "oversized"
+    elif text is not None and not text.strip():
+        body_format = "empty"
+    elif valid_json:
+        body_format = "json_object" if isinstance(value, dict) else "json_list" if isinstance(value, list) else "json_null" if value is None else "json_scalar"
+    elif text is not None and text.lstrip().lower().startswith(("<!doctype html", "<html")):
+        body_format = "html"
+    elif text is not None and text.lstrip().startswith("<"):
+        body_format = "markup"
+    else:
+        body_format = "non_json"
+    known_keys = [key for key in ("code", "result", "data", "message", "status", "error", "success")
+                  if isinstance(value, dict) and key in value]
+    envelope_status = value.get("status") if isinstance(value, dict) else None
+    envelope_status = envelope_status if type(envelope_status) is int and 100 <= envelope_status <= 599 else None
+    profile = {"body_format": body_format, "content_type": content_type, "size_bucket": bucket,
+               "utf8_bom": bom, "known_keys": known_keys, "envelope_status": envelope_status}
+    return text, value, profile
 
 
 def _charging_failure(response: dict[str, Any] | None, reason: str) -> dict[str, Any]:
     """Only bounded status codes and fixed shape enums leave the cloud reader."""
     status = response.get("status_code") if isinstance(response, dict) else None
     status = status if type(status) is int and 100 <= status <= 599 else None
-    body = None
-    if isinstance(response, dict) and isinstance(response.get("body"), str):
-        try:
-            body = json.loads(response["body"])
-        except (ValueError, TypeError):
-            pass
+    _text, body, profile = _charging_content(response)
     raw_code = body.get("code") if isinstance(body, dict) else None
     code = None
     if type(raw_code) is int and abs(raw_code) <= 99_999_999:
@@ -304,7 +347,7 @@ def _charging_failure(response: dict[str, Any] | None, reason: str) -> dict[str,
     temporary = reason in {"charging_transport_error", "charging_cloud_temporary", "charging_auth_unavailable"}
     result = {"ok": False, "temporary": temporary, "reason": reason,
               "probe_kind": "charging_history", "probe_version": CHARGING_PROBE_VERSION,
-              "diagnostic": diagnostic, "raw_response_included": False}
+              "diagnostic": diagnostic, "response_profile": profile, "raw_response_included": False}
     if temporary:
         result["retry_after_seconds"] = 20
     return result
@@ -347,8 +390,11 @@ def probe_charging_history(client: Any, *, vin: str, begin_ms: int, end_ms: int,
     response = None
     try:
         response = client._post_json(path=CHARGING_PATH, headers=headers, json_body=body, cert=client.account_cert)
+        parse_body, _value, _profile = _charging_content(response)
+        if parse_body is None or _profile["body_format"] not in {"json_object", "json_list", "json_null", "json_scalar"}:
+            return _charging_failure(response, "charging_response_invalid")
         try:
-            parsed = client._parse_api_body(response["status_code"], response["body"], label)
+            parsed = client._parse_api_body(response["status_code"], parse_body, label)
         except (LeapmotorApiError, AttributeError, TypeError, ValueError):
             return _charging_failure(response, "charging_response_invalid")
     except LeapmotorApiError:

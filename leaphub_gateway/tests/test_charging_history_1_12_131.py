@@ -118,3 +118,21 @@ def test_engine_changed_subscription_and_unknown_kind_never_touches_cloud(engine
     p=payload();p['probe_kind']='unknown'
     with pytest.raises(ValueError):e.execute_driving_record_probe('staging',p)
     assert c.calls==[]
+
+
+def test_133_wait_and_response_format_are_logged_without_raw_values(engine,caplog):
+    import logging
+    from telemetry_engine import LOG
+    e,c=engine;e.manual_pending_provider=lambda *a:True
+    with caplog.at_level(logging.INFO,logger=LOG.name):
+        assert e.execute_driving_record_probe('staging',payload())['reason']=='manual_priority'
+    assert 'motivo=manual_priority'in caplog.text and c.calls==[]
+    e.manual_pending_provider=lambda *a:False
+    def html_response(**kw):
+        c.calls.append(kw)
+        return {'status_code':200,'body':'<html>private-response-sentinel</html>','headers':{'Content-Type':'text/html; private-header-sentinel'}}
+    c._post_json=html_response
+    with caplog.at_level(logging.INFO,logger=LOG.name):
+        r=e.execute_driving_record_probe('staging',payload())
+    assert not r['ok'] and 'formato=html'in caplog.text and 'tipo=html'in caplog.text
+    assert 'private-'not in caplog.text and len(c.calls)==1 and c.timeout==30

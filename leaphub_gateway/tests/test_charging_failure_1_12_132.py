@@ -74,3 +74,50 @@ def test_real_sdk_transport_error_is_not_a_zero_or_login():
 def test_empty_cloud_history_still_requires_successful_protocol():
     r=read(SDKClient(body={'code':0,'data':{'list':[]}}));assert r['ok'] and r['charging_history']['records']==[]
     r=read(SDKClient(body={'code':40,'data':{'list':[]}}));assert not r['ok'] and 'charging_history'not in r
+
+# 1.12.133: format diagnostics and a narrow UTF-8 BOM compatibility fix.
+def test_133_utf8_bom_reproduces_sdk_failure_and_reads_valid_history():
+    from leapmotor_api.exceptions import LeapmotorApiError
+    body='\ufeff'+json.dumps({'code':0,'data':{'list':[row()]}})
+    c=SDKClient(body=body)
+    with pytest.raises(LeapmotorApiError):c._parse_api_body(200,body,'baseline-bom')
+    c.last_api_results.clear()
+    r=read(c);assert r['ok'] and r['charging_history']['records'][0]['energy_kwh']==12.5
+
+@pytest.mark.parametrize('body,expected',[
+ ('','empty'),(' \n\t','empty'),('<html>private-body-sentinel</html>','html'),
+ ('<!DOCTYPE html><html>private-body-sentinel</html>','html'),
+ ('<error>private-body-sentinel</error>','markup'),('private-body-sentinel','non_json'),
+ ('callback({"code":0,"data":{"list":[]}})','non_json'),
+ ("<html>{\"code\":0,\"data\":{\"list\":[]}}</html>",'html'),
+ ('null','json_null'),('[]','json_list'),('"private-body-sentinel"','json_scalar'),
+ ('{"error":"private-body-sentinel","status":500}','json_object'),
+ ('\ufeff<html>private-body-sentinel</html>','html'),
+])
+def test_133_invalid_200_is_classified_without_exposing_or_parsing_embedded_data(body,expected):
+    c=SDKClient(body=body);r=read(c)
+    assert not r['ok'] and r['response_profile']['body_format']==expected
+    assert 'charging_history'not in r and 'private-'not in json.dumps(r)
+    assert set(r['response_profile'])=={'body_format','content_type','size_bucket','utf8_bom','known_keys','envelope_status'}
+
+def test_133_bom_error_is_still_rejected_with_original_numeric_code():
+    r=read(SDKClient(body='\ufeff'+json.dumps({'code':40,'message':'private-body-sentinel','data':{'list':[]}})))
+    assert r['reason']=='charging_cloud_rejected' and r['diagnostic']['cloud_code']==40
+    assert r['response_profile']['utf8_bom'] is True
+
+@pytest.mark.parametrize('content_type,expected',[('application/json; secret=private-sentinel','json'),('application/problem+json','json'),('TEXT/HTML; charset=UTF-8','html'),('text/plain','text'),('private-type-sentinel','other')])
+def test_133_content_types_are_fixed_classes_not_header_values(content_type,expected):
+    c=SDKClient(body='<html>private-body-sentinel</html>')
+    post=c.session.post
+    def with_headers(*args,**kw):
+        response=post(*args,**kw);response.headers={'content-type':content_type,'Set-Cookie':'private-cookie-sentinel'};return response
+    c.session.post=with_headers
+    r=read(c);assert r['response_profile']['content_type']==expected
+    assert all(value not in json.dumps(r)for value in ['private-','Set-Cookie','charset'])
+
+def test_133_oversized_response_is_bounded_and_no_raw_keys_escape():
+    r=read(SDKClient(body='x'*(probe.CHARGING_MAX_RESPONSE_BYTES+1)))
+    assert r['response_profile']['body_format']=='oversized' and not r['ok']
+    r=read(SDKClient(body={'private-key-sentinel':'private-value-sentinel','message':'private-message-sentinel','status':500}))
+    assert r['response_profile']['known_keys']==['message','status']
+    assert r['response_profile']['envelope_status']==500
