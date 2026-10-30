@@ -16,7 +16,7 @@ from urllib.parse import quote
 
 from leapmotor_api.crypto import build_signed_headers
 
-PROBE_VERSION = "1.12.130"
+PROBE_VERSION = "1.12.131"
 WINDOW_PATH = "/carownerservice/oversea/drivingRecord/v1/mileage/energy/detail"
 MAX_WINDOW_MS = 7 * 24 * 60 * 60 * 1000
 MIN_MILLISECONDS = 1_000_000_000_000
@@ -254,3 +254,93 @@ def probe_windowed_mileage_energy(client: Any, *, vin: str, begin_ms: int, end_m
     if official_daily is not None:
         result["official_daily"] = official_daily
     return result
+
+# Separate, versioned contract: never interpret driving totals as charging kWh.
+CHARGING_PROBE_VERSION = "1.12.131"
+CHARGING_PATH = "/carownerservice/charge/daily/detail/page"
+CHARGING_PAGE_SIZE = 25
+
+
+def normalize_charging_options(payload: dict[str, Any]) -> tuple[int, int]:
+    page = payload.get("page_num", 1)
+    offset = payload.get("utc_offset_minutes", 0)
+    if isinstance(page, bool) or not isinstance(page, int) or not 1 <= page <= 5:
+        raise ValueError("A leitura aceita páginas de 1 a 5.")
+    if isinstance(offset, bool) or not isinstance(offset, int) or not -720 <= offset <= 840 or offset % 15:
+        raise ValueError("Fuso inválido para o histórico de recarga.")
+    return page, offset
+
+
+def probe_charging_history(client: Any, *, vin: str, begin_ms: int, end_ms: int,
+                           page_num: int = 1, utc_offset_minutes: int = 0) -> dict[str, Any]:
+    """Exactly one authenticated read; no login/refresh/retry or raw location/VIN in result."""
+    from datetime import datetime, timedelta, timezone
+    begin_ms, end_ms = normalize_window({"begintime_ms": begin_ms, "endtime_ms": end_ms})
+    page_num, utc_offset_minutes = normalize_charging_options({"page_num": page_num, "utc_offset_minutes": utc_offset_minutes})
+    vin = str(vin or "").strip().upper()
+    if len(vin) != 17 or not vin.isalnum():
+        raise ValueError("VIN indisponível para o histórico de recarga.")
+    zone = timezone(timedelta(minutes=utc_offset_minutes))
+    sign = "+" if utc_offset_minutes >= 0 else "-"
+    hours, minutes = divmod(abs(utc_offset_minutes), 60)
+    start = datetime.fromtimestamp(begin_ms / 1000, zone).date().isoformat()
+    end = datetime.fromtimestamp(end_ms / 1000, zone).date().isoformat()
+    zone_name = f"GMT{sign}{hours:02d}:{minutes:02d}"
+    # Keep the signing strings identical to SDK 0.3.2 / 0.6.0; JSON page values are ints.
+    signed = {"vin": vin, "timeZone": zone_name, "startTime": start, "endTime": end,
+              "pageNum": str(page_num), "pageSize": str(CHARGING_PAGE_SIZE)}
+    headers = build_signed_headers(sign_key=client.sign_key, device_id=client.device_id,
+                                   language=client.language, body_params=signed).to_dict()
+    headers.update(client._auth_headers())
+    headers["Content-Type"] = "application/json"
+    body = dict(signed, pageNum=page_num, pageSize=CHARGING_PAGE_SIZE)
+    response = client._post_json(path=CHARGING_PATH, headers=headers, json_body=body, cert=client.account_cert)
+    label = "charging history bounded read"
+    try:
+        parsed = client._parse_api_body(response["status_code"], response["body"], label)
+    finally:
+        results = getattr(client, "last_api_results", None)
+        if isinstance(results, dict):
+            results.pop(label, None)
+    data = parsed.get("data") if isinstance(parsed, dict) else None
+    if not isinstance(data, dict) or not isinstance(data.get("list"), list):
+        return {"ok": False, "temporary": False, "reason": "charging_shape_unavailable",
+                "probe_kind": "charging_history", "probe_version": CHARGING_PROBE_VERSION,
+                "message": "A nuvem não retornou o formato esperado do histórico de recargas.",
+                "raw_response_included": False}
+    raw = data["list"]
+    records = []; invalid = 0; outside = 0; seen: set[tuple[int, int, str, float]] = set()
+    for row in raw[:CHARGING_PAGE_SIZE]:
+        if not isinstance(row, dict):
+            invalid += 1
+            continue
+        try:
+            a = _as_millis(row.get("chargeGunStartTs"), "início")
+            b = _as_millis(row.get("chargeGunEndTs"), "fim")
+            value = row.get("chargeInEnergy")
+            if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+                raise ValueError("Energia inválida.")
+            kwh = float(value)
+            if not math.isfinite(kwh) or kwh < 0 or kwh > 500 or b <= a or b - a > MAX_WINDOW_MS:
+                raise ValueError("Registro inválido.")
+        except (TypeError, ValueError, OverflowError):
+            invalid += 1
+            continue
+        if b <= begin_ms or a >= end_ms:
+            outside += 1
+            continue
+        kind = {"1": "ac", "2": "dc"}.get(str(row.get("chargeType")), "unknown")
+        key = (a, b, kind, kwh)
+        if key in seen:
+            continue
+        seen.add(key)
+        records.append({"started_at_ms": a, "ended_at_ms": b, "energy_kwh": kwh, "charging_type": kind,
+                        "crosses_window": a < begin_ms or b > end_ms})
+    records.sort(key=lambda row: (row["started_at_ms"], row["ended_at_ms"]))
+    return {"ok": True, "probe_kind": "charging_history", "probe_version": CHARGING_PROBE_VERSION,
+            "raw_response_included": False, "charging_history": {
+                "schema_version": 1, "source": "leapmotor_cloud", "unit": "kWh",
+                "window": {"begintime_ms": begin_ms, "endtime_ms": end_ms},
+                "page_num": page_num, "page_size": CHARGING_PAGE_SIZE, "has_more_possible": len(raw) >= CHARGING_PAGE_SIZE,
+                "records": records, "invalid_records": invalid, "out_of_window": outside,
+                "response_truncated": len(raw) > CHARGING_PAGE_SIZE}}

@@ -65,7 +65,7 @@ except ModuleNotFoundError:
         _event_transport_spec.loader.exec_module(_event_transport_module)
         EVENT_TRANSPORT = _event_transport_module.EVENT_TRANSPORT
 
-VERSION = "1.12.130"
+VERSION = "1.12.131"
 API_VERSION = 2
 CAPABILITY_SCHEMA_VERSION = 1
 MIN_SUPPORTED_CLIENT_API_VERSION = 1
@@ -1938,7 +1938,7 @@ class Handler(BaseHTTPRequestHandler):
                 "supported_api_version": API_VERSION,
             })
             return
-        if self.path not in {"/v1/accounts/test", "/v1/vehicles/sync", "/v1/vehicles/sync/status", "/v1/vehicles/command", "/v1/vehicles/command/status", "/v1/vehicles/command/cancel", "/v1/telemetry/subscriptions/upsert", "/v1/telemetry/subscriptions/remove", "/v1/telemetry/subscriptions/boost", "/v1/telemetry/subscriptions/release", "/v1/vehicles/driving-record"}:
+        if self.path not in {"/v1/accounts/test", "/v1/vehicles/sync", "/v1/vehicles/sync/status", "/v1/vehicles/command", "/v1/vehicles/command/status", "/v1/vehicles/command/cancel", "/v1/telemetry/subscriptions/upsert", "/v1/telemetry/subscriptions/remove", "/v1/telemetry/subscriptions/boost", "/v1/telemetry/subscriptions/release", "/v1/vehicles/driving-record", "/v1/vehicles/charging-record"}:
             self.send_json(404, {"ok": False, "message": "Página não encontrada."})
             return
         try:
@@ -2033,9 +2033,10 @@ class Handler(BaseHTTPRequestHandler):
                         "connector_version": connector.CONNECTOR_VERSION,
                     })
                     return
-            if self.path == "/v1/vehicles/driving-record":
+            if self.path in {"/v1/vehicles/driving-record", "/v1/vehicles/charging-record"}:
                 try:
-                    result = TELEMETRY.execute_driving_record_probe(environment, payload)
+                    probe_payload = dict(payload, probe_kind="charging_history" if self.path == "/v1/vehicles/charging-record" else "mileage_energy")
+                    result = TELEMETRY.execute_driving_record_probe(environment, probe_payload)
                 except ValueError:
                     LOG.info("Sonda Official recusada por parâmetros ou escopo inválidos; conteúdo omitido.")
                     self.send_json(400, {
@@ -2070,6 +2071,8 @@ class Handler(BaseHTTPRequestHandler):
                     # Compatibilidade do contrato 1.12.72: a rota real já retornou acima,
                     # antes de manual_operation_enter. Chegar aqui indica regressão de fluxo.
                     raise RuntimeError("driving-record não pode entrar no caminho manual prioritário.")
+                elif self.path == "/v1/vehicles/charging-record":
+                    raise RuntimeError("charging-record não pode entrar no caminho manual prioritário.")
                 elif self.path == "/v1/accounts/test":
                     result = TELEMETRY.execute_account_operation(environment, payload, sync=False, origin="account_test")
                 elif self.path == "/v1/vehicles/sync":

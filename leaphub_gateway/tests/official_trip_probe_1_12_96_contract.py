@@ -11,12 +11,13 @@ def test_library_raw_debug_logging_remains_suppressed():
 
 
 def test_route_is_hmac_protected_early_and_has_safe_input_error():
-    call = "TELEMETRY.execute_driving_record_probe(environment, payload)"
+    call = "TELEMETRY.execute_driving_record_probe(environment, probe_payload)"
     verify = 'verify_signature("POST", self.path, body, self.headers)'
     pending = "pending_key = manual_operation_enter(environment, payload)"
     start = SERVER.index("    def do_POST(self) -> None:")
     end = SERVER.index("\n\nclass ConnectorHTTPServer", start)
     post = SERVER[start:end]
+    assert 'probe_kind="charging_history" if self.path == "/v1/vehicles/charging-record" else "mileage_energy"' in post
     assert post.count(call) == 1 and post.count(verify) == 1 and post.count(pending) == 1
     assert post.index(verify) < post.index(call) < post.index(pending)
     assert '"reason": "invalid_probe_input"' in post

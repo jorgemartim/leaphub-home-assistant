@@ -55,7 +55,7 @@ except ModuleNotFoundError:
         EVENT_TRANSPORT = _event_transport_module.EVENT_TRANSPORT
 
 LOG = logging.getLogger("leaphub.telemetry")
-ENGINE_VERSION = "1.12.130"  # configuration diagnostics; telemetry contract unchanged
+ENGINE_VERSION = "1.12.131"  # configuration diagnostics; telemetry contract unchanged
 
 # Hospedagem compartilhada (Apache/LiteSpeed) fecha a conexão ociosa em poucos
 # segundos. Reaproveitar depois disso escreve num socket já fechado e devolve
@@ -1517,15 +1517,22 @@ class TelemetryEngine:
         A manual command is rechecked at every boundary and wins before network.
         """
         try:
-            from leaphub_official_trip_probe import normalize_window, probe_windowed_mileage_energy
+            from leaphub_official_trip_probe import normalize_window, probe_windowed_mileage_energy, normalize_charging_options, probe_charging_history
         except ModuleNotFoundError:
-            from official_trip_probe import normalize_window, probe_windowed_mileage_energy
+            from official_trip_probe import normalize_window, probe_windowed_mileage_energy, normalize_charging_options, probe_charging_history
 
         overall_started = time.monotonic()
         account_id = self._account_id(payload)
         if account_id < 1:
             raise ValueError("Conta inválida para a sonda de histórico.")
         begin_ms, end_ms = normalize_window(payload)
+        probe_kind = payload.get("probe_kind", "mileage_energy")
+        charging_probe = probe_kind == "charging_history"
+        if not isinstance(probe_kind, str) or probe_kind not in {"mileage_energy", "charging_history"}:
+            raise ValueError("Tipo de leitura não suportado.")
+        if charging_probe and environment != "staging":
+            raise ValueError("A conferência de recargas está habilitada somente no Beta.")
+        page_num, utc_offset_minutes = normalize_charging_options(payload) if charging_probe else (1, 0)
         vehicle_id = str(payload.get("vehicle_id") or "").strip()[:190]
         direct_vin = str(payload.get("vehicle_vin") or "").strip().upper()
         if direct_vin and (len(direct_vin) != 17 or not direct_vin.isalnum()):
@@ -1732,7 +1739,10 @@ class TelemetryEngine:
 
             try:
                 with self._telemetry_request_timeout(client):
-                    result = probe_windowed_mileage_energy(client, vin=vin, begin_ms=begin_ms, end_ms=end_ms)
+                    if charging_probe:
+                        result = probe_charging_history(client, vin=vin, begin_ms=begin_ms, end_ms=end_ms, page_num=page_num, utc_offset_minutes=utc_offset_minutes)
+                    else:
+                        result = probe_windowed_mileage_energy(client, vin=vin, begin_ms=begin_ms, end_ms=end_ms)
             except Exception as exc:  # noqa: BLE001
                 elapsed_ms = int(round((time.monotonic() - overall_started) * 1000))
                 if connector.is_transient_cloud_error(exc):

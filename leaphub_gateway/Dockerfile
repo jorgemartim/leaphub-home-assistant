@@ -75,7 +75,9 @@ assert leaphub_telemetry_engine.ENGINE_VERSION
 assert leaphub_privacy.PRIVACY_VERSION
 assert leaphub_connection_orchestrator.ORCHESTRATOR is not None
 assert leaphub_event_transport.EVENT_TRANSPORT is not None
-assert leaphub_official_trip_probe.PROBE_VERSION == "1.12.130"
+assert leaphub_official_trip_probe.PROBE_VERSION == "1.12.131"
+assert leaphub_official_trip_probe.CHARGING_PROBE_VERSION == "1.12.131"
+assert callable(leaphub_official_trip_probe.probe_charging_history)
 assert TelemetryEngine is not None
 import os
 import sqlite3

@@ -1,7 +1,7 @@
-## 1.12.130
+## 1.12.131
 
-- O painel Ingress usa a versão real do add-on, eliminando o rótulo fixo `v1.12.48`.
-- Novo cartão sanitizado compara apenas parâmetros numéricos não secretos com o perfil recomendado e explica valores legados que podem aumentar latência.
-- Todos os campos avançados de telemetria, OCPP e Tunnel passam a ter nomes e descrições em português e inglês.
-- A distribuição permanece pré-compilada no GHCR e só é anunciada ao Home Assistant depois do smoke test público.
-- Nenhuma fila, credencial, telemetria, transação ou banco local é alterado.
+- Consulta de histórico de recargas em uma página por solicitação, usando a sessão já aberta e a prioridade/travas do leitor Official existente.
+- Novo endpoint HMAC `/v1/vehicles/charging-record`, com veículo autorizado, janela máxima de sete dias, fuso explícito e até cinco páginas de 25 registros.
+- Retorna somente início/fim, AC/DC e energia da nuvem, sem VIN, coordenadas, credenciais ou resposta bruta.
+- Nenhum login, refresh de token, retry automático, comando físico ou reescrita de transações/recargas nessa leitura.
+- Distribuição pré-compilada no GHCR em duas fases: config.yaml continua em 1.12.130 até a imagem 1.12.131 passar pelo fluxo oficial de build, smoke test e acesso público.
