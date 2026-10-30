@@ -98,7 +98,7 @@ def test_133_invalid_200_is_classified_without_exposing_or_parsing_embedded_data
     c=SDKClient(body=body);r=read(c)
     assert not r['ok'] and r['response_profile']['body_format']==expected
     assert 'charging_history'not in r and 'private-'not in json.dumps(r)
-    assert set(r['response_profile'])=={'body_format','content_type','size_bucket','utf8_bom','known_keys','envelope_status'}
+    assert set(r['response_profile'])=={'body_format','content_type','size_bucket','utf8_bom','known_keys','envelope_status','result_code','message_class'}
 
 def test_133_bom_error_is_still_rejected_with_original_numeric_code():
     r=read(SDKClient(body='\ufeff'+json.dumps({'code':40,'message':'private-body-sentinel','data':{'list':[]}})))
@@ -121,3 +121,42 @@ def test_133_oversized_response_is_bounded_and_no_raw_keys_escape():
     r=read(SDKClient(body={'private-key-sentinel':'private-value-sentinel','message':'private-message-sentinel','status':500}))
     assert r['response_profile']['known_keys']==['message','status']
     assert r['response_profile']['envelope_status']==500
+
+# 1.12.134: the observed alternate error envelope must not masquerade as a
+# successful or empty history, and no external error text may escape.
+@pytest.mark.parametrize('result,message,code,category,reason',[
+    (40,'No such permission private-message-sentinel',40,'access','charging_access_denied'),
+    ('-42','private-message-sentinel',-42,'unrecognized','charging_cloud_rejected'),
+    (100,'Token expired private-message-sentinel',100,'auth','charging_auth_unavailable'),
+    (500,'System busy private-message-sentinel',500,'temporary','charging_cloud_temporary'),
+    (-1,'Invalid signature private-message-sentinel',-1,'signature','charging_cloud_rejected'),
+    (-1,'Interface does not exist private-message-sentinel',-1,'route','charging_cloud_rejected'),
+    (-1,'Invalid parameter private-message-sentinel',-1,'request','charging_cloud_rejected'),
+    (True,'private-message-sentinel',None,'unrecognized','charging_response_invalid'),
+    (9999999999,'private-message-sentinel',None,'unrecognized','charging_response_invalid'),
+    ('private-result-sentinel','private-message-sentinel',None,'unrecognized','charging_response_invalid'),
+    (0,'private-message-sentinel',0,'unrecognized','charging_response_invalid'),
+    (0,'',0,'empty','charging_response_invalid'),
+    (0,None,0,'missing','charging_response_invalid'),
+])
+def test_134_alternate_result_message_error_envelope(result,message,code,category,reason):
+    r=read(SDKClient(body={'result':result,'message':message}))
+    assert not r['ok'] and r['reason']==reason and 'charging_history'not in r
+    assert r['diagnostic']['cloud_code']==code
+    assert r['response_profile']['result_code']==code
+    assert r['response_profile']['message_class']==category
+
+def test_134_alternate_result_is_never_success_or_precedence_over_code():
+    r=read(SDKClient(body={'result':0,'data':{'list':[row()]}}));assert not r['ok']
+    r=read(SDKClient(body={'code':40,'result':0,'data':{'list':[row()]}}))
+    assert not r['ok'] and r['diagnostic']['cloud_code']==40
+    r=read(SDKClient(body={'code':'private-code-sentinel','result':40}))
+    assert not r['ok'] and r['diagnostic']['cloud_code']is None
+    r=read(SDKClient(body={'code':0,'result':40,'data':{'list':[row()]}}))
+    assert r['ok'] and r['charging_history']['records'][0]['energy_kwh']==12.5
+
+def test_134_classification_is_bounded_and_unknown_values_remain_private():
+    r=read(SDKClient(body={'result':{'token':'private-token-sentinel'},'message':{'account':'private-account-sentinel'}}))
+    assert r['response_profile']['message_class']=='missing'and r['response_profile']['result_code']is None
+    r=read(SDKClient(body={'result':-1,'message':'x'*4096+'No such permission private-message-sentinel'}))
+    assert r['response_profile']['message_class']=='unrecognized'

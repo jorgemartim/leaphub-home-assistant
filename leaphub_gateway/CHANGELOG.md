@@ -1,7 +1,7 @@
-## 1.12.133
+## 1.12.134
 
-- Compatibilidade com BOM UTF-8 inicial no JSON de recargas, mantendo validação de HTTP, código, esquema e registros.
-- Perfil de formato, MIME e tamanho limitado no log, sem corpo, campos desconhecidos, identificadores ou credenciais. HTML/JSONP/resposta vazia não viram recargas de zero kWh.
-- Registra motivos fechados dos adiamentos do Gateway, além do diagnóstico de conteúdo da nuvem.
-- Mesma biblioteca 0.3.2, endpoint, fuso, assinatura, uma única leitura e prioridade/travas; sem login, refresh, retry ou comandos nessa consulta.
-- Compatível com o Site Beta 1.12.449. Distribuição pré-compilada no GHCR em duas fases; config.yaml só anuncia 133 após os testes da imagem e acesso público.
+- Trata envelopes de erro com result/message: fallback de código estritamente numérico e limitado, somente quando code está ausente.
+- Classifica mensagens conhecidas em categorias fechadas, sem texto externo no log ou resposta; avisos existentes de acesso, autenticação e indisponibilidade passam a reconhecer essas falhas.
+- result 0 sem o contrato de sucesso não vira histórico vazio ou registro válido.
+- Mesma API, biblioteca, assinatura, intervalo, travas e consulta única no Beta; nenhum recálculo de kWh ou escrita no histórico.
+- Compatível com Site Beta 449, sem novo ZIP; distribuição pré-compilada com anúncio no Home Assistant somente após imagem pública e testada.

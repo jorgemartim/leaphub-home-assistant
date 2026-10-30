@@ -18,7 +18,7 @@ from urllib.parse import quote
 from leapmotor_api.crypto import build_signed_headers
 from leapmotor_api.exceptions import LeapmotorApiError
 
-PROBE_VERSION = "1.12.133"
+PROBE_VERSION = "1.12.134"
 WINDOW_PATH = "/carownerservice/oversea/drivingRecord/v1/mileage/energy/detail"
 MAX_WINDOW_MS = 7 * 24 * 60 * 60 * 1000
 MIN_MILLISECONDS = 1_000_000_000_000
@@ -258,10 +258,39 @@ def probe_windowed_mileage_energy(client: Any, *, vin: str, begin_ms: int, end_m
     return result
 
 # Separate, versioned contract: never interpret driving totals as charging kWh.
-CHARGING_PROBE_VERSION = "1.12.133"
+CHARGING_PROBE_VERSION = "1.12.134"
 CHARGING_PATH = "/carownerservice/charge/daily/detail/page"
 CHARGING_PAGE_SIZE = 25
 CHARGING_MAX_RESPONSE_BYTES = 2 * 1024 * 1024
+
+
+def _charging_numeric_code(value: Any) -> int | None:
+    if type(value) is int and abs(value) <= 99_999_999:
+        return value
+    if isinstance(value, str) and re.fullmatch(r"-?\d{1,8}", value, flags=re.ASCII):
+        return int(value)
+    return None
+
+
+def _charging_message_class(body: Any) -> str:
+    """Only a closed hint leaves the reader; never return external message text."""
+    value = body.get("message") if isinstance(body, dict) else None
+    if not isinstance(value, str):
+        return "missing"
+    value = value[:4096].strip().lower()
+    if not value:
+        return "empty"
+    for category, markers in (
+        ("auth", ("token expired", "session expired", "invalid token", "token is invalid", "expired token", "not logged in", "not login", "登录已过期", "未登录")),
+        ("access", ("no such permission", "permission denied", "access denied", "no permission", "forbidden", "无权限", "没有权限")),
+        ("signature", ("invalid signature", "signature error", "sign error", "sign invalid", "signature verification failed", "签名错误", "签名验证失败")),
+        ("route", ("no handler found", "no route", "not found", "interface does not exist", "接口不存在", "接口不存在或已下线")),
+        ("request", ("invalid parameter", "parameter error", "missing parameter", "参数错误", "参数异常")),
+        ("temporary", ("too many requests", "service unavailable", "system busy", "系统繁忙", "请求过于频繁")),
+    ):
+        if any(marker in value for marker in markers):
+            return category
+    return "unrecognized"
 
 
 def _charging_content(response: dict[str, Any] | None) -> tuple[str | None, Any, dict[str, Any]]:
@@ -307,7 +336,9 @@ def _charging_content(response: dict[str, Any] | None) -> tuple[str | None, Any,
     envelope_status = value.get("status") if isinstance(value, dict) else None
     envelope_status = envelope_status if type(envelope_status) is int and 100 <= envelope_status <= 599 else None
     profile = {"body_format": body_format, "content_type": content_type, "size_bucket": bucket,
-               "utf8_bom": bom, "known_keys": known_keys, "envelope_status": envelope_status}
+               "utf8_bom": bom, "known_keys": known_keys, "envelope_status": envelope_status,
+               "result_code": _charging_numeric_code(value.get("result")) if isinstance(value, dict) else None,
+               "message_class": _charging_message_class(value)}
     return text, value, profile
 
 
@@ -317,11 +348,11 @@ def _charging_failure(response: dict[str, Any] | None, reason: str) -> dict[str,
     status = status if type(status) is int and 100 <= status <= 599 else None
     _text, body, profile = _charging_content(response)
     raw_code = body.get("code") if isinstance(body, dict) else None
-    code = None
-    if type(raw_code) is int and abs(raw_code) <= 99_999_999:
-        code = raw_code
-    elif isinstance(raw_code, str) and re.fullmatch(r"-?\d{1,8}", raw_code, flags=re.ASCII):
-        code = int(raw_code)
+    # Some error envelopes use result/message rather than code/message. This
+    # fallback is diagnostic only: result=0 never authorizes a successful read.
+    code = _charging_numeric_code(raw_code)
+    if isinstance(body, dict) and "code" not in body:
+        code = profile["result_code"]
     def shape(value: Any) -> str:
         if isinstance(value, dict):
             return "object"
@@ -333,16 +364,13 @@ def _charging_failure(response: dict[str, Any] | None, reason: str) -> dict[str,
     diagnostic = {"cloud_http_status": status, "cloud_code": code,
                   "response_format": shape(body), "data_format": shape(data), "records_format": shape(records)}
     if reason == "charging_response_invalid":
-        message = body.get("message") if isinstance(body, dict) else None
-        expired = isinstance(message, str) and any(marker in message[:4096].lower() for marker in (
-            "token expired", "session expired", "invalid token", "token is invalid", "expired token"))
-        if status == 401 or expired:
+        if status == 401 or profile["message_class"] == "auth":
             reason = "charging_auth_unavailable"
-        elif status == 403:
+        elif status == 403 or profile["message_class"] == "access":
             reason = "charging_access_denied"
-        elif status == 429 or status is not None and status >= 500:
+        elif status == 429 or (status is not None and status >= 500) or profile["message_class"] == "temporary":
             reason = "charging_cloud_temporary"
-        elif isinstance(body, dict) and raw_code is not None and raw_code != 0:
+        elif (isinstance(body, dict) and raw_code is not None and raw_code != 0) or (code is not None and code != 0):
             reason = "charging_cloud_rejected"
     temporary = reason in {"charging_transport_error", "charging_cloud_temporary", "charging_auth_unavailable"}
     result = {"ok": False, "temporary": temporary, "reason": reason,

@@ -136,3 +136,25 @@ def test_133_wait_and_response_format_are_logged_without_raw_values(engine,caplo
         r=e.execute_driving_record_probe('staging',payload())
     assert not r['ok'] and 'formato=html'in caplog.text and 'tipo=html'in caplog.text
     assert 'private-'not in caplog.text and len(c.calls)==1 and c.timeout==30
+
+def test_134_engine_logs_alternate_envelope_safely(engine,caplog):
+    import logging
+    from telemetry_engine import LOG
+    e,c=engine
+    def alternate_response(**kw):
+        c.calls.append(kw)
+        return {'status_code':200,'body':json.dumps({'result':40,'message':'No such permission private-message-sentinel'}),'headers':{'Content-Type':'text/html'}}
+    c._post_json=alternate_response
+    # Exercise the actual SDK parser; the lightweight fixture parser deliberately
+    # does not validate code and would not reproduce the cloud rejection.
+    from leapmotor_api.client import LeapmotorApiClient
+    from types import MethodType
+    c._record_api_result=lambda *a,**kw:None
+    c._parse_api_body=MethodType(LeapmotorApiClient._parse_api_body,c)
+    with caplog.at_level(logging.INFO,logger=LOG.name):
+        r=e.execute_driving_record_probe('staging',payload())
+    assert not r['ok']and r['reason']=='charging_access_denied'
+    assert 'resultado=40'in caplog.text and 'mensagem_classe=access'in caplog.text
+    assert 'codigo=40'in caplog.text and 'formato=json_object'in caplog.text
+    assert all(x not in caplog.text for x in ['private-',VIN,'No such permission'])
+    assert len(c.calls)==1 and c.timeout==30

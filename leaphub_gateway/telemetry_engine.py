@@ -55,7 +55,7 @@ except ModuleNotFoundError:
         EVENT_TRANSPORT = _event_transport_module.EVENT_TRANSPORT
 
 LOG = logging.getLogger("leaphub.telemetry")
-ENGINE_VERSION = "1.12.133"  # configuration diagnostics; telemetry contract unchanged
+ENGINE_VERSION = "1.12.134"  # configuration diagnostics; telemetry contract unchanged
 
 # Hospedagem compartilhada (Apache/LiteSpeed) fecha a conexão ociosa em poucos
 # segundos. Reaproveitar depois disso escreve num socket já fechado e devolve
@@ -1763,10 +1763,11 @@ class TelemetryEngine:
             if charging_probe and result.get("ok") is False:
                 diagnostic = result.get("diagnostic") or {}
                 profile = result.get("response_profile") or {}
-                LOG.info("Histórico de recargas indisponível; motivo=%s http=%s codigo=%s formato=%s tipo=%s tamanho=%s bom=%s chaves=%s estado_envelope=%s dados=%s registros=%s; sem dados brutos.",
+                LOG.info("Histórico de recargas indisponível; motivo=%s http=%s codigo=%s formato=%s tipo=%s tamanho=%s bom=%s chaves=%s estado_envelope=%s resultado=%s mensagem_classe=%s dados=%s registros=%s; sem dados brutos.",
                          result.get("reason"), diagnostic.get("cloud_http_status"), diagnostic.get("cloud_code"),
                          profile.get("body_format"), profile.get("content_type"), profile.get("size_bucket"),
-                         profile.get("utf8_bom"), profile.get("known_keys"), profile.get("envelope_status"), diagnostic.get("data_format"), diagnostic.get("records_format"))
+                         profile.get("utf8_bom"), profile.get("known_keys"), profile.get("envelope_status"),
+                         profile.get("result_code"), profile.get("message_class"), diagnostic.get("data_format"), diagnostic.get("records_format"))
             result.update({
                 "low_priority": True, "session_reused": True, "engine_version": ENGINE_VERSION,
                 "connector_version": connector.CONNECTOR_VERSION, "library_version": connector.package_version(),
