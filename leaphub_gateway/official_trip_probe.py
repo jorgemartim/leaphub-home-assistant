@@ -18,7 +18,7 @@ from urllib.parse import quote
 from leapmotor_api.crypto import build_signed_headers
 from leapmotor_api.exceptions import LeapmotorApiError
 
-PROBE_VERSION = "1.12.134"
+PROBE_VERSION = "1.12.135"
 WINDOW_PATH = "/carownerservice/oversea/drivingRecord/v1/mileage/energy/detail"
 MAX_WINDOW_MS = 7 * 24 * 60 * 60 * 1000
 MIN_MILLISECONDS = 1_000_000_000_000
@@ -258,7 +258,7 @@ def probe_windowed_mileage_energy(client: Any, *, vin: str, begin_ms: int, end_m
     return result
 
 # Separate, versioned contract: never interpret driving totals as charging kWh.
-CHARGING_PROBE_VERSION = "1.12.134"
+CHARGING_PROBE_VERSION = "1.12.135"
 CHARGING_PATH = "/carownerservice/charge/daily/detail/page"
 CHARGING_PAGE_SIZE = 25
 CHARGING_MAX_RESPONSE_BYTES = 2 * 1024 * 1024
@@ -392,10 +392,13 @@ def normalize_charging_options(payload: dict[str, Any]) -> tuple[int, int]:
 
 
 def probe_charging_history(client: Any, *, vin: str, begin_ms: int, end_ms: int,
-                           page_num: int = 1, utc_offset_minutes: int = 0) -> dict[str, Any]:
+                           page_num: int = 1, utc_offset_minutes: int = 0,
+                           request_profile: str = "sdk_dates") -> dict[str, Any]:
     """Exactly one authenticated read; no login/refresh/retry or raw location/VIN in result."""
     from datetime import datetime, timedelta, timezone
     begin_ms, end_ms = normalize_window({"begintime_ms": begin_ms, "endtime_ms": end_ms})
+    if request_profile not in {"sdk_dates", "epoch_seconds"}:
+        raise ValueError("Formato de consulta de recarga inválido.")
     page_num, utc_offset_minutes = normalize_charging_options({"page_num": page_num, "utc_offset_minutes": utc_offset_minutes})
     vin = str(vin or "").strip().upper()
     if len(vin) != 17 or not vin.isalnum():
@@ -414,6 +417,16 @@ def probe_charging_history(client: Any, *, vin: str, begin_ms: int, end_ms: int,
     headers.update(client._auth_headers())
     headers["Content-Type"] = "application/json"
     body = dict(signed, pageNum=page_num, pageSize=CHARGING_PAGE_SIZE)
+    if request_profile == "epoch_seconds":
+        # Current history contract uses Unix seconds and string pagination.
+        # Sign exactly these wire values; do not sign the SDK's date/timeZone body.
+        body = {"vin": vin, "startTime": str(begin_ms // 1000),
+                "endTime": str((end_ms + 999) // 1000),
+                "pageNum": str(page_num), "pageSize": str(CHARGING_PAGE_SIZE)}
+        headers = build_signed_headers(sign_key=client.sign_key, device_id=client.device_id,
+                                       language=client.language, body_params=body).to_dict()
+        headers.update(client._auth_headers())
+        headers["Content-Type"] = "application/json"
     label = "charging history bounded read"
     response = None
     try:
@@ -422,6 +435,15 @@ def probe_charging_history(client: Any, *, vin: str, begin_ms: int, end_ms: int,
         if parse_body is None or _profile["body_format"] not in {"json_object", "json_list", "json_null", "json_scalar"}:
             return _charging_failure(response, "charging_response_invalid")
         try:
+            if request_profile == "epoch_seconds" and isinstance(_value, dict):
+                codes = [_value[key] for key in ("code", "result") if key in _value]
+                if not codes or any(type(code) is not int or code != 0 for code in codes):
+                    return _charging_failure(response, "charging_response_invalid")
+                # A result envelope is accepted only with an explicit zero and
+                # the full expected data.list shape. Bare result=0 is not success.
+                if not isinstance(_value.get("data"), dict) or not isinstance(_value["data"].get("list"), list):
+                    return _charging_failure(response, "charging_shape_unavailable")
+                parse_body = json.dumps(dict(_value, code=0))
             parsed = client._parse_api_body(response["status_code"], parse_body, label)
         except (LeapmotorApiError, AttributeError, TypeError, ValueError):
             return _charging_failure(response, "charging_response_invalid")
@@ -441,8 +463,10 @@ def probe_charging_history(client: Any, *, vin: str, begin_ms: int, end_ms: int,
             invalid += 1
             continue
         try:
-            a = _as_millis(row.get("chargeGunStartTs"), "início")
-            b = _as_millis(row.get("chargeGunEndTs"), "fim")
+            if "vin" in row and row["vin"] != vin:
+                raise ValueError("Registro de outro veículo.")
+            a = _as_millis(row.get("chargeEarliestTs", row.get("chargeGunStartTs")), "início")
+            b = _as_millis(row.get("chargeLatestTs", row.get("chargeGunEndTs")), "fim")
             value = row.get("chargeInEnergy")
             if isinstance(value, bool) or not isinstance(value, (int, float, str)):
                 raise ValueError("Energia inválida.")
@@ -455,7 +479,7 @@ def probe_charging_history(client: Any, *, vin: str, begin_ms: int, end_ms: int,
         if b <= begin_ms or a >= end_ms:
             outside += 1
             continue
-        kind = {"1": "ac", "2": "dc"}.get(str(row.get("chargeType")), "unknown")
+        kind = {"1": "ac", "2": "dc", "SLOW": "ac", "FAST": "dc"}.get(str(row.get("chargeType")).upper(), "unknown")
         key = (a, b, kind, kwh)
         if key in seen:
             continue

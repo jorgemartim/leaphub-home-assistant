@@ -1,7 +1,8 @@
-## 1.12.134
+## 1.12.135
 
-- Trata envelopes de erro com result/message: fallback de código estritamente numérico e limitado, somente quando code está ausente.
-- Classifica mensagens conhecidas em categorias fechadas, sem texto externo no log ou resposta; avisos existentes de acesso, autenticação e indisponibilidade passam a reconhecer essas falhas.
-- result 0 sem o contrato de sucesso não vira histórico vazio ou registro válido.
-- Mesma API, biblioteca, assinatura, intervalo, travas e consulta única no Beta; nenhum recálculo de kWh ou escrita no histórico.
-- Compatível com Site Beta 449, sem novo ZIP; distribuição pré-compilada com anúncio no Home Assistant somente após imagem pública e testada.
+- Consulta explícita de recargas usa segundos Unix e paginação textual, com assinatura dos mesmos campos enviados no corpo.
+- Reconhece envelopes result/code zero consistentes com data.list válida e períodos chargeEarliestTs/chargeLatestTs; FAST/SLOW e códigos antigos mantidos.
+- Respostas incompletas, conflitos de código e registros de outro veículo não viram dados válidos.
+- Uma chamada autenticada, sem login/refresh/retry, importação ou alteração da energia local; sessão, limites e prioridade existentes preservados.
+- Compatível com o Site Beta atual. Código 39 ainda exige confirmação real após instalar; config.yaml só anuncia 135 quando o workflow oficial completar a imagem pública e testada.
+- Distribuição pré-compilada pelo workflow oficial; sem dependências instaladas pelo usuário no Home Assistant.
