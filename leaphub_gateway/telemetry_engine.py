@@ -55,7 +55,7 @@ except ModuleNotFoundError:
         EVENT_TRANSPORT = _event_transport_module.EVENT_TRANSPORT
 
 LOG = logging.getLogger("leaphub.telemetry")
-ENGINE_VERSION = "1.12.134"  # configuration diagnostics; telemetry contract unchanged
+ENGINE_VERSION = "1.12.135"  # configuration diagnostics; telemetry contract unchanged
 
 # Hospedagem compartilhada (Apache/LiteSpeed) fecha a conexão ociosa em poucos
 # segundos. Reaproveitar depois disso escreve num socket já fechado e devolve
@@ -1743,7 +1743,7 @@ class TelemetryEngine:
             try:
                 with self._telemetry_request_timeout(client):
                     if charging_probe:
-                        result = probe_charging_history(client, vin=vin, begin_ms=begin_ms, end_ms=end_ms, page_num=page_num, utc_offset_minutes=utc_offset_minutes)
+                        result = probe_charging_history(client, vin=vin, begin_ms=begin_ms, end_ms=end_ms, page_num=page_num, utc_offset_minutes=utc_offset_minutes, request_profile="epoch_seconds")
                     else:
                         result = probe_windowed_mileage_energy(client, vin=vin, begin_ms=begin_ms, end_ms=end_ms)
             except Exception as exc:  # noqa: BLE001

@@ -29,7 +29,7 @@ class Client:
     sign_key=bytes(32);device_id='synthetic';language='en-GB';account_cert=('fake','fake');timeout=30
     def __init__(self,rows=None):self.rows=[row()] if rows is None else rows;self.calls=[];self.last_api_results={}
     def _auth_headers(self):return {'Authorization':'synthetic-only'}
-    def _post_json(self,**kwargs):self.calls.append(kwargs);return {'status_code':200,'body':json.dumps({'data':{'list':self.rows}})}
+    def _post_json(self,**kwargs):self.calls.append(kwargs);return {'status_code':200,'body':json.dumps({'code':0,'data':{'list':self.rows}})}
     def _parse_api_body(self,status,body,label):self.last_api_results[label]={'message':'private-token-sentinel'};return json.loads(body)
     def login(self):raise AssertionError('login must not run')
     def token_refresh(self):raise AssertionError('refresh must not run')

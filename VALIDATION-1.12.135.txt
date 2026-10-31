@@ -1,0 +1,5 @@
+Validation: .github/scripts/validate_repository.py, Python 3.12 and pinned SDK 0.3.2.
+General suite: 685 passed. Runtime suite: 84 passed.
+Targeted charging history suites: 79 passed, included in canonical runtime validation.
+Synthetic HTTP only. Exact epoch body signature recomputed and checked; one authenticated call, no login/refresh/retry. Error 39, conflicting success codes, incomplete envelopes and foreign vehicle data remain rejected.
+config.yaml still advertises 1.12.134. Official CI image build/publication and installation in Home Assistant remain necessary before real account validation. No claim that cloud code 39 has been resolved in production.
